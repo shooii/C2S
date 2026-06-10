@@ -5,7 +5,6 @@ import {
   Card,
   Empty,
   Input,
-  Popconfirm,
   Progress,
   Select,
   Space,
@@ -29,11 +28,12 @@ import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
 import { LogDrawer } from "../../components/LogDrawer";
 import { TaskStatusTag } from "../../components/StatusTag";
+import { useManagementPageSize } from "../../hooks/useManagementPageSize";
 import { api } from "../../services/api";
 import type { ConversionTask, TaskStatus } from "../../types";
 
 export default function ResultManage() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const navigate = useNavigate();
   const [allTasks, setAllTasks] = useState<ConversionTask[]>([]);
   const [tasks, setTasks] = useState<ConversionTask[]>([]);
@@ -89,6 +89,12 @@ export default function ResultManage() {
     failed: allTasks.filter((task) => task.status === "failed").length
   }), [allTasks]);
 
+  const tablePageSize = useManagementPageSize({
+    cardSelector: ".result-table-card",
+    fallbackRowHeight: 54,
+    totalItems: tasks.length
+  });
+
   const downloadFirst = async (task: ConversionTask) => {
     try {
       const files = await api.getResultFiles(task.id);
@@ -133,6 +139,18 @@ export default function ResultManage() {
     } catch (error) {
       message.error(error instanceof Error ? error.message : "删除任务失败");
     }
+  };
+
+  const confirmDeleteTask = (task: ConversionTask) => {
+    modal.confirm({
+      title: "删除成果任务",
+      content: `确定删除“${task.taskName}”吗？任务记录、成果文件和日志都会被永久删除。`,
+      okText: "删除",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: () => deleteTask(task)
+    });
   };
 
   const columns: ColumnsType<ConversionTask> = [
@@ -220,16 +238,16 @@ export default function ResultManage() {
           <Tooltip title="重新解析模板">
             <Button icon={<SyncOutlined />} onClick={() => reparseTemplate(record)} />
           </Tooltip>
-          <Popconfirm title="删除任务" description="删除整个任务，包括任务记录、成果文件和日志。" onConfirm={() => deleteTask(record)}>
-            <Button danger icon={<DeleteOutlined />} />
-          </Popconfirm>
+          <Tooltip title="删除">
+            <Button danger icon={<DeleteOutlined />} onClick={() => confirmDeleteTask(record)} />
+          </Tooltip>
         </Space>
       )
     }
   ];
 
   return (
-    <div className="page-stack">
+    <div className="page-stack management-page result-page">
       <div className="toolbar">
         <Space direction="vertical" size={0}>
           <Typography.Title level={4} style={{ margin: 0 }}>
@@ -246,7 +264,7 @@ export default function ResultManage() {
         <Card className="stat-card"><Statistic title="失败" value={stats.failed} valueStyle={{ color: "#c73333" }} /></Card>
       </div>
 
-      <Card className="table-card result-table-card">
+      <Card className="table-card management-table-card result-table-card">
         <div className="filter-row" style={{ marginBottom: 16 }}>
           <Input
             allowClear
@@ -282,13 +300,14 @@ export default function ResultManage() {
         </div>
         <Table
           rowKey="id"
-          size="middle"
           loading={loading}
           columns={columns}
           dataSource={tasks}
           pagination={{
-            pageSize: 6,
+            pageSize: tablePageSize,
             showSizeChanger: false,
+            position: ["bottomCenter"],
+            hideOnSinglePage: true,
             showTotal: (total) => `共 ${total} 条成果`
           }}
           scroll={{ x: 1500 }}

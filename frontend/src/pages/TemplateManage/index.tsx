@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   App,
   Button,
@@ -38,12 +38,12 @@ import {
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
 import { ParseStatusTag } from "../../components/StatusTag";
+import { useManagementPageSize } from "../../hooks/useManagementPageSize";
 import { api } from "../../services/api";
 import type { ParseStatus, TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
 
 type GroupKey = string;
 type SortKey = "updated-desc" | "updated-asc" | "name-asc" | "params-desc";
-const groupPageSize = 8;
 
 export default function TemplateManage() {
   const { message } = App.useApp();
@@ -64,6 +64,8 @@ export default function TemplateManage() {
   const [pendingUploadTemplate, setPendingUploadTemplate] = useState<TemplateDetail | null>(null);
   const [pendingUploadGroup, setPendingUploadGroup] = useState<GroupKey>("default");
   const [groupPage, setGroupPage] = useState(1);
+  const [groupPageSize, setGroupPageSize] = useState(8);
+  const groupListRef = useRef<HTMLDivElement>(null);
 
   const loadData = async () => {
     setLoading(true);
@@ -134,9 +136,15 @@ export default function TemplateManage() {
     });
   }, [activeGroup, groupedTemplates, keyword, sort, status]);
 
+  const tablePageSize = useManagementPageSize({
+    cardSelector: ".template-table-card",
+    fallbackRowHeight: 52,
+    totalItems: currentGroupTemplates.length
+  });
+
   const pagedGroupKeys = useMemo(
     () => visibleGroupKeys.slice((groupPage - 1) * groupPageSize, groupPage * groupPageSize),
-    [groupPage, visibleGroupKeys]
+    [groupPage, groupPageSize, visibleGroupKeys]
   );
 
   const stats = useMemo(() => ({
@@ -171,7 +179,42 @@ export default function TemplateManage() {
     if (groupPage > maxPage) {
       setGroupPage(maxPage);
     }
-  }, [groupPage, visibleGroupKeys]);
+  }, [groupPage, groupPageSize, visibleGroupKeys]);
+
+  useEffect(() => {
+    const groupList = groupListRef.current;
+    if (!groupList) {
+      return;
+    }
+
+    const updatePageSize = () => {
+      const styles = window.getComputedStyle(groupList);
+      const gap = Number.parseFloat(styles.rowGap) || 0;
+      const firstItem = groupList.querySelector<HTMLElement>(".template-group-item");
+      const itemHeight = firstItem?.getBoundingClientRect().height || 48;
+      const pagination = groupList.parentElement?.querySelector<HTMLElement>(".template-pagination");
+      const paginationHeight = pagination?.getBoundingClientRect().height || 38;
+      const totalAvailableHeight = groupList.clientHeight + (pagination ? paginationHeight : 0);
+      const maxWithoutPagination = Math.max(
+        1,
+        Math.floor((totalAvailableHeight + gap) / (itemHeight + gap))
+      );
+      const listHeight = visibleGroupKeys.length > maxWithoutPagination
+        ? totalAvailableHeight - paginationHeight
+        : totalAvailableHeight;
+      const nextPageSize = Math.max(1, Math.floor((listHeight + gap) / (itemHeight + gap)));
+      setGroupPageSize((current) => current === nextPageSize ? current : nextPageSize);
+    };
+
+    const observer = new ResizeObserver(updatePageSize);
+    observer.observe(groupList);
+    const frame = window.requestAnimationFrame(updatePageSize);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [groupPageSize, visibleGroupKeys.length]);
 
   const uploadProps: UploadProps = {
     accept: ".fmw,.fmwt",
@@ -305,7 +348,7 @@ export default function TemplateManage() {
     {
       title: "参数",
       dataIndex: "parameterCount",
-      width: 50,
+      width: 60,
       render: (value) => `${value || 0} 个`
     },
     {
@@ -317,7 +360,7 @@ export default function TemplateManage() {
     {
       title: "更新时间",
       dataIndex: "updatedAt",
-      width: 100,
+      width: 120,
       render: (value) => dayjs(value).format("YYYY-MM-DD HH:mm")
     },
     {
@@ -340,7 +383,7 @@ export default function TemplateManage() {
   ];
 
   return (
-    <div className="page-stack template-page">
+    <div className="page-stack management-page template-page">
       <div className="toolbar">
         <Space direction="vertical" size={0}>
           <Typography.Title level={4} style={{ margin: 0 }}>模板管理</Typography.Title>
@@ -368,7 +411,7 @@ export default function TemplateManage() {
             <Button icon={<PlusOutlined />} onClick={createGroup}>新建分组</Button>
           </div>
 
-          <div className="template-group-list">
+          <div ref={groupListRef} className="template-group-list">
             {pagedGroupKeys.map((key) => {
               const active = activeGroup === key;
               return (
@@ -427,7 +470,7 @@ export default function TemplateManage() {
           )}
         </Card>
 
-        <Card className="table-card template-table-card">
+        <Card className="table-card management-table-card template-table-card">
           <div className="template-table-heading">
             <Space size={10}>
               <Typography.Text type="secondary">模板管理</Typography.Text>
@@ -473,9 +516,10 @@ export default function TemplateManage() {
             columns={columns}
             dataSource={currentGroupTemplates}
             pagination={{
-              pageSize: 8,
+              pageSize: tablePageSize,
               showSizeChanger: false,
               position: ["bottomCenter"],
+              hideOnSinglePage: true,
               showTotal: (total) => `共 ${total} 个模板`
             }}
             locale={{ emptyText: <Empty description="当前分组暂无模板" /> }}

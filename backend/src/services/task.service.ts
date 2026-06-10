@@ -61,8 +61,8 @@ export function getTask(id: string): ConversionTask {
 }
 
 export function getTaskLogs(id: string): string {
-  const task = getTask(id);
-  const logPath = assertPathInside(logStorageDir, task.logPath);
+  getTask(id);
+  const logPath = assertPathInside(logStorageDir, path.join(logStorageDir, `${id}.log`));
   if (!fs.existsSync(logPath)) {
     return "";
   }
@@ -207,7 +207,7 @@ export function deleteTask(taskId: string): void {
   removeIfExists(outputPath);
 
   // 删除日志文件
-  const logPath = assertPathInside(logStorageDir, task.logPath);
+  const logPath = assertPathInside(logStorageDir, path.join(logStorageDir, `${taskId}.log`));
   removeIfExists(logPath);
 
   const db = getDb();
