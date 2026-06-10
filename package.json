@@ -1,0 +1,21 @@
+{
+  "name": "c2s-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "build": "npm run build -w backend && npm run build -w frontend",
+    "start:backend": "npm run start -w backend",
+    "init:db": "npm run init:db -w backend"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "playwright-core": "^1.60.0",
+    "pngjs": "^7.0.0"
+  }
+}
