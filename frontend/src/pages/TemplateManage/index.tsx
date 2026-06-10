@@ -39,30 +39,17 @@ import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
 import { ParseStatusTag } from "../../components/StatusTag";
 import { api } from "../../services/api";
-import type { ParseStatus, TemplateDetail, TemplateRecord } from "../../types";
+import type { ParseStatus, TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
 
 type GroupKey = string;
 type SortKey = "updated-desc" | "updated-asc" | "name-asc" | "params-desc";
-type GroupOverrides = Record<GroupKey, { label?: string; deleted?: boolean; custom?: boolean }>;
-type GroupAssignments = Record<string, GroupKey>;
-
-const groupMeta: Record<GroupKey, { label: string; description: string }> = {
-  default: { label: "默认分组", description: "未分类模板" },
-  conversion: { label: "数据转换", description: "格式转换、数据入库和批处理" },
-  spatial: { label: "空间处理", description: "坐标、几何和空间数据处理" },
-  quality: { label: "质检检查", description: "数据质量检查和治理" },
-  publish: { label: "发布服务", description: "成果发布、服务生成和接口模板" }
-};
-
-const builtInGroupKeys = Object.keys(groupMeta);
-const groupOverrideStorageKey = "c2s-template-group-overrides";
-const groupAssignmentStorageKey = "c2s-template-group-assignments";
 const groupPageSize = 8;
 
 export default function TemplateManage() {
   const { message } = App.useApp();
   const navigate = useNavigate();
   const [templates, setTemplates] = useState<TemplateRecord[]>([]);
+  const [groups, setGroups] = useState<TemplateGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeGroup, setActiveGroup] = useState<GroupKey>("default");
   const [keyword, setKeyword] = useState("");
@@ -71,8 +58,6 @@ export default function TemplateManage() {
   const [selected, setSelected] = useState<TemplateDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [groupInitialized, setGroupInitialized] = useState(false);
-  const [groupOverrides, setGroupOverrides] = useState<GroupOverrides>(() => loadGroupOverrides());
-  const [groupAssignments, setGroupAssignments] = useState<GroupAssignments>(() => loadGroupAssignments());
   const [editingGroup, setEditingGroup] = useState<GroupKey | null>(null);
   const [editingGroupName, setEditingGroupName] = useState("");
   const [groupModalMode, setGroupModalMode] = useState<"create" | "edit">("edit");
@@ -80,37 +65,31 @@ export default function TemplateManage() {
   const [pendingUploadGroup, setPendingUploadGroup] = useState<GroupKey>("default");
   const [groupPage, setGroupPage] = useState(1);
 
-  const loadTemplates = async () => {
+  const loadData = async () => {
     setLoading(true);
     try {
-      setTemplates(await api.listTemplates({}));
+      const [templateRecords, templateGroups] = await Promise.all([
+        api.listTemplates({}),
+        api.listTemplateGroups()
+      ]);
+      setTemplates(templateRecords);
+      setGroups(templateGroups);
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "模板加载失败");
+      message.error(error instanceof Error ? error.message : "模板管理数据加载失败");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    void loadTemplates();
+    void loadData();
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem(groupOverrideStorageKey, JSON.stringify(groupOverrides));
-  }, [groupOverrides]);
-
-  useEffect(() => {
-    localStorage.setItem(groupAssignmentStorageKey, JSON.stringify(groupAssignments));
-  }, [groupAssignments]);
-
-  const visibleGroupKeys = useMemo(() => {
-    const allKeys = Array.from(new Set([...builtInGroupKeys, ...Object.keys(groupOverrides)]));
-    return allKeys.filter((key) => !groupOverrides[key]?.deleted);
-  }, [groupOverrides]);
+  const visibleGroupKeys = useMemo(() => groups.map((group) => group.id), [groups]);
 
   const groupOptions = useMemo(
-    () => visibleGroupKeys.map((key) => ({ value: key, label: getGroupLabel(key, groupOverrides) })),
-    [groupOverrides, visibleGroupKeys]
+    () => groups.map((group) => ({ value: group.id, label: group.name })),
+    [groups]
   );
 
   const groupedTemplates = useMemo(() => {
@@ -121,15 +100,13 @@ export default function TemplateManage() {
     result.default = result.default || [];
 
     templates.forEach((template) => {
-      const assignedGroup = groupAssignments[template.id];
-      const inferredGroup = assignedGroup || inferGroup(template);
-      const group = groupOverrides[inferredGroup]?.deleted ? "default" : inferredGroup;
+      const group = visibleGroupKeys.includes(template.groupId) ? template.groupId : "default";
       result[group] = result[group] || [];
       result[group].push(template);
     });
 
     return result;
-  }, [groupAssignments, groupOverrides, templates, visibleGroupKeys]);
+  }, [templates, visibleGroupKeys]);
 
   const currentGroupTemplates = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase();
@@ -229,13 +206,8 @@ export default function TemplateManage() {
   const remove = async (record: TemplateRecord) => {
     try {
       await api.deleteTemplate(record.id);
-      setGroupAssignments((current) => {
-        const next = { ...current };
-        delete next[record.id];
-        return next;
-      });
       message.success("模板已删除");
-      await loadTemplates();
+      await loadData();
     } catch (error) {
       message.error(error instanceof Error ? error.message : "模板删除失败");
     }
@@ -250,82 +222,69 @@ export default function TemplateManage() {
   const startEditGroup = (key: GroupKey) => {
     setGroupModalMode("edit");
     setEditingGroup(key);
-    setEditingGroupName(getGroupLabel(key, groupOverrides));
+    setEditingGroupName(getGroupLabel(key, groups));
   };
 
-  const saveGroupName = () => {
+  const saveGroupName = async () => {
     const nextName = editingGroupName.trim();
     if (!nextName) {
       message.warning("分组名称不能为空");
       return;
     }
-    if (visibleGroupKeys.some((key) => key !== editingGroup && getGroupLabel(key, groupOverrides) === nextName)) {
+    if (groups.some((group) => group.id !== editingGroup && group.name === nextName)) {
       message.warning("分组名称已存在");
       return;
     }
-    if (groupModalMode === "create") {
-      const key = `custom-${Date.now()}`;
-      setGroupOverrides((current) => ({ ...current, [key]: { label: nextName, custom: true } }));
-      setActiveGroup(key);
-      setGroupPage(Math.ceil((visibleGroupKeys.length + 1) / groupPageSize));
+    try {
+      if (groupModalMode === "create") {
+        const created = await api.createTemplateGroup(nextName);
+        setActiveGroup(created.id);
+        setGroupPage(Math.ceil((visibleGroupKeys.length + 1) / groupPageSize));
+        message.success("分组已创建");
+      } else if (editingGroup) {
+        await api.updateTemplateGroup(editingGroup, nextName);
+        message.success("分组已更新");
+      }
+      setEditingGroup(null);
       setEditingGroupName("");
       setGroupModalMode("edit");
-      message.success("分组已创建");
-      return;
+      await loadData();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "分组保存失败");
     }
-    if (!editingGroup) {
-      return;
-    }
-    setGroupOverrides((current) => ({
-      ...current,
-      [editingGroup]: { ...current[editingGroup], label: nextName }
-    }));
-    setEditingGroup(null);
-    setEditingGroupName("");
-    message.success("分组已更新");
   };
 
-  const deleteGroups = (keys: GroupKey[]) => {
-    const deletableKeys = keys.filter((key) => key !== "default");
-    if (!deletableKeys.length) {
+  const deleteGroup = async (key: GroupKey) => {
+    if (key === "default") {
       message.warning("默认分组不能删除");
       return;
     }
-    setGroupOverrides((current) => {
-      const next = { ...current };
-      deletableKeys.forEach((key) => {
-        next[key] = { ...next[key], deleted: true };
-      });
-      return next;
-    });
-    setGroupAssignments((current) => {
-      const next = { ...current };
-      Object.entries(next).forEach(([templateId, group]) => {
-        if (deletableKeys.includes(group)) {
-          next[templateId] = "default";
-        }
-      });
-      return next;
-    });
-    if (deletableKeys.includes(activeGroup)) {
-      setActiveGroup("default");
+    try {
+      await api.deleteTemplateGroup(key);
+      if (activeGroup === key) {
+        setActiveGroup("default");
+      }
+      message.success("分组已删除，模板已归入默认分组");
+      await loadData();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "分组删除失败");
     }
-    message.success(`已删除 ${deletableKeys.length} 个分组，模板已归入默认分组`);
   };
 
   const confirmUploadedTemplateGroup = async () => {
     if (!pendingUploadTemplate) {
       return;
     }
-    setGroupAssignments((current) => ({
-      ...current,
-      [pendingUploadTemplate.id]: pendingUploadGroup
-    }));
-    setActiveGroup(pendingUploadGroup);
-    const groupName = getGroupLabel(pendingUploadGroup, groupOverrides);
-    setPendingUploadTemplate(null);
-    message.success(`模板已归类到「${groupName}」`);
-    await loadTemplates();
+    try {
+      await api.assignTemplateGroup(pendingUploadTemplate.id, pendingUploadGroup);
+      setActiveGroup(pendingUploadGroup);
+      const groupName = getGroupLabel(pendingUploadGroup, groups);
+      setPendingUploadTemplate(null);
+      message.success(`模板已归类到「${groupName}」`);
+      await loadData();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "模板归类失败");
+    }
   };
 
   const columns: ColumnsType<TemplateRecord> = [
@@ -427,7 +386,7 @@ export default function TemplateManage() {
                 >
                   <span className="template-group-left">
                     <FolderOutlined />
-                    <strong>{getGroupLabel(key, groupOverrides)}</strong>
+                    <strong>{getGroupLabel(key, groups)}</strong>
                   </span>
                   <span className="template-group-count">{groupedTemplates[key]?.length || 0}</span>
                   <Dropdown
@@ -443,7 +402,7 @@ export default function TemplateManage() {
                           startEditGroup(key);
                         }
                         if (actionKey === "delete") {
-                          deleteGroups([key]);
+                          void deleteGroup(key);
                         }
                       }
                     }}
@@ -473,7 +432,7 @@ export default function TemplateManage() {
             <Space size={10}>
               <Typography.Text type="secondary">模板管理</Typography.Text>
               <Typography.Text type="secondary">/</Typography.Text>
-              <Typography.Text className="template-active-group">{getGroupLabel(activeGroup, groupOverrides)}</Typography.Text>
+              <Typography.Text className="template-active-group">{getGroupLabel(activeGroup, groups)}</Typography.Text>
             </Space>
           </div>
 
@@ -593,43 +552,8 @@ export default function TemplateManage() {
   );
 }
 
-function loadGroupOverrides(): GroupOverrides {
-  try {
-    const raw = localStorage.getItem(groupOverrideStorageKey);
-    if (!raw) {
-      return {};
-    }
-    const parsed = JSON.parse(raw) as GroupOverrides;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function loadGroupAssignments(): GroupAssignments {
-  try {
-    const raw = localStorage.getItem(groupAssignmentStorageKey);
-    if (!raw) {
-      return {};
-    }
-    const parsed = JSON.parse(raw) as GroupAssignments;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function getGroupLabel(key: GroupKey, overrides: GroupOverrides): string {
-  return overrides[key]?.label || groupMeta[key]?.label || "默认分组";
-}
-
-function inferGroup(template: TemplateRecord): GroupKey {
-  const text = `${template.name} ${template.fileName} ${template.outputDataType || ""}`.toLowerCase();
-  if (/质检|检查|治理|quality|check|validate/.test(text)) return "quality";
-  if (/发布|服务|api|接口|publish|service/.test(text)) return "publish";
-  if (/空间|坐标|gis|shp|dwg|3dtiles|cesium|revit|rvt|fbx|udatasmith/.test(text)) return "spatial";
-  if (/csv|json|excel|xml|转换|convert|translator|database|db|数据库/.test(text)) return "conversion";
-  return "default";
+function getGroupLabel(key: GroupKey, groups: TemplateGroup[]): string {
+  return groups.find((group) => group.id === key)?.name || "默认分组";
 }
 
 function getTemplateIcon(template: TemplateRecord) {

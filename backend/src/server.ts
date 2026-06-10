@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import templateRoutes from "./routes/template.routes";
+import templateGroupRoutes from "./routes/template-group.routes";
 import taskRoutes from "./routes/task.routes";
 import resultRoutes from "./routes/result.routes";
 import { ensureStorageDirs } from "./config/paths";
@@ -57,6 +58,7 @@ app.get("/api/fme/status", async (_req, res, next) => {
 });
 
 app.use("/api/templates", templateRoutes);
+app.use("/api/template-groups", templateGroupRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/results", resultRoutes);
 

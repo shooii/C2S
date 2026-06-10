@@ -70,15 +70,16 @@ export async function createTemplateFromUpload(file: Express.Multer.File): Promi
   getDb()
     .prepare(
       `INSERT INTO templates (
-        id, name, fileName, fileType, filePath, description, inputDataType, outputDataType,
+        id, groupId, name, fileName, fileType, filePath, description, inputDataType, outputDataType,
         parameterCount, parseStatus, parseMessage, version, tags, createdAt, updatedAt
       ) VALUES (
-        @id, @name, @fileName, @fileType, @filePath, @description, @inputDataType, @outputDataType,
+        @id, @groupId, @name, @fileName, @fileType, @filePath, @description, @inputDataType, @outputDataType,
         @parameterCount, @parseStatus, @parseMessage, @version, @tags, @createdAt, @updatedAt
       )`
     )
     .run({
       id,
+      groupId: "default",
       name,
       fileName: displayFileName,
       fileType,

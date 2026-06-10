@@ -6,6 +6,7 @@ import type {
   ResultFile,
   TaskStatus,
   TemplateDetail,
+  TemplateGroup,
   TemplateRecord
 } from "../types";
 
@@ -41,6 +42,19 @@ export const api = {
     unwrap<TemplateRecord[]>(http.get("/api/templates", { params })),
 
   getTemplate: (id: string) => unwrap<TemplateDetail>(http.get(`/api/templates/${id}`)),
+
+  listTemplateGroups: () => unwrap<TemplateGroup[]>(http.get("/api/template-groups")),
+
+  createTemplateGroup: (name: string) =>
+    unwrap<TemplateGroup>(http.post("/api/template-groups", { name })),
+
+  updateTemplateGroup: (id: string, name: string) =>
+    unwrap<TemplateGroup>(http.patch(`/api/template-groups/${id}`, { name })),
+
+  deleteTemplateGroup: (id: string) => http.delete(`/api/template-groups/${id}`),
+
+  assignTemplateGroup: (templateId: string, groupId: string) =>
+    unwrap<TemplateDetail>(http.patch(`/api/templates/${templateId}/group`, { groupId })),
 
   uploadTemplate: (file: File, onProgress?: (percent: number) => void) => {
     const formData = new FormData();
@@ -111,4 +125,3 @@ export const api = {
     return `${API_BASE_URL}${url.startsWith("/") ? "" : "/"}${url}`;
   }
 };
-

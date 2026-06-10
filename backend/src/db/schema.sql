@@ -1,5 +1,15 @@
+CREATE TABLE IF NOT EXISTS template_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  builtIn INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS templates (
   id TEXT PRIMARY KEY,
+  groupId TEXT NOT NULL DEFAULT 'default',
   name TEXT NOT NULL,
   fileName TEXT NOT NULL,
   fileType TEXT NOT NULL,
@@ -15,6 +25,9 @@ CREATE TABLE IF NOT EXISTS templates (
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_templates_group_id
+  ON templates(groupId);
 
 CREATE TABLE IF NOT EXISTS template_parameters (
   id TEXT PRIMARY KEY,
@@ -78,4 +91,3 @@ CREATE TABLE IF NOT EXISTS result_files (
 
 CREATE INDEX IF NOT EXISTS idx_result_files_task_id
   ON result_files(taskId);
-

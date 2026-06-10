@@ -46,6 +46,7 @@ export interface TemplateParameter {
 
 export interface TemplateRecord {
   id: string;
+  groupId: string;
   name: string;
   fileName: string;
   fileType: ".fmw" | ".fmwt";
@@ -58,6 +59,16 @@ export interface TemplateRecord {
   parseMessage: string | null;
   version: string | null;
   tags: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TemplateGroup {
+  id: string;
+  name: string;
+  description: string | null;
+  builtIn: boolean;
+  templateCount: number;
   createdAt: string;
   updatedAt: string;
 }

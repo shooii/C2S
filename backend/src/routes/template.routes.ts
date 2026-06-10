@@ -10,6 +10,7 @@ import {
 import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
 import type { ParseStatus } from "../types";
+import { assignTemplateGroup } from "../services/template-group.service";
 
 const router = Router();
 const upload = createTemplateUpload();
@@ -50,6 +51,14 @@ router.post(
   })
 );
 
+router.patch(
+  "/:id/group",
+  asyncHandler(async (req, res) => {
+    assignTemplateGroup(req.params.id, String(req.body?.groupId || ""));
+    res.json({ data: getTemplate(req.params.id) });
+  })
+);
+
 router.delete(
   "/:id",
   asyncHandler(async (req, res) => {
@@ -59,4 +68,3 @@ router.delete(
 );
 
 export default router;
-

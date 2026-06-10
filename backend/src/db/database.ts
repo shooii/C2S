@@ -4,8 +4,18 @@ import { DatabaseSync } from "node:sqlite";
 import { databasePath, ensureStorageDirs } from "../config/paths";
 
 const schemaSql = `
+CREATE TABLE IF NOT EXISTS template_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT,
+  builtIn INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS templates (
   id TEXT PRIMARY KEY,
+  groupId TEXT NOT NULL DEFAULT 'default',
   name TEXT NOT NULL,
   fileName TEXT NOT NULL,
   fileType TEXT NOT NULL,
@@ -96,6 +106,7 @@ export function getDb(): SqliteDatabase {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(schemaSql);
+  migrateDatabase(db);
   return db;
 }
 
@@ -114,4 +125,32 @@ export function runTransaction<T>(handler: () => T): T {
     database.exec("ROLLBACK");
     throw error;
   }
+}
+
+function migrateDatabase(database: SqliteDatabase): void {
+  const templateColumns = database.prepare("PRAGMA table_info(templates)").all() as unknown as Array<{ name: string }>;
+  if (!templateColumns.some((column) => column.name === "groupId")) {
+    database.exec("ALTER TABLE templates ADD COLUMN groupId TEXT NOT NULL DEFAULT 'default'");
+  }
+  database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");
+
+  const groupCount = database.prepare("SELECT COUNT(*) AS count FROM template_groups").get() as { count: number };
+  if (groupCount.count > 0) {
+    return;
+  }
+
+  const timestamp = nowIso();
+  const insert = database.prepare(
+    `INSERT INTO template_groups (id, name, description, builtIn, createdAt, updatedAt)
+     VALUES (@id, @name, @description, 1, @createdAt, @updatedAt)`
+  );
+  [
+    ["default", "默认分组", "未分类模板"],
+    ["conversion", "数据转换", "格式转换、数据入库和批处理"],
+    ["spatial", "空间处理", "坐标、几何和空间数据处理"],
+    ["quality", "质检检查", "数据质量检查和治理"],
+    ["publish", "发布服务", "成果发布、服务生成和接口模板"]
+  ].forEach(([id, name, description]) => {
+    insert.run({ id, name, description, createdAt: timestamp, updatedAt: timestamp });
+  });
 }
