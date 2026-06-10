@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS templates (
   inputDataType TEXT,
   outputDataType TEXT,
   parameterCount INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 0,
   parseStatus TEXT NOT NULL DEFAULT 'pending',
   parseMessage TEXT,
   version TEXT,

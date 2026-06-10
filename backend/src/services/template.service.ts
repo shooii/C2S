@@ -5,25 +5,36 @@ import type { ParseStatus, TemplateDetail, TemplateParameter, TemplateRecord } f
 import { assertTemplateFile, decodeFileName, removeIfExists, safeFileName } from "./file.service";
 import { parseWorkspaceParameters } from "./fme.service";
 import { assertFound, HttpError } from "../utils/httpError";
+import { getTemplateGroup } from "./template-group.service";
 
-type TemplateRow = Omit<TemplateRecord, "tags"> & { tags: string };
+type TemplateRow = Omit<TemplateRecord, "tags" | "enabled"> & {
+  tags: string;
+  enabled: number;
+};
 type ParameterRow = Omit<TemplateParameter, "required" | "options"> & {
   required: number;
   options: string;
 };
 
-export function listTemplates(options: { search?: string; parseStatus?: ParseStatus } = {}): TemplateRecord[] {
+export interface UpdateTemplateConfigurationInput {
+  description?: string | null;
+  version?: string | null;
+  enabled?: boolean;
+  parameterLabels?: Array<{ id: string; label: string }>;
+}
+
+export function listTemplates(options: { search?: string; enabled?: boolean } = {}): TemplateRecord[] {
   const db = getDb();
   const where: string[] = [];
-  const params: Record<string, string> = {};
+  const params: Record<string, string | number> = {};
 
   if (options.search) {
-    where.push("(name LIKE @search OR fileName LIKE @search OR tags LIKE @search)");
+    where.push("(name LIKE @search OR fileName LIKE @search OR description LIKE @search OR tags LIKE @search)");
     params.search = `%${options.search}%`;
   }
-  if (options.parseStatus) {
-    where.push("parseStatus = @parseStatus");
-    params.parseStatus = options.parseStatus;
+  if (options.enabled !== undefined) {
+    where.push("enabled = @enabled");
+    params.enabled = options.enabled ? 1 : 0;
   }
 
   const sql = `
@@ -51,12 +62,16 @@ export function getTemplate(id: string): TemplateDetail {
   };
 }
 
-export async function createTemplateFromUpload(file: Express.Multer.File): Promise<TemplateDetail> {
+export async function createTemplateFromUpload(
+  file: Express.Multer.File,
+  groupId = "default"
+): Promise<TemplateDetail> {
   if (!file) {
     throw new HttpError(400, "请上传模板文件");
   }
 
   assertTemplateFile(file.originalname);
+  getTemplateGroup(groupId);
 
   // 解码原始文件名，处理可能的中文编码问题
   const decodedOriginalName = decodeFileName(file.originalname);
@@ -66,20 +81,21 @@ export async function createTemplateFromUpload(file: Express.Multer.File): Promi
   const fileType = path.extname(decodedOriginalName).toLowerCase() as ".fmw" | ".fmwt";
   const displayFileName = safeFileName(decodedOriginalName);
   const name = path.parse(displayFileName).name;
+  assertTemplateNameAvailable(groupId, name);
 
   getDb()
     .prepare(
       `INSERT INTO templates (
         id, groupId, name, fileName, fileType, filePath, description, inputDataType, outputDataType,
-        parameterCount, parseStatus, parseMessage, version, tags, createdAt, updatedAt
+        parameterCount, enabled, parseStatus, parseMessage, version, tags, createdAt, updatedAt
       ) VALUES (
         @id, @groupId, @name, @fileName, @fileType, @filePath, @description, @inputDataType, @outputDataType,
-        @parameterCount, @parseStatus, @parseMessage, @version, @tags, @createdAt, @updatedAt
+        @parameterCount, @enabled, @parseStatus, @parseMessage, @version, @tags, @createdAt, @updatedAt
       )`
     )
     .run({
       id,
-      groupId: "default",
+      groupId,
       name,
       fileName: displayFileName,
       fileType,
@@ -88,6 +104,7 @@ export async function createTemplateFromUpload(file: Express.Multer.File): Promi
       inputDataType: "CIM",
       outputDataType: null,
       parameterCount: 0,
+      enabled: 0,
       parseStatus: "pending",
       parseMessage: "已上传，等待解析",
       version: "1.0.0",
@@ -171,6 +188,68 @@ export function deleteTemplate(id: string): void {
   removeIfExists(template.filePath);
 }
 
+export function updateTemplateDescription(id: string, description: string | null): TemplateDetail {
+  return updateTemplateConfiguration(id, { description });
+}
+
+export function updateTemplateConfiguration(
+  id: string,
+  input: UpdateTemplateConfigurationInput
+): TemplateDetail {
+  const template = getTemplate(id);
+  const normalizedDescription = input.description === undefined
+    ? template.description
+    : input.description?.trim() || null;
+  const normalizedVersion = input.version === undefined
+    ? template.version
+    : input.version?.trim() || "1.0.0";
+
+  if (normalizedDescription && normalizedDescription.length > 500) {
+    throw new HttpError(400, "模板说明不能超过 500 个字符");
+  }
+  if (normalizedVersion && normalizedVersion.length > 30) {
+    throw new HttpError(400, "模板版本号不能超过 30 个字符");
+  }
+
+  const parameterLabels = input.parameterLabels || [];
+  const templateParameterIds = new Set(template.parameters.map((parameter) => parameter.id));
+  parameterLabels.forEach((parameter) => {
+    const label = parameter.label.trim();
+    if (!templateParameterIds.has(parameter.id)) {
+      throw new HttpError(400, "参数不属于当前模板");
+    }
+    if (!label) {
+      throw new HttpError(400, "参数名称不能为空");
+    }
+    if (label.length > 100) {
+      throw new HttpError(400, "参数名称不能超过 100 个字符");
+    }
+  });
+
+  const db = getDb();
+  const updateParameter = db.prepare(
+    "UPDATE template_parameters SET label = ? WHERE id = ? AND templateId = ?"
+  );
+  runTransaction(() => {
+    db.prepare(
+      `UPDATE templates
+       SET description = ?, version = ?, enabled = ?, updatedAt = ?
+       WHERE id = ?`
+    ).run(
+      normalizedDescription,
+      normalizedVersion,
+      input.enabled === undefined ? (template.enabled ? 1 : 0) : (input.enabled ? 1 : 0),
+      nowIso(),
+      id
+    );
+    parameterLabels.forEach((parameter) => {
+      updateParameter.run(parameter.label.trim(), parameter.id, id);
+    });
+  });
+
+  return getTemplate(id);
+}
+
 export function updateTemplateParseStatus(id: string, status: ParseStatus, message: string): void {
   getDb().prepare("UPDATE templates SET parseStatus = ?, parseMessage = ?, updatedAt = ? WHERE id = ?")
     .run(status, message, nowIso(), id);
@@ -179,8 +258,24 @@ export function updateTemplateParseStatus(id: string, status: ParseStatus, messa
 function mapTemplateRow(row: TemplateRow): TemplateRecord {
   return {
     ...row,
+    enabled: Boolean(row.enabled),
     tags: safeJsonArray(row.tags)
   };
+}
+
+function assertTemplateNameAvailable(groupId: string, name: string, excludeId?: string): void {
+  const sql = `
+    SELECT id FROM templates
+    WHERE groupId = ? AND lower(name) = lower(?)
+    ${excludeId ? "AND id <> ?" : ""}
+    LIMIT 1
+  `;
+  const duplicate = excludeId
+    ? getDb().prepare(sql).get(groupId, name, excludeId)
+    : getDb().prepare(sql).get(groupId, name);
+  if (duplicate) {
+    throw new HttpError(409, "同一分组内不允许存在同名模板");
+  }
 }
 
 function mapParameterRow(row: ParameterRow): TemplateParameter {

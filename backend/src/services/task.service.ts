@@ -92,6 +92,9 @@ export function getResultFile(taskId: string, fileId: string): ResultFile {
 
 export function createAndRunTask(input: CreateTaskInput): ConversionTask {
   const template = getTemplate(input.templateId);
+  if (!template.enabled) {
+    throw new HttpError(400, "模板尚未启用，请先在模板配置中启用");
+  }
   const id = randomUUID();
   const createdAt = nowIso();
   const outputPath = resultOutputPath(id);

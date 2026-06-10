@@ -67,7 +67,7 @@ function AppShell() {
             {
               key: "/results",
               icon: <FileSearchOutlined />,
-              label: "成果管理"
+              label: "任务管理"
             }
           ]}
           onClick={({ key }) => navigate(key)}
@@ -97,4 +97,3 @@ export default function App() {
     </BrowserRouter>
   );
 }
-

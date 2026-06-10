@@ -21,8 +21,7 @@ import {
   FileTextOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
-  SearchOutlined,
-  SyncOutlined
+  SearchOutlined
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
@@ -55,8 +54,12 @@ export default function ResultManage() {
   const loadTasks = async (filters?: { search?: string; status?: TaskStatus }) => {
     setLoading(true);
     try {
-      const s = filters?.search ?? search;
-      const st = filters?.status ?? status;
+      const s = filters && Object.prototype.hasOwnProperty.call(filters, "search")
+        ? filters.search || ""
+        : search;
+      const st = filters && Object.prototype.hasOwnProperty.call(filters, "status")
+        ? filters.status
+        : status;
       setTasks(await api.listTasks({ search: s || undefined, status: st || undefined }));
     } catch (error) {
       message.error(error instanceof Error ? error.message : "成果列表加载失败");
@@ -116,17 +119,6 @@ export default function ResultManage() {
       navigate(`/results/${nextTask.id}`);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "重新运行失败");
-    }
-  };
-
-  const reparseTemplate = async (task: ConversionTask) => {
-    try {
-      await api.parseTemplate(task.templateId);
-      message.success("关联模板重新解析完成");
-      await loadAllTasks();
-      await loadTasks();
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "关联模板解析失败");
     }
   };
 
@@ -216,7 +208,7 @@ export default function ResultManage() {
     },
     {
       title: "操作",
-      width: 300,
+      width: 260,
       fixed: "right",
       render: (_, record) => (
         <Space>
@@ -235,9 +227,6 @@ export default function ResultManage() {
           <Tooltip title="重新运行">
             <Button icon={<ReloadOutlined />} onClick={() => rerun(record)} />
           </Tooltip>
-          <Tooltip title="重新解析模板">
-            <Button icon={<SyncOutlined />} onClick={() => reparseTemplate(record)} />
-          </Tooltip>
           <Tooltip title="删除">
             <Button danger icon={<DeleteOutlined />} onClick={() => confirmDeleteTask(record)} />
           </Tooltip>
@@ -251,7 +240,7 @@ export default function ResultManage() {
       <div className="toolbar">
         <Space direction="vertical" size={0}>
           <Typography.Title level={4} style={{ margin: 0 }}>
-            成果管理
+            任务管理
           </Typography.Title>
           <Typography.Text type="secondary">FME 转换任务与输出成果</Typography.Text>
         </Space>
@@ -307,7 +296,7 @@ export default function ResultManage() {
             pageSize: tablePageSize,
             showSizeChanger: false,
             position: ["bottomCenter"],
-            hideOnSinglePage: true,
+            hideOnSinglePage: false,
             showTotal: (total) => `共 ${total} 条成果`
           }}
           scroll={{ x: 1500 }}

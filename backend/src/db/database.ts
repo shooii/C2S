@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS templates (
   inputDataType TEXT,
   outputDataType TEXT,
   parameterCount INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 0,
   parseStatus TEXT NOT NULL DEFAULT 'pending',
   parseMessage TEXT,
   version TEXT,
@@ -140,7 +141,23 @@ function migrateDatabase(database: SqliteDatabase): void {
   if (!templateColumns.some((column) => column.name === "groupId")) {
     database.exec("ALTER TABLE templates ADD COLUMN groupId TEXT NOT NULL DEFAULT 'default'");
   }
+  if (!templateColumns.some((column) => column.name === "enabled")) {
+    database.exec("ALTER TABLE templates ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
+  }
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");
+  database.exec("CREATE INDEX IF NOT EXISTS idx_templates_enabled ON templates(enabled)");
+  const duplicateTemplateName = database.prepare(
+    `SELECT 1
+     FROM templates
+     GROUP BY groupId, lower(name)
+     HAVING COUNT(*) > 1
+     LIMIT 1`
+  ).get();
+  if (!duplicateTemplateName) {
+    database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_group_name_unique ON templates(groupId, name COLLATE NOCASE)"
+    );
+  }
 
   const groupCount = database.prepare("SELECT COUNT(*) AS count FROM template_groups").get() as { count: number };
   if (groupCount.count > 0) {

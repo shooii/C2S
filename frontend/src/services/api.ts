@@ -38,10 +38,20 @@ async function unwrap<T>(request: Promise<{ data: ApiEnvelope<T> }>): Promise<T>
 export const api = {
   getFmeStatus: () => unwrap<FmeStatus>(http.get("/api/fme/status")),
 
-  listTemplates: (params?: { search?: string; parseStatus?: string }) =>
+  listTemplates: (params?: { search?: string; enabled?: boolean }) =>
     unwrap<TemplateRecord[]>(http.get("/api/templates", { params })),
 
   getTemplate: (id: string) => unwrap<TemplateDetail>(http.get(`/api/templates/${id}`)),
+
+  updateTemplateConfiguration: (
+    id: string,
+    payload: {
+      description?: string | null;
+      version?: string | null;
+      enabled?: boolean;
+      parameterLabels?: Array<{ id: string; label: string }>;
+    }
+  ) => unwrap<TemplateDetail>(http.patch(`/api/templates/${id}`, payload)),
 
   listTemplateGroups: () => unwrap<TemplateGroup[]>(http.get("/api/template-groups")),
 
@@ -56,12 +66,21 @@ export const api = {
   assignTemplateGroup: (templateId: string, groupId: string) =>
     unwrap<TemplateDetail>(http.patch(`/api/templates/${templateId}/group`, { groupId })),
 
-  uploadTemplate: (file: File, onProgress?: (percent: number) => void) => {
+  uploadTemplate: (
+    file: File,
+    groupId: string,
+    uploadToken: string,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal
+  ) => {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("groupId", groupId);
+    formData.append("uploadToken", uploadToken);
     return unwrap<TemplateDetail>(
       http.post("/api/templates/upload", formData, {
         headers: { "Content-Type": "multipart/form-data" },
+        signal,
         onUploadProgress: (event) => {
           if (event.total && onProgress) {
             onProgress(Math.round((event.loaded / event.total) * 100));
@@ -71,7 +90,8 @@ export const api = {
     );
   },
 
-  parseTemplate: (id: string) => unwrap<TemplateDetail>(http.post(`/api/templates/${id}/parse`)),
+  cancelTemplateUpload: (uploadToken: string) =>
+    http.post(`/api/templates/upload-cancellations/${encodeURIComponent(uploadToken)}`),
 
   deleteTemplate: (id: string) => http.delete(`/api/templates/${id}`),
 

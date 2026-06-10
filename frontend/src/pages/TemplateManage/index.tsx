@@ -10,10 +10,12 @@ import {
   Modal,
   Pagination,
   Popconfirm,
+  Progress,
   Select,
   Space,
   Statistic,
   Table,
+  Tag,
   Tooltip,
   Typography,
   Upload
@@ -37,35 +39,37 @@ import {
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
-import { ParseStatusTag } from "../../components/StatusTag";
 import { useManagementPageSize } from "../../hooks/useManagementPageSize";
 import { api } from "../../services/api";
-import type { ParseStatus, TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
+import type { TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
 
 type GroupKey = string;
-type SortKey = "updated-desc" | "updated-asc" | "name-asc" | "params-desc";
+type EnabledFilter = "all" | "enabled" | "disabled";
 
 export default function TemplateManage() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const navigate = useNavigate();
   const [templates, setTemplates] = useState<TemplateRecord[]>([]);
   const [groups, setGroups] = useState<TemplateGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeGroup, setActiveGroup] = useState<GroupKey>("default");
   const [keyword, setKeyword] = useState("");
-  const [status, setStatus] = useState<ParseStatus | "all">("all");
-  const [sort, setSort] = useState<SortKey>("updated-desc");
+  const [status, setStatus] = useState<EnabledFilter>("all");
   const [selected, setSelected] = useState<TemplateDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [groupInitialized, setGroupInitialized] = useState(false);
   const [editingGroup, setEditingGroup] = useState<GroupKey | null>(null);
   const [editingGroupName, setEditingGroupName] = useState("");
   const [groupModalMode, setGroupModalMode] = useState<"create" | "edit">("edit");
-  const [pendingUploadTemplate, setPendingUploadTemplate] = useState<TemplateDetail | null>(null);
+  const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [pendingUploadGroup, setPendingUploadGroup] = useState<GroupKey>("default");
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [groupPage, setGroupPage] = useState(1);
   const [groupPageSize, setGroupPageSize] = useState(8);
   const groupListRef = useRef<HTMLDivElement>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
+  const uploadTokenRef = useRef<string | null>(null);
 
   const loadData = async () => {
     setLoading(true);
@@ -113,7 +117,10 @@ export default function TemplateManage() {
   const currentGroupTemplates = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase();
     const filtered = (groupedTemplates[activeGroup] || []).filter((template) => {
-      if (status !== "all" && template.parseStatus !== status) {
+      if (
+        (status === "enabled" && !template.enabled) ||
+        (status === "disabled" && template.enabled)
+      ) {
         return false;
       }
       if (!normalizedKeyword) {
@@ -128,13 +135,8 @@ export default function TemplateManage() {
       ].some((value) => value.toLowerCase().includes(normalizedKeyword));
     });
 
-    return filtered.sort((a, b) => {
-      if (sort === "updated-asc") return dayjs(a.updatedAt).valueOf() - dayjs(b.updatedAt).valueOf();
-      if (sort === "name-asc") return a.name.localeCompare(b.name, "zh-Hans-CN");
-      if (sort === "params-desc") return b.parameterCount - a.parameterCount;
-      return dayjs(b.updatedAt).valueOf() - dayjs(a.updatedAt).valueOf();
-    });
-  }, [activeGroup, groupedTemplates, keyword, sort, status]);
+    return filtered;
+  }, [activeGroup, groupedTemplates, keyword, status]);
 
   const tablePageSize = useManagementPageSize({
     cardSelector: ".template-table-card",
@@ -149,10 +151,10 @@ export default function TemplateManage() {
 
   const stats = useMemo(() => ({
     total: templates.length,
-    groups: visibleGroupKeys.length,
-    enabled: templates.filter((template) => template.parseStatus === "success").length,
-    failed: templates.filter((template) => template.parseStatus === "failed").length
-  }), [templates, visibleGroupKeys]);
+    enabled: templates.filter((template) => template.enabled).length,
+    disabled: templates.filter((template) => !template.enabled).length,
+    monthAdded: templates.filter((template) => dayjs(template.createdAt).isSame(dayjs(), "month")).length
+  }), [templates]);
 
   useEffect(() => {
     if (groupInitialized || !templates.length) {
@@ -220,18 +222,11 @@ export default function TemplateManage() {
     accept: ".fmw,.fmwt",
     maxCount: 1,
     showUploadList: false,
-    customRequest: async ({ file, onSuccess, onError, onProgress }) => {
-      try {
-        const uploaded = await api.uploadTemplate(file as File, (percent) => onProgress?.({ percent }));
-        setPendingUploadTemplate(uploaded);
-        setPendingUploadGroup(visibleGroupKeys.includes(activeGroup) ? activeGroup : "default");
-        message.success("模板已上传，请选择所属分组");
-        onSuccess?.("ok");
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error("模板上传失败");
-        message.error(err.message);
-        onError?.(err);
-      }
+    beforeUpload: (file) => {
+      setPendingUploadFile(file as File);
+      setPendingUploadGroup(visibleGroupKeys.includes(activeGroup) ? activeGroup : "default");
+      setUploadProgress(0);
+      return Upload.LIST_IGNORE;
     }
   };
 
@@ -307,26 +302,82 @@ export default function TemplateManage() {
       if (activeGroup === key) {
         setActiveGroup("default");
       }
-      message.success("分组已删除，模板已归入默认分组");
+      message.success("分组及其模板已删除");
       await loadData();
     } catch (error) {
       message.error(error instanceof Error ? error.message : "分组删除失败");
     }
   };
 
-  const confirmUploadedTemplateGroup = async () => {
-    if (!pendingUploadTemplate) {
+  const confirmDeleteGroup = (key: GroupKey) => {
+    const groupName = getGroupLabel(key, groups);
+    const templateCount = groupedTemplates[key]?.length || 0;
+    modal.confirm({
+      title: "删除模板分组",
+      content: templateCount
+        ? `确定删除“${groupName}”吗？该分组下的 ${templateCount} 个模板及模板文件会被永久删除。`
+        : `确定删除空分组“${groupName}”吗？`,
+      okText: "删除",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: () => deleteGroup(key)
+    });
+  };
+
+  const closeUploadDialog = (cancelActiveUpload = true) => {
+    const uploadToken = uploadTokenRef.current;
+    if (cancelActiveUpload) {
+      if (uploadToken) {
+        void api.cancelTemplateUpload(uploadToken).catch(() => undefined);
+      }
+      uploadAbortRef.current?.abort();
+    }
+    uploadAbortRef.current = null;
+    uploadTokenRef.current = null;
+    setPendingUploadFile(null);
+    setPendingUploadGroup("default");
+    setUploadProgress(0);
+    setUploading(false);
+  };
+
+  const confirmTemplateUpload = async () => {
+    if (!pendingUploadFile || uploading) {
       return;
     }
+
+    const controller = new AbortController();
+    const uploadToken = crypto.randomUUID();
+    uploadAbortRef.current = controller;
+    uploadTokenRef.current = uploadToken;
+    setUploading(true);
+    setUploadProgress(0);
+
     try {
-      await api.assignTemplateGroup(pendingUploadTemplate.id, pendingUploadGroup);
+      await api.uploadTemplate(
+        pendingUploadFile,
+        pendingUploadGroup,
+        uploadToken,
+        setUploadProgress,
+        controller.signal
+      );
       setActiveGroup(pendingUploadGroup);
       const groupName = getGroupLabel(pendingUploadGroup, groups);
-      setPendingUploadTemplate(null);
-      message.success(`模板已归类到「${groupName}」`);
+      message.success(`模板已上传到「${groupName}」`);
+      closeUploadDialog(false);
       await loadData();
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "模板归类失败");
+      if (controller.signal.aborted) {
+        message.info("已取消模板上传");
+      } else {
+        message.error(error instanceof Error ? error.message : "模板上传失败");
+      }
+    } finally {
+      if (uploadAbortRef.current === controller) {
+        uploadAbortRef.current = null;
+        uploadTokenRef.current = null;
+        setUploading(false);
+      }
     }
   };
 
@@ -340,10 +391,18 @@ export default function TemplateManage() {
           <span className={`template-table-icon ${getIconClass(record)}`}>{getTemplateIcon(record)}</span>
           <Space direction="vertical" size={0}>
             <Typography.Text strong>{value}</Typography.Text>
-            <span className="muted-path">{record.description || getTemplateDescription(record)}</span>
+            <span className={`muted-path${record.description ? "" : " is-empty"}`}>
+              {record.description || "暂无模板说明"}
+            </span>
           </Space>
         </Space>
       )
+    },
+    {
+      title: "版本",
+      dataIndex: "version",
+      width: 84,
+      render: (value) => value || "1.0.0"
     },
     {
       title: "参数",
@@ -352,10 +411,12 @@ export default function TemplateManage() {
       render: (value) => `${value || 0} 个`
     },
     {
-      title: "解析状态",
-      dataIndex: "parseStatus",
+      title: "启用状态",
+      dataIndex: "enabled",
       width: 90,
-      render: (value) => <ParseStatusTag status={value} />
+      render: (value) => value
+        ? <Tag color="success">启用中</Tag>
+        : <Tag>待启用</Tag>
     },
     {
       title: "更新时间",
@@ -365,17 +426,17 @@ export default function TemplateManage() {
     },
     {
       title: "操作",
-      width: 112,
+      width: 150,
       render: (_, record) => (
-        <Space size={4}>
+        <Space>
           <Tooltip title="详情">
-            <Button size="small" icon={<EyeOutlined />} onClick={() => openDetail(record)} />
+            <Button icon={<EyeOutlined />} onClick={() => openDetail(record)} />
           </Tooltip>
-          <Tooltip title="编辑">
-            <Button size="small" icon={<EditOutlined />} onClick={() => navigate(`/templates/${record.id}/config`)} />
+          <Tooltip title="配置">
+            <Button icon={<EditOutlined />} onClick={() => navigate(`/templates/${record.id}/config`)} />
           </Tooltip>
           <Popconfirm title="删除模板" description="模板文件和参数记录会被删除。" onConfirm={() => remove(record)}>
-            <Button size="small" danger icon={<DeleteOutlined />} />
+            <Button danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
       )
@@ -387,7 +448,7 @@ export default function TemplateManage() {
       <div className="toolbar">
         <Space direction="vertical" size={0}>
           <Typography.Title level={4} style={{ margin: 0 }}>模板管理</Typography.Title>
-          <Typography.Text type="secondary">FME Workspace 模板、分组和参数解析</Typography.Text>
+          <Typography.Text type="secondary">FME Workspace 模板、分组和运行配置</Typography.Text>
         </Space>
         <div className="template-upload-actions">
           <Upload {...uploadProps}>
@@ -399,9 +460,9 @@ export default function TemplateManage() {
 
       <div className="stat-grid">
         <Card className="stat-card"><Statistic title="模板总数" value={stats.total} /></Card>
-        <Card className="stat-card"><Statistic title="分组数量" value={stats.groups} valueStyle={{ color: "#1765d8" }} /></Card>
-        <Card className="stat-card"><Statistic title="已解析" value={stats.enabled} valueStyle={{ color: "#167d4c" }} /></Card>
-        <Card className="stat-card"><Statistic title="解析失败" value={stats.failed} valueStyle={{ color: "#c73333" }} /></Card>
+        <Card className="stat-card"><Statistic title="启用中" value={stats.enabled} valueStyle={{ color: "#167d4c" }} /></Card>
+        <Card className="stat-card"><Statistic title="待启用" value={stats.disabled} valueStyle={{ color: "#1765d8" }} /></Card>
+        <Card className="stat-card"><Statistic title="本月新增" value={stats.monthAdded} /></Card>
       </div>
 
       <div className="template-management-grid">
@@ -445,7 +506,7 @@ export default function TemplateManage() {
                           startEditGroup(key);
                         }
                         if (actionKey === "delete") {
-                          void deleteGroup(key);
+                          confirmDeleteGroup(key);
                         }
                       }
                     }}
@@ -457,17 +518,16 @@ export default function TemplateManage() {
             })}
           </div>
 
-          {visibleGroupKeys.length > groupPageSize && (
-            <Pagination
-              className="template-pagination"
-              current={groupPage}
-              pageSize={groupPageSize}
-              total={visibleGroupKeys.length}
-              size="small"
-              showSizeChanger={false}
-              onChange={setGroupPage}
-            />
-          )}
+          <Pagination
+            className="template-pagination"
+            current={groupPage}
+            pageSize={groupPageSize}
+            total={visibleGroupKeys.length}
+            size="small"
+            showSizeChanger={false}
+            hideOnSinglePage={false}
+            onChange={setGroupPage}
+          />
         </Card>
 
         <Card className="table-card management-table-card template-table-card">
@@ -492,20 +552,8 @@ export default function TemplateManage() {
               onChange={setStatus}
               options={[
                 { value: "all", label: "状态：全部" },
-                { value: "success", label: "解析成功" },
-                { value: "pending", label: "待解析" },
-                { value: "parsing", label: "解析中" },
-                { value: "failed", label: "解析失败" }
-              ]}
-            />
-            <Select
-              value={sort}
-              onChange={setSort}
-              options={[
-                { value: "updated-desc", label: "排序：更新时间（最新）" },
-                { value: "updated-asc", label: "排序：更新时间（最早）" },
-                { value: "name-asc", label: "排序：名称" },
-                { value: "params-desc", label: "排序：参数数量" }
+                { value: "enabled", label: "启用中" },
+                { value: "disabled", label: "待启用" }
               ]}
             />
           </div>
@@ -519,7 +567,7 @@ export default function TemplateManage() {
               pageSize: tablePageSize,
               showSizeChanger: false,
               position: ["bottomCenter"],
-              hideOnSinglePage: true,
+              hideOnSinglePage: false,
               showTotal: (total) => `共 ${total} 个模板`
             }}
             locale={{ emptyText: <Empty description="当前分组暂无模板" /> }}
@@ -528,24 +576,58 @@ export default function TemplateManage() {
       </div>
 
       <Modal
-        title="选择模板分组"
-        open={Boolean(pendingUploadTemplate)}
-        onOk={confirmUploadedTemplateGroup}
-        okText="确认归类"
-        cancelButtonProps={{ style: { display: "none" } }}
-        closable={false}
-        maskClosable={false}
+        title="上传模板"
+        open={Boolean(pendingUploadFile)}
+        onCancel={() => closeUploadDialog()}
+        footer={[
+          <Button key="cancel" onClick={() => closeUploadDialog()}>
+            {uploading ? "中止上传" : "取消"}
+          </Button>,
+          <Button
+            key="upload"
+            type="primary"
+            loading={uploading}
+            disabled={!pendingUploadFile || !pendingUploadGroup}
+            onClick={confirmTemplateUpload}
+          >
+            确认上传
+          </Button>
+        ]}
+        closable
+        maskClosable
       >
-        <Space direction="vertical" size={12} style={{ width: "100%" }}>
-          <Typography.Text>
-            模板「{pendingUploadTemplate?.name}」已上传完成，请选择要归类到的分组。
-          </Typography.Text>
+        <Space direction="vertical" size={16} style={{ width: "100%" }}>
+          <div className="template-upload-step">
+            <Typography.Text type="secondary">1. 已选择模板</Typography.Text>
+            <div className="template-upload-file">
+              <FileTextOutlined />
+              <div>
+                <Typography.Text strong>{pendingUploadFile?.name}</Typography.Text>
+                <Typography.Text type="secondary">
+                  {pendingUploadFile ? formatFileSize(pendingUploadFile.size) : ""}
+                </Typography.Text>
+              </div>
+              <Upload {...uploadProps} disabled={uploading}>
+                <Button size="small" disabled={uploading}>重新选择</Button>
+              </Upload>
+            </div>
+          </div>
+
+          <div className="template-upload-step">
+            <Typography.Text type="secondary">2. 选择归类分组</Typography.Text>
           <Select
             value={pendingUploadGroup}
             options={groupOptions}
             onChange={setPendingUploadGroup}
+            disabled={uploading}
             style={{ width: "100%" }}
           />
+          </div>
+
+          <div className="template-upload-step">
+            <Typography.Text type="secondary">3. 确认后开始上传模板</Typography.Text>
+            {uploading && <Progress percent={uploadProgress} size="small" />}
+          </div>
         </Space>
       </Modal>
 
@@ -562,11 +644,16 @@ export default function TemplateManage() {
       >
         {selected && (
           <Descriptions bordered size="small" column={2}>
+            <Descriptions.Item label="模板说明" span={2}>
+              {selected.description || "暂无模板说明"}
+            </Descriptions.Item>
             <Descriptions.Item label="模板名称">{selected.name}</Descriptions.Item>
             <Descriptions.Item label="文件类型">{selected.fileType}</Descriptions.Item>
             <Descriptions.Item label="参数数量">{selected.parameterCount}</Descriptions.Item>
-            <Descriptions.Item label="解析状态"><ParseStatusTag status={selected.parseStatus} /></Descriptions.Item>
-            <Descriptions.Item label="解析信息" span={2}>{selected.parseMessage || "-"}</Descriptions.Item>
+            <Descriptions.Item label="模板版本">{selected.version || "1.0.0"}</Descriptions.Item>
+            <Descriptions.Item label="启用状态">
+              {selected.enabled ? <Tag color="success">启用中</Tag> : <Tag>待启用</Tag>}
+            </Descriptions.Item>
             <Descriptions.Item label="模板路径" span={2}>{selected.filePath}</Descriptions.Item>
           </Descriptions>
         )}
@@ -618,9 +705,8 @@ function getIconClass(template: TemplateRecord): string {
   return "is-green";
 }
 
-function getTemplateDescription(template: TemplateRecord): string {
-  if (template.parameterCount) {
-    return `已识别 ${template.parameterCount} 个 FME 参数，可配置后运行转换。`;
-  }
-  return "FME Workspace 模板，支持上传、查看、编辑和运行。";
+function formatFileSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }

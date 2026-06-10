@@ -55,6 +55,7 @@ export interface TemplateRecord {
   inputDataType: string | null;
   outputDataType: string | null;
   parameterCount: number;
+  enabled: boolean;
   parseStatus: ParseStatus;
   parseMessage: string | null;
   version: string | null;

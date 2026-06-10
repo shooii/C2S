@@ -24,13 +24,13 @@ import {
   ArrowLeftOutlined,
   DeleteOutlined,
   PlusOutlined,
-  PlayCircleOutlined
+  PlayCircleOutlined,
+  SaveOutlined
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../../services/api";
 import type { TemplateDetail, TemplateParameter } from "../../types";
-import { ParseStatusTag } from "../../components/StatusTag";
 
 const outputFormatOptions = [
   { value: "glb", label: "GLB" },
@@ -95,6 +95,11 @@ export default function TemplateConfig() {
   const [template, setTemplate] = useState<TemplateDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [description, setDescription] = useState("");
+  const [version, setVersion] = useState("1.0.0");
+  const [enabled, setEnabled] = useState(false);
+  const [parameterLabels, setParameterLabels] = useState<Record<string, string>>({});
+  const [savingConfiguration, setSavingConfiguration] = useState(false);
 
   useEffect(() => {
     if (!id) {
@@ -105,6 +110,12 @@ export default function TemplateConfig() {
       try {
         const detail = await api.getTemplate(id);
         setTemplate(detail);
+        setDescription(detail.description || "");
+        setVersion(detail.version || "1.0.0");
+        setEnabled(detail.enabled);
+        setParameterLabels(Object.fromEntries(
+          detail.parameters.map((parameter) => [parameter.id, parameter.label])
+        ));
         form.setFieldsValue({
           parameters: Object.fromEntries(
             detail.parameters.map((parameter) => [
@@ -123,6 +134,61 @@ export default function TemplateConfig() {
   }, [id, form, message]);
 
   const requiredCount = useMemo(() => template?.parameters.filter((item) => item.required).length || 0, [template]);
+  const configurationChanged = useMemo(() => {
+    if (!template) {
+      return false;
+    }
+    return (
+      description.trim() !== (template.description || "") ||
+      version.trim() !== (template.version || "1.0.0") ||
+      enabled !== template.enabled ||
+      template.parameters.some((parameter) => (
+        (parameterLabels[parameter.id] || "").trim() !== parameter.label
+      ))
+    );
+  }, [description, enabled, parameterLabels, template, version]);
+
+  const saveConfiguration = async () => {
+    if (!template) {
+      return;
+    }
+    if (!version.trim()) {
+      message.warning("模板版本号不能为空");
+      return;
+    }
+    const emptyParameter = template.parameters.find((parameter) => (
+      !(parameterLabels[parameter.id] || "").trim()
+    ));
+    if (emptyParameter) {
+      message.warning(`参数“${emptyParameter.name}”的名称不能为空`);
+      return;
+    }
+
+    setSavingConfiguration(true);
+    try {
+      const updated = await api.updateTemplateConfiguration(template.id, {
+        description,
+        version,
+        enabled,
+        parameterLabels: template.parameters.map((parameter) => ({
+          id: parameter.id,
+          label: (parameterLabels[parameter.id] || parameter.label).trim()
+        }))
+      });
+      setTemplate(updated);
+      setDescription(updated.description || "");
+      setVersion(updated.version || "1.0.0");
+      setEnabled(updated.enabled);
+      setParameterLabels(Object.fromEntries(
+        updated.parameters.map((parameter) => [parameter.id, parameter.label])
+      ));
+      message.success("模板配置已保存");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "模板配置保存失败");
+    } finally {
+      setSavingConfiguration(false);
+    }
+  };
 
   const submit = async (values: {
     parameters?: Record<string, unknown>;
@@ -132,13 +198,13 @@ export default function TemplateConfig() {
     }
     setRunning(true);
     try {
-      const task = await api.runTask({
+      await api.runTask({
         templateId: template.id,
         taskName: `${template.name} 转换任务`,
         parameters: normalizeParameters(values.parameters || {})
       });
       message.success("转换任务已创建");
-      navigate(`/results/${task.id}`);
+      navigate("/results");
     } catch (error) {
       message.error(error instanceof Error ? error.message : "任务创建失败");
     } finally {
@@ -172,19 +238,34 @@ export default function TemplateConfig() {
             <Typography.Text type="secondary">{template.name}</Typography.Text>
           </Space>
         </Space>
+        <Button
+          type="primary"
+          icon={<SaveOutlined />}
+          loading={savingConfiguration}
+          disabled={!configurationChanged}
+          onClick={saveConfiguration}
+        >
+          保存配置
+        </Button>
       </div>
 
       <div className="config-grid">
-        <Card className="form-card" title="模板解析参数">
+        <Card className="form-card" title="运行参数">
           <Form form={form} layout="vertical" onFinish={submit}>
             {template.parameters.length ? (
               template.parameters.map((parameter) => renderParameterItem(parameter))
             ) : (
-              <Empty description="模板未识别到公开参数" />
+              <Empty description="暂无可配置参数" />
             )}
 
             <Form.Item>
-              <Button type="primary" htmlType="submit" icon={<PlayCircleOutlined />} loading={running}>
+              <Button
+                type="primary"
+                htmlType="submit"
+                icon={<PlayCircleOutlined />}
+                loading={running}
+                disabled={!template.enabled}
+              >
                 发起转换
               </Button>
             </Form.Item>
@@ -192,25 +273,64 @@ export default function TemplateConfig() {
         </Card>
 
         <Space direction="vertical" size={16} className="full-height">
+          <Card className="detail-card" title="模板设置">
+            <Space direction="vertical" size={16} style={{ width: "100%" }}>
+              <div>
+                <Typography.Text type="secondary">模板版本</Typography.Text>
+                <Input
+                  value={version}
+                  maxLength={30}
+                  placeholder="例如 1.0.0"
+                  onChange={(event) => setVersion(event.target.value)}
+                  style={{ marginTop: 6 }}
+                />
+              </div>
+              <div className="template-enabled-setting">
+                <div>
+                  <Typography.Text strong>启用模板</Typography.Text>
+                  <div className="parameter-help">
+                    {enabled ? "启用中" : "待启用"}
+                  </div>
+                </div>
+                <Switch checked={enabled} onChange={setEnabled} />
+              </div>
+              <div>
+                <Typography.Text type="secondary">模板说明</Typography.Text>
+                <TextArea
+                  value={description}
+                  rows={4}
+                  maxLength={500}
+                  showCount
+                  placeholder="请输入模板用途、适用数据和输出成果"
+                  onChange={(event) => setDescription(event.target.value)}
+                  style={{ marginTop: 6 }}
+                />
+              </div>
+            </Space>
+          </Card>
+
           <Card className="detail-card" title="模板基础信息">
             <Descriptions size="small" column={1}>
               <Descriptions.Item label="模板名称">{template.name}</Descriptions.Item>
               <Descriptions.Item label="文件类型">{template.fileType}</Descriptions.Item>
               <Descriptions.Item label="参数数量">{template.parameterCount}</Descriptions.Item>
               <Descriptions.Item label="必填参数">{requiredCount}</Descriptions.Item>
-              <Descriptions.Item label="解析状态">
-                <ParseStatusTag status={template.parseStatus} />
-              </Descriptions.Item>
-              <Descriptions.Item label="解析信息">{template.parseMessage || "-"}</Descriptions.Item>
             </Descriptions>
           </Card>
 
-          <Card className="detail-card" title="参数概览">
+          <Card className="detail-card" title="参数名称">
             {template.parameters.length ? (
-              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+              <Space direction="vertical" size={12} style={{ width: "100%" }}>
                 {template.parameters.map((parameter) => (
-                  <div key={parameter.id}>
-                    <Typography.Text strong>{parameter.label}</Typography.Text>
+                  <div key={parameter.id} className="parameter-name-setting">
+                    <Input
+                      value={parameterLabels[parameter.id] || ""}
+                      maxLength={100}
+                      onChange={(event) => setParameterLabels((current) => ({
+                        ...current,
+                        [parameter.id]: event.target.value
+                      }))}
+                    />
                     <div className="parameter-help">
                       {parameter.name} · {parameter.type}{parameter.required ? " · 必填" : ""}
                     </div>

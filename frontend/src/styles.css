@@ -139,6 +139,18 @@ body,
   font-size: 12px;
 }
 
+.template-enabled-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.parameter-name-setting .parameter-help {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
 .config-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -267,6 +279,41 @@ body,
   font-size: 12px;
   line-height: 16px;
   text-align: center;
+}
+
+.template-upload-step {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.template-upload-file {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 8px 10px;
+  background: #f7f9fc;
+  border: 1px solid #dfe7f1;
+  border-radius: 6px;
+}
+
+.template-upload-file > .anticon {
+  color: #1677ff;
+  font-size: 24px;
+}
+
+.template-upload-file > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.template-upload-file .ant-typography {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .management-page {
@@ -405,7 +452,7 @@ body,
 }
 
 .template-filter-row {
-  grid-template-columns: minmax(220px, 1fr) 160px 210px;
+  grid-template-columns: minmax(280px, 1fr) 180px;
   margin-bottom: 12px;
 }
 
@@ -460,6 +507,10 @@ body,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.template-table-card .muted-path.is-empty {
+  color: #9aa6b5;
 }
 
 .template-table-icon {

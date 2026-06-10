@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { getDb, nowIso, runTransaction } from "../db/database";
 import type { TemplateGroup } from "../types";
 import { assertFound, HttpError } from "../utils/httpError";
+import { removeIfExists } from "./file.service";
 
 type GroupRow = Omit<TemplateGroup, "builtIn" | "templateCount"> & {
   builtIn: number;
@@ -75,25 +76,39 @@ export function deleteTemplateGroup(id: string): void {
   getTemplateGroup(id);
 
   const db = getDb();
+  const templates = db.prepare(
+    "SELECT id, filePath FROM templates WHERE groupId = ?"
+  ).all(id) as unknown as Array<{ id: string; filePath: string }>;
+
   runTransaction(() => {
-    db.prepare("UPDATE templates SET groupId = 'default', updatedAt = ? WHERE groupId = ?")
-      .run(nowIso(), id);
+    db.prepare("DELETE FROM templates WHERE groupId = ?").run(id);
     db.prepare("DELETE FROM template_groups WHERE id = ?").run(id);
   });
+  templates.forEach((template) => removeIfExists(template.filePath));
 }
 
 export function assignTemplateGroup(templateId: string, groupId: string): void {
   const db = getDb();
-  assertFound(
-    db.prepare("SELECT id FROM templates WHERE id = ?").get(templateId),
+  const template = assertFound(
+    db.prepare("SELECT id, name FROM templates WHERE id = ?").get(templateId) as
+      | { id: string; name: string }
+      | undefined,
     "模板不存在"
   );
   getTemplateGroup(groupId);
+  const duplicate = db.prepare(
+    `SELECT id FROM templates
+     WHERE groupId = ? AND lower(name) = lower(?) AND id <> ?
+     LIMIT 1`
+  ).get(groupId, template.name, templateId);
+  if (duplicate) {
+    throw new HttpError(409, "目标分组已存在同名模板");
+  }
   db.prepare("UPDATE templates SET groupId = ?, updatedAt = ? WHERE id = ?")
     .run(groupId, nowIso(), templateId);
 }
 
-function getTemplateGroup(id: string): TemplateGroup {
+export function getTemplateGroup(id: string): TemplateGroup {
   const row = assertFound(
     getDb().prepare(
       `SELECT groups.*, COUNT(templates.id) AS templateCount
