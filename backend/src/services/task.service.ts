@@ -9,6 +9,7 @@ import {
   defaultLogPath,
   getWorkspaceOutputParameterNames,
   isOutputDirectoryParameter,
+  type OutputFileSnapshot,
   runWorkspace,
   scanOutputFiles,
   snapshotOutputFiles
@@ -275,13 +276,14 @@ async function executeTask(
     errorMessage: null
   });
 
+  const outputSnapshot = snapshotOutputFiles(task.outputPath);
+
   try {
     const runtimeParameters = enrichWorkspaceOutputParameters(
       fmeParameters,
       workspacePath,
       task.outputPath
     );
-    const outputSnapshot = snapshotOutputFiles(task.outputPath);
     const result = await runWorkspace({
       taskId,
       workspacePath,
@@ -296,20 +298,15 @@ async function executeTask(
       return;
     }
 
-    const generatedFiles = scanOutputFiles(taskId, task.outputPath, outputSnapshot);
-    const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
-    replaceResultFiles(taskId, files);
-    const persistedFiles = getResultFiles(taskId);
-    const firstPreviewable = persistedFiles.find((file) => file.previewable);
-    const hasDownloadableFiles = persistedFiles.some((file) => file.downloadable);
+    const resultFiles = persistGeneratedFiles(taskId, task.outputPath, outputSnapshot);
     const success = result.exitCode === 0;
 
     updateTask(taskId, {
       status: success ? "success" : "failed",
       progress: success ? 100 : Math.max(current.progress, 5),
-      resultSize: files.reduce((total, file) => total + file.fileSize, 0),
-      previewUrl: firstPreviewable ? `/api/results/${taskId}/preview` : null,
-      downloadUrl: hasDownloadableFiles ? `/api/results/${taskId}/download` : null,
+      resultSize: resultFiles.resultSize,
+      previewUrl: resultFiles.firstPreviewable ? `/api/results/${taskId}/preview` : null,
+      downloadUrl: resultFiles.hasDownloadableFiles ? `/api/results/${taskId}/download` : null,
       exitCode: result.exitCode,
       errorMessage: success ? null : `FME 进程退出码：${result.exitCode ?? "null"}`,
       finishedAt: nowIso(),
@@ -320,9 +317,13 @@ async function executeTask(
     if (current.status === "cancelled") {
       return;
     }
+    const resultFiles = tryPersistGeneratedFiles(taskId, task.outputPath, outputSnapshot);
     updateTask(taskId, {
       status: "failed",
       progress: Math.max(current.progress, 5),
+      resultSize: resultFiles?.resultSize ?? current.resultSize,
+      previewUrl: resultFiles?.firstPreviewable ? `/api/results/${taskId}/preview` : current.previewUrl,
+      downloadUrl: resultFiles?.hasDownloadableFiles ? `/api/results/${taskId}/download` : current.downloadUrl,
       errorMessage: error instanceof Error ? error.message : "FME 执行失败",
       finishedAt: nowIso(),
       duration: current.startedAt ? Date.now() - new Date(current.startedAt).getTime() : null
@@ -345,6 +346,38 @@ function scheduleTaskExecution(
       });
     });
   });
+}
+
+function persistGeneratedFiles(
+  taskId: string,
+  outputPath: string,
+  outputSnapshot: OutputFileSnapshot
+): {
+  resultSize: number;
+  firstPreviewable: ResultFile | undefined;
+  hasDownloadableFiles: boolean;
+} {
+  const generatedFiles = scanOutputFiles(taskId, outputPath, outputSnapshot);
+  const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
+  replaceResultFiles(taskId, files);
+  const persistedFiles = getResultFiles(taskId);
+  return {
+    resultSize: files.reduce((total, file) => total + file.fileSize, 0),
+    firstPreviewable: persistedFiles.find((file) => file.previewable),
+    hasDownloadableFiles: persistedFiles.some((file) => file.downloadable)
+  };
+}
+
+function tryPersistGeneratedFiles(
+  taskId: string,
+  outputPath: string,
+  outputSnapshot: OutputFileSnapshot
+): ReturnType<typeof persistGeneratedFiles> | null {
+  try {
+    return persistGeneratedFiles(taskId, outputPath, outputSnapshot);
+  } catch {
+    return null;
+  }
 }
 
 function syncResultFilesToManagedStorage(

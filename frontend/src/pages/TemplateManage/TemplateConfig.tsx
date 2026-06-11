@@ -19,6 +19,7 @@ import {
   Switch,
   Table,
   TimePicker,
+  Tooltip,
   Typography
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
@@ -251,17 +252,24 @@ export default function TemplateConfig() {
   return (
     <div className="page-stack">
       <div className="toolbar">
-        <Space>
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate("/templates")}>
-            返回
-          </Button>
+        <div className="result-detail-heading">
+          <Tooltip title="返回模板列表">
+            <Button
+              aria-label="返回模板列表"
+              className="result-detail-back"
+              icon={<ArrowLeftOutlined />}
+              shape="circle"
+              type="text"
+              onClick={() => navigate("/templates")}
+            />
+          </Tooltip>
           <Space direction="vertical" size={0}>
             <Typography.Title level={4} style={{ margin: 0 }}>
               模板配置
             </Typography.Title>
             <Typography.Text type="secondary">{template.name}</Typography.Text>
           </Space>
-        </Space>
+        </div>
         <Space>
           <Button
             icon={<SyncOutlined />}

@@ -72,6 +72,10 @@ body,
   overflow: auto;
 }
 
+.app-content:has(.result-detail-page) {
+  overflow: hidden;
+}
+
 .page-stack {
   display: flex;
   flex-direction: column;
@@ -135,6 +139,7 @@ body,
 }
 
 .log-view {
+  min-width: 0;
   min-height: 220px;
   margin: 0;
   padding: 14px;
@@ -146,6 +151,21 @@ body,
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
+}
+
+.detail-log-view {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  white-space: pre;
+}
+
+.parameter-log-view {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  white-space: pre;
 }
 
 .parameter-help {
@@ -187,7 +207,139 @@ body,
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
   gap: 16px;
-  align-items: start;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-items: stretch;
+}
+
+.result-detail-page {
+  height: calc(100vh - 48px);
+  min-height: 0;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.result-detail-page .toolbar {
+  flex: 0 0 auto;
+}
+
+.result-detail-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.result-detail-heading .ant-space {
+  min-width: 0;
+}
+
+.result-detail-heading .ant-typography {
+  max-width: 440px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-detail-back.ant-btn {
+  width: 36px;
+  height: 36px;
+  color: #42526b;
+  background: #ffffff;
+  border: 1px solid #d9e2ef;
+  box-shadow: 0 4px 12px rgba(15, 31, 51, 0.06);
+}
+
+.result-detail-back.ant-btn:hover,
+.result-detail-back.ant-btn:focus-visible {
+  color: #1765d8;
+  background: #edf4ff;
+  border-color: #bfd5ff;
+}
+
+.result-detail-page .detail-card {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.result-detail-page .detail-card .ant-card-head {
+  min-height: 48px;
+}
+
+.result-detail-page .detail-card .ant-card-head-title,
+.result-detail-page .detail-card .ant-card-extra {
+  padding-block: 10px;
+}
+
+.result-detail-page .detail-card .ant-card-body {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 24px;
+  overflow: auto;
+}
+
+.result-detail-column {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.result-detail-left {
+  grid-template-rows: auto minmax(132px, 0.58fr) minmax(220px, 1fr);
+}
+
+.result-detail-right {
+  grid-template-rows: minmax(200px, 0.56fr) minmax(260px, 1fr);
+}
+
+.result-detail-basic-card .ant-card-body {
+  padding-block: 14px;
+}
+
+.result-detail-basic-card .ant-descriptions-item-label,
+.result-detail-basic-card .ant-descriptions-item-content {
+  padding: 8px 10px !important;
+}
+
+.result-detail-basic-card .ant-descriptions-item-label {
+  width: 74px;
+  white-space: nowrap;
+}
+
+.result-detail-basic-card .ant-descriptions-item-content {
+  min-width: 0;
+  word-break: break-all;
+}
+
+.result-files-card .ant-card-body,
+.result-log-card .ant-card-body,
+.result-parameters-card .ant-card-body {
+  display: flex;
+  overflow: hidden;
+}
+
+.result-files-card .ant-table-wrapper {
+  width: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.result-files-card .ant-table-thead > tr > th,
+.result-files-card .ant-table-tbody > tr > td {
+  padding-block: 8px;
+}
+
+.result-progress-card .ant-card-body {
+  display: grid;
+  place-items: center;
 }
 
 .preview-shell {

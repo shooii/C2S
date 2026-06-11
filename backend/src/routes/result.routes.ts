@@ -9,10 +9,16 @@ import {
   getResultFiles,
   getTask
 } from "../services/task.service";
+import { assertPathInside, listFilesRecursive, resultOutputPath } from "../services/file.service";
 import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
 
 const router = Router();
+
+interface ArchiveFile {
+  fileName: string;
+  filePath: string;
+}
 
 router.get(
   "/:taskId/files",
@@ -25,14 +31,9 @@ router.get(
   "/:taskId/download",
   asyncHandler(async (req, res, next) => {
     const task = getTask(req.params.taskId);
-    const files = getResultFiles(req.params.taskId).filter((file) => file.downloadable);
+    const files = getArchiveFiles(req.params.taskId);
     if (!files.length) {
       throw new HttpError(404, "暂无可下载成果文件");
-    }
-
-    const missingFile = files.find((file) => !fs.existsSync(file.filePath));
-    if (missingFile) {
-      throw new HttpError(404, `成果文件 ${missingFile.fileName} 不存在或已被删除`);
     }
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2s-results-"));
@@ -152,6 +153,43 @@ function uniqueArchiveEntryName(entryName: string, usedNames: Set<string>): stri
   }
   usedNames.add(candidate);
   return candidate;
+}
+
+function getArchiveFiles(taskId: string): ArchiveFile[] {
+  const managedRoot = resultOutputPath(taskId);
+  const filesByPath = new Map<string, ArchiveFile>();
+
+  getResultFiles(taskId)
+    .filter((file) => file.downloadable)
+    .forEach((file) => {
+      addArchiveFile(filesByPath, managedRoot, file.filePath, file.fileName);
+    });
+
+  listFilesRecursive(managedRoot).forEach((file) => {
+    addArchiveFile(filesByPath, managedRoot, file.filePath, file.fileName);
+  });
+
+  return [...filesByPath.values()];
+}
+
+function addArchiveFile(
+  filesByPath: Map<string, ArchiveFile>,
+  managedRoot: string,
+  filePath: string,
+  fileName: string
+): void {
+  try {
+    const safePath = assertPathInside(managedRoot, filePath);
+    if (!fs.existsSync(safePath) || !fs.statSync(safePath).isFile()) {
+      return;
+    }
+    const key = path.resolve(safePath).toLowerCase();
+    if (!filesByPath.has(key)) {
+      filesByPath.set(key, { fileName, filePath: safePath });
+    }
+  } catch {
+    // Ignore stale or invalid result-file records; actual managed outputs are scanned separately.
+  }
 }
 
 function safeDownloadName(value: string): string {

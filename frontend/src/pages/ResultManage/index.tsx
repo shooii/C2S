@@ -53,8 +53,7 @@ export default function ResultManage() {
       list = list.filter(
         (t) =>
           t.taskName.toLowerCase().includes(q) ||
-          (t.templateName && t.templateName.toLowerCase().includes(q)) ||
-          (t.inputDataName && t.inputDataName.toLowerCase().includes(q))
+          (t.templateName && t.templateName.toLowerCase().includes(q))
       );
     }
     return list;
@@ -155,7 +154,7 @@ export default function ResultManage() {
   });
 
   const downloadArchive = (task: ConversionTask) => {
-    if (task.status !== "success") {
+    if (!task.downloadUrl && !task.resultSize) {
       return;
     }
     window.open(api.downloadArchiveUrl(task.id), "_blank");
@@ -265,19 +264,6 @@ export default function ResultManage() {
       width: 170
     },
     {
-      title: "输入数据",
-      dataIndex: "inputDataName",
-      width: 170,
-      ellipsis: true,
-      render: (value) => value || "-"
-    },
-    {
-      title: "输出格式",
-      dataIndex: "outputFormat",
-      width: 100,
-      render: (value) => value || "-"
-    },
-    {
       title: "运行状态",
       dataIndex: "status",
       width: 110,
@@ -322,7 +308,7 @@ export default function ResultManage() {
             <Button icon={<PlayCircleOutlined />} disabled={!record.previewUrl} onClick={() => navigate(`/preview/${record.id}`)} />
           </Tooltip>
           <Tooltip title="下载">
-            <Button icon={<DownloadOutlined />} disabled={record.status !== "success"} onClick={() => downloadArchive(record)} />
+            <Button icon={<DownloadOutlined />} disabled={!record.downloadUrl && !record.resultSize} onClick={() => downloadArchive(record)} />
           </Tooltip>
           <Tooltip title="日志">
             <Button icon={<FileTextOutlined />} onClick={() => setLogTask(record)} />
@@ -365,7 +351,7 @@ export default function ResultManage() {
           <Input
             allowClear
             prefix={<SearchOutlined />}
-            placeholder="搜索任务、模板或输入数据"
+            placeholder="搜索任务或模板"
             value={search}
             onChange={(event) => {
               setSearch(event.target.value);

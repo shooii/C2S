@@ -54,6 +54,14 @@ interface WorkspaceParseContext {
   packageRoot: string | null;
 }
 
+interface ProgressStream {
+  key: string;
+  current: number;
+  total: number;
+  samples: number;
+  percent: number;
+}
+
 const runningProcesses = new Map<string, ChildProcessWithoutNullStreams>();
 let cachedFmeCommand: string | null = null;
 
@@ -206,10 +214,11 @@ export async function runWorkspace(input: RunWorkspaceInput): Promise<RunWorkspa
   fs.mkdirSync(path.dirname(input.logPath), { recursive: true });
 
   const logStream = fs.createWriteStream(input.logPath, { flags: "a" });
+  const progressTracker = createProgressTracker();
   const writeLog = (chunk: string) => {
     logStream.write(chunk);
     input.onLog?.(chunk);
-    const progress = extractProgress(chunk);
+    const progress = progressTracker(chunk);
     if (progress !== null) {
       input.onProgress?.(progress);
     }
@@ -1261,8 +1270,49 @@ function prettifyName(name: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function extractProgress(chunk: string): number | null {
-  const match = chunk.match(/(\d{1,3})\s*%/);
+function createProgressTracker(): (chunk: string) => number | null {
+  const streams = new Map<string, ProgressStream>();
+  let pendingLine = "";
+  let activeKey: string | null = null;
+
+  return (chunk: string) => {
+    const text = pendingLine + chunk;
+    const lines = text.split(/\r?\n/);
+    pendingLine = text.endsWith("\n") || text.endsWith("\r") ? "" : lines.pop() ?? "";
+
+    let latestProgress: number | null = null;
+    for (const line of lines) {
+      const explicitPercent = extractPercentProgress(line);
+      if (explicitPercent !== null) {
+        latestProgress = explicitPercent;
+        continue;
+      }
+
+      const measured = extractMeasuredProgress(line);
+      if (!measured) {
+        continue;
+      }
+
+      const previous = streams.get(measured.key);
+      const stream: ProgressStream = {
+        ...measured,
+        samples: (previous?.samples ?? 0) + 1
+      };
+      streams.set(stream.key, stream);
+
+      const active = activeKey ? streams.get(activeKey) ?? null : null;
+      if (shouldUseProgressStream(stream, active)) {
+        activeKey = stream.key;
+        latestProgress = stream.percent;
+      }
+    }
+
+    return latestProgress;
+  };
+}
+
+function extractPercentProgress(line: string): number | null {
+  const match = line.match(/(\d{1,3})\s*%/);
   if (!match) {
     return null;
   }
@@ -1270,7 +1320,59 @@ function extractProgress(chunk: string): number | null {
   if (Number.isNaN(value)) {
     return null;
   }
-  return Math.max(5, Math.min(99, value));
+  return normalizeRunningProgress(value);
+}
+
+function extractMeasuredProgress(line: string): Omit<ProgressStream, "samples"> | null {
+  const match = line.match(
+    /^(?<source>[^:\r\n]+):\s*Processed(?:\s+'(?<label>[^']+)')?\s+(?<current>[\d,]+)\s*(?:\/|of)\s*(?<total>[\d,]+)(?:\s+(?<unit>[A-Za-z]+))?/i
+  );
+  if (!match?.groups) {
+    return null;
+  }
+
+  const current = parseProgressNumber(match.groups.current);
+  const total = parseProgressNumber(match.groups.total);
+  if (!current || !total || current > total) {
+    return null;
+  }
+
+  const percent = normalizeRunningProgress((current / total) * 100);
+  return {
+    key: [
+      match.groups.source.trim().toLowerCase(),
+      (match.groups.label || "").trim().toLowerCase(),
+      (match.groups.unit || "").trim().toLowerCase(),
+      total
+    ].join("|"),
+    current,
+    total,
+    percent
+  };
+}
+
+function shouldUseProgressStream(stream: ProgressStream, active: ProgressStream | null): boolean {
+  if (stream.samples < 2) {
+    return false;
+  }
+  if (!active) {
+    return true;
+  }
+  if (stream.key === active.key) {
+    return true;
+  }
+  return stream.samples > active.samples && stream.total >= active.total;
+}
+
+function parseProgressNumber(value: string): number {
+  return Number(value.replace(/,/g, ""));
+}
+
+function normalizeRunningProgress(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 5;
+  }
+  return Math.max(5, Math.min(99, Math.round(value)));
 }
 
 function firstNonEmptyLine(text: string): string | undefined {
