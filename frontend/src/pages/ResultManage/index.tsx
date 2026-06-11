@@ -27,9 +27,10 @@ import dayjs from "dayjs";
 import { useLocation, useNavigate } from "react-router-dom";
 import { LogDrawer } from "../../components/LogDrawer";
 import { TaskStatusTag } from "../../components/StatusTag";
-import { useManagementPageSize } from "../../hooks/useManagementPageSize";
 import { api } from "../../services/api";
 import type { ConversionTask, TaskStatus } from "../../types";
+
+const MANAGEMENT_PAGE_SIZE = 10;
 
 export default function ResultManage() {
   const { message, modal } = App.useApp();
@@ -147,11 +148,6 @@ export default function ResultManage() {
     success: allTasks.filter((task) => task.status === "success").length,
     failed: allTasks.filter((task) => task.status === "failed").length
   }), [allTasks]);
-
-  const tablePageSize = useManagementPageSize({
-    cardSelector: ".result-table-card",
-    fallbackRowHeight: 54
-  });
 
   const downloadArchive = (task: ConversionTask) => {
     if (!task.downloadUrl && !task.resultSize) {
@@ -405,7 +401,7 @@ export default function ResultManage() {
             onChange: (keys) => setSelectedTaskIds(keys.map(String))
           }}
           pagination={{
-            pageSize: tablePageSize,
+            pageSize: MANAGEMENT_PAGE_SIZE,
             showSizeChanger: false,
             position: ["bottomCenter"],
             hideOnSinglePage: false,

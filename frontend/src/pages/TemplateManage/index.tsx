@@ -40,12 +40,12 @@ import {
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
-import { useManagementPageSize } from "../../hooks/useManagementPageSize";
 import { api } from "../../services/api";
 import type { TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
 
 type GroupKey = string;
 type EnabledFilter = "all" | "enabled" | "disabled";
+const MANAGEMENT_PAGE_SIZE = 10;
 
 export default function TemplateManage() {
   const { message, modal } = App.useApp();
@@ -151,11 +151,6 @@ export default function TemplateManage() {
     return filtered;
   }, [activeGroup, groupedTemplates, keyword, status]);
 
-  const tablePageSize = useManagementPageSize({
-    cardSelector: ".template-table-card",
-    fallbackRowHeight: 52
-  });
-
   const selectGroup = (key: GroupKey) => {
     if (key === activeGroup) {
       return;
@@ -204,11 +199,11 @@ export default function TemplateManage() {
   }, [groupPage, groupPageSize, visibleGroupKeys]);
 
   useEffect(() => {
-    const maxPage = Math.max(1, Math.ceil(currentGroupTemplates.length / tablePageSize));
+    const maxPage = Math.max(1, Math.ceil(currentGroupTemplates.length / MANAGEMENT_PAGE_SIZE));
     if (tablePage > maxPage) {
       setTablePage(maxPage);
     }
-  }, [currentGroupTemplates.length, tablePage, tablePageSize]);
+  }, [currentGroupTemplates.length, tablePage]);
 
   useEffect(() => {
     const groupList = groupListRef.current;
@@ -609,7 +604,7 @@ export default function TemplateManage() {
             dataSource={currentGroupTemplates}
             pagination={{
               current: tablePage,
-              pageSize: tablePageSize,
+              pageSize: MANAGEMENT_PAGE_SIZE,
               showSizeChanger: false,
               position: ["bottomCenter"],
               hideOnSinglePage: false,
