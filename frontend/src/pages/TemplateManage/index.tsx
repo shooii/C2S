@@ -421,7 +421,7 @@ export default function TemplateManage() {
     {
       title: "模板名称",
       dataIndex: "name",
-      width: 180,
+      width: 260,
       render: (value, record) => (
         <Space size={12}>
           <span className={`template-table-icon ${getIconClass(record)}`}>{getTemplateIcon(record)}</span>
@@ -443,7 +443,7 @@ export default function TemplateManage() {
     {
       title: "参数",
       dataIndex: "parameterCount",
-      width: 60,
+      width: 72,
       render: (value) => `${value || 0} 个`
     },
     {
@@ -457,12 +457,13 @@ export default function TemplateManage() {
     {
       title: "更新时间",
       dataIndex: "updatedAt",
-      width: 120,
+      width: 136,
       render: (value) => dayjs(value).format("YYYY-MM-DD HH:mm")
     },
     {
       title: "操作",
-      width: 150,
+      width: 136,
+      fixed: "right",
       render: (_, record) => (
         <Space>
           <Tooltip title="详情">
@@ -612,6 +613,7 @@ export default function TemplateManage() {
               onChange: setTablePage
             }}
             locale={{ emptyText: <Empty description="当前分组暂无模板" /> }}
+            scroll={{ x: 800 }}
           />
         </Card>
       </div>

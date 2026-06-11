@@ -247,6 +247,7 @@ export default function ResultManage() {
     {
       title: "任务名称",
       dataIndex: "taskName",
+      width: 260,
       render: (value, record) => (
         <Space direction="vertical" size={0}>
           <Typography.Text strong>{value}</Typography.Text>
@@ -257,7 +258,8 @@ export default function ResultManage() {
     {
       title: "来源模板",
       dataIndex: "templateName",
-      width: 170
+      width: 150,
+      ellipsis: true
     },
     {
       title: "运行状态",
@@ -268,7 +270,7 @@ export default function ResultManage() {
     {
       title: "进度",
       dataIndex: "progress",
-      width: 150,
+      width: 130,
       render: (value, record) => (
         <Progress percent={value} size="small" status={record.status === "failed" ? "exception" : undefined} />
       )
@@ -276,7 +278,7 @@ export default function ResultManage() {
     {
       title: "开始时间",
       dataIndex: "startedAt",
-      width: 170,
+      width: 150,
       render: (value) => value ? dayjs(value).format("YYYY-MM-DD HH:mm") : "-"
     },
     {
@@ -293,7 +295,7 @@ export default function ResultManage() {
     },
     {
       title: "操作",
-      width: 260,
+      width: 220,
       fixed: "right",
       render: (_, record) => (
         <Space>
@@ -343,7 +345,7 @@ export default function ResultManage() {
       </div>
 
       <Card className="table-card management-table-card result-table-card">
-        <div className="filter-row" style={{ marginBottom: 16 }}>
+        <div className="filter-row result-filter-row" style={{ marginBottom: 16 }}>
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -407,7 +409,7 @@ export default function ResultManage() {
             hideOnSinglePage: false,
             showTotal: (total) => `共 ${total} 条成果`
           }}
-          scroll={{ x: 1500 }}
+          scroll={{ x: 1180 }}
           locale={{ emptyText: <Empty description="暂无转换任务" /> }}
         />
       </Card>

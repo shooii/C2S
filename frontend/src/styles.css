@@ -515,8 +515,10 @@ body,
 .template-management-grid {
   display: grid;
   flex: 1 1 auto;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: clamp(240px, 22%, 320px) minmax(0, 1fr);
   gap: 12px;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   align-items: stretch;
 }
@@ -629,7 +631,7 @@ body,
 }
 
 .template-filter-row {
-  grid-template-columns: minmax(280px, 1fr) 180px;
+  grid-template-columns: minmax(220px, 1fr) clamp(150px, 22%, 190px);
   margin-bottom: 12px;
 }
 
@@ -676,6 +678,14 @@ body,
 .result-page .result-table-card {
   flex: 1 1 auto;
   min-height: 0;
+}
+
+.result-filter-row {
+  grid-template-columns: minmax(260px, 1fr) clamp(150px, 18%, 190px) auto;
+}
+
+.result-table-card .task-bulk-actions {
+  justify-content: end;
 }
 
 .template-table-card .muted-path {
