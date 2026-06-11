@@ -12,6 +12,7 @@ backend/storage/data/*.sqlite
 backend/storage/data/*.sqlite-*
 test-artifacts/
 backend/storage/templates/*
+backend/storage/template-packages/*
 backend/storage/input/*
 backend/storage/outputs/*
 backend/storage/logs/*

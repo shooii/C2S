@@ -11,7 +11,7 @@ import type {
   TemplateRecord
 } from "../types";
 import { assertTemplateFile, decodeFileName, removeIfExists, safeFileName } from "./file.service";
-import { parseWorkspaceParameters } from "./fme.service";
+import { parseWorkspaceParameters, removeWorkspacePackageResources } from "./fme.service";
 import { assertFound, HttpError } from "../utils/httpError";
 import { getTemplateGroup } from "./template-group.service";
 
@@ -162,6 +162,7 @@ export async function replaceTemplateFromUpload(
   try {
     const parsed = await parseTemplate(id);
     if (path.resolve(template.filePath) !== path.resolve(file.path)) {
+      removeWorkspacePackageResources(template.filePath);
       removeIfExists(template.filePath);
     }
     return parsed;
@@ -264,6 +265,7 @@ export function deleteTemplate(id: string): void {
   const template = getTemplate(id);
   const db = getDb();
   db.prepare("DELETE FROM templates WHERE id = ?").run(id);
+  removeWorkspacePackageResources(template.filePath);
   removeIfExists(template.filePath);
 }
 

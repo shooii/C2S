@@ -123,8 +123,7 @@ export function createAndRunTask(input: CreateTaskInput): ConversionTask {
     input.inputDataPath || null,
     input.outputFormat || null,
     template.parameters,
-    outputPath,
-    template.filePath
+    outputPath
   );
 
   fs.mkdirSync(outputPath, { recursive: true });
@@ -167,7 +166,7 @@ export function createAndRunTask(input: CreateTaskInput): ConversionTask {
       duration: null
     });
 
-  void executeTask(id, template.filePath, parameters);
+  scheduleTaskExecution(id, template.filePath, parameters);
 
   return getTask(id);
 }
@@ -277,11 +276,16 @@ async function executeTask(
   });
 
   try {
+    const runtimeParameters = enrichWorkspaceOutputParameters(
+      fmeParameters,
+      workspacePath,
+      task.outputPath
+    );
     const outputSnapshot = snapshotOutputFiles(task.outputPath);
     const result = await runWorkspace({
       taskId,
       workspacePath,
-      parameters: fmeParameters,
+      parameters: runtimeParameters,
       outputPath: task.outputPath,
       logPath: task.logPath,
       onProgress: (progress) => updateProgressIfRunning(taskId, progress)
@@ -296,8 +300,8 @@ async function executeTask(
     const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
     replaceResultFiles(taskId, files);
     const persistedFiles = getResultFiles(taskId);
-    const firstDownloadable = persistedFiles.find((file) => file.downloadable);
     const firstPreviewable = persistedFiles.find((file) => file.previewable);
+    const hasDownloadableFiles = persistedFiles.some((file) => file.downloadable);
     const success = result.exitCode === 0;
 
     updateTask(taskId, {
@@ -305,7 +309,7 @@ async function executeTask(
       progress: success ? 100 : Math.max(current.progress, 5),
       resultSize: files.reduce((total, file) => total + file.fileSize, 0),
       previewUrl: firstPreviewable ? `/api/results/${taskId}/preview` : null,
-      downloadUrl: firstDownloadable ? `/api/results/${taskId}/download/${firstDownloadable.id}` : null,
+      downloadUrl: hasDownloadableFiles ? `/api/results/${taskId}/download` : null,
       exitCode: result.exitCode,
       errorMessage: success ? null : `FME 进程退出码：${result.exitCode ?? "null"}`,
       finishedAt: nowIso(),
@@ -324,6 +328,23 @@ async function executeTask(
       duration: current.startedAt ? Date.now() - new Date(current.startedAt).getTime() : null
     });
   }
+}
+
+function scheduleTaskExecution(
+  taskId: string,
+  workspacePath: string,
+  fmeParameters: Record<string, unknown>
+): void {
+  setImmediate(() => {
+    void executeTask(taskId, workspacePath, fmeParameters).catch((error) => {
+      updateTask(taskId, {
+        status: "failed",
+        progress: 0,
+        errorMessage: error instanceof Error ? error.message : "FME 执行调度失败",
+        finishedAt: nowIso()
+      });
+    });
+  });
 }
 
 function syncResultFilesToManagedStorage(
@@ -406,8 +427,7 @@ function buildRuntimeParameters(
     TemplateParameter,
     "name" | "label" | "type" | "defaultValue" | "description" | "direction" | "pathKind"
   >>,
-  outputPath: string,
-  workspacePath: string
+  outputPath: string
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...parameters };
 
@@ -416,9 +436,6 @@ function buildRuntimeParameters(
     if (isOutputDirectoryParameter(parameter)) {
       outputParameterNames.add(parameter.name);
     }
-  }
-  for (const parameterName of getWorkspaceOutputParameterNames(workspacePath)) {
-    outputParameterNames.add(parameterName);
   }
   for (const parameterName of outputParameterNames) {
     const currentValue = getCaseInsensitiveValue(merged, parameterName);
@@ -435,6 +452,21 @@ function buildRuntimeParameters(
   }
   if (!hasCaseInsensitiveKey(merged, "OUTPUT_DIR") && !hasCaseInsensitiveKey(merged, "OUTPUT_DIRECTORY")) {
     merged.OUTPUT_DIR = outputPath;
+  }
+  return merged;
+}
+
+function enrichWorkspaceOutputParameters(
+  parameters: Record<string, unknown>,
+  workspacePath: string,
+  outputPath: string
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...parameters };
+  for (const parameterName of getWorkspaceOutputParameterNames(workspacePath)) {
+    const currentValue = getCaseInsensitiveValue(merged, parameterName);
+    if (!isAbsolutePathValue(currentValue)) {
+      setCaseInsensitiveValue(merged, parameterName, outputPath);
+    }
   }
   return merged;
 }

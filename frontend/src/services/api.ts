@@ -202,6 +202,8 @@ export const api = {
   clearTasks: () =>
     unwrap<{ deletedCount: number }>(http.delete("/api/tasks")),
 
+  downloadArchiveUrl: (taskId: string) => `${API_BASE_URL}/api/results/${taskId}/download`,
+
   downloadUrl: (taskId: string, fileId: string) => `${API_BASE_URL}/api/results/${taskId}/download/${fileId}`,
 
   absoluteUrl: (url?: string) => {

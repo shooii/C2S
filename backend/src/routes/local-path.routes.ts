@@ -16,7 +16,7 @@ router.post(
     const initialPath = typeof req.body?.initialPath === "string"
       ? req.body.initialPath.trim()
       : null;
-    const multiple = req.body?.multiple === true;
+    const multiple = kind === "file" && req.body?.multiple === true;
     res.json({
       data: await selectLocalPath({ kind, initialPath, multiple })
     });

@@ -225,9 +225,11 @@ export default function TemplateConfig() {
     taskPromise
       .then(() => {
         message.success("转换任务已创建");
+        window.dispatchEvent(new Event("c2s:task-submission-settled"));
       })
       .catch((error) => {
         message.error(error instanceof Error ? error.message : "任务创建失败");
+        window.dispatchEvent(new Event("c2s:task-submission-settled"));
       })
       .finally(() => {
         setRunning(false);
@@ -608,17 +610,18 @@ function PathParameterInput({
   const { message } = App.useApp();
   const [selecting, setSelecting] = useState(false);
   const kind = getPathKind(parameter);
+  const multipleFiles = kind === "file" && parameter.multiple;
 
   const selectPath = async () => {
     setSelecting(true);
     try {
       const result = await api.selectLocalPath({
         kind,
-        initialPath: value,
-        multiple: kind === "file" && parameter.multiple
+        initialPath: firstPathValue(value),
+        multiple: multipleFiles
       });
       if (!result.cancelled && result.paths.length) {
-        onChange?.(result.paths.join(","));
+        onChange?.(formatSelectedPathValue(result.paths, multipleFiles));
       }
     } catch (error) {
       message.error(error instanceof Error ? error.message : "本地路径选择失败");
@@ -631,6 +634,7 @@ function PathParameterInput({
     <div className="path-parameter-control">
       <Space.Compact style={{ width: "100%" }}>
         <Input
+          allowClear
           value={value}
           placeholder={placeholderFor(parameter)}
           onChange={(event) => onChange?.(event.target.value)}
@@ -640,7 +644,7 @@ function PathParameterInput({
           loading={selecting}
           onClick={selectPath}
         >
-          {kind === "folder" ? "选择目录" : "选择文件"}
+          {kind === "folder" ? "选择目录" : multipleFiles ? "选择多个文件" : "选择文件"}
         </Button>
       </Space.Compact>
     </div>
@@ -771,6 +775,22 @@ function getPathKind(parameter: TemplateParameter): "file" | "folder" {
     return parameter.pathKind;
   }
   return parameter.type === "folder" ? "folder" : "file";
+}
+
+function firstPathValue(value?: string): string | undefined {
+  const text = value?.trim();
+  if (!text) {
+    return undefined;
+  }
+  const quotedPath = text.match(/"([^"]+)"/)?.[1]?.trim();
+  if (quotedPath) {
+    return quotedPath;
+  }
+  return text.split(",").map((item) => item.trim()).find(Boolean);
+}
+
+function formatSelectedPathValue(paths: string[], multiple: boolean): string {
+  return multiple ? paths.join(",") : paths[0] || "";
 }
 
 function normalizeParameters(parameters: Record<string, unknown>): Record<string, unknown> {

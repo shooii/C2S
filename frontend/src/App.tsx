@@ -46,7 +46,7 @@ function AppShell() {
 
   return (
     <Layout className="app-shell">
-      <Sider width={224}>
+      <Sider width={224} className="app-sider">
         <div className="brand-block">
           <ApartmentOutlined />
           <div>

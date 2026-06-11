@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import AdmZip from "adm-zip";
 import iconv from "iconv-lite";
-import { fmeCandidates, logStorageDir } from "../config/paths";
+import { fmeCandidates, logStorageDir, templatePackageStorageDir } from "../config/paths";
 import type {
   ParameterDirection,
   ParameterOption,
@@ -11,7 +11,7 @@ import type {
   ParameterType,
   ResultFile
 } from "../types";
-import { getResultFileType, isPreviewable, listFilesRecursive } from "./file.service";
+import { assertPathInside, getResultFileType, isPreviewable, listFilesRecursive, removeIfExists } from "./file.service";
 
 export interface ParsedWorkspaceParameter {
   name: string;
@@ -50,6 +50,10 @@ export interface RunWorkspaceResult {
   duration: number;
 }
 
+interface WorkspaceParseContext {
+  packageRoot: string | null;
+}
+
 const runningProcesses = new Map<string, ChildProcessWithoutNullStreams>();
 let cachedFmeCommand: string | null = null;
 
@@ -77,8 +81,9 @@ export async function checkFmeAvailable(): Promise<FmeStatus> {
 }
 
 export async function parseWorkspaceParameters(workspacePath: string): Promise<ParsedWorkspaceParameter[]> {
+  const context = prepareWorkspaceParseContext(workspacePath);
   const text = readWorkspaceText(workspacePath);
-  return parseWorkspaceParameterText(text);
+  return parseWorkspaceParameterText(text, context);
 }
 
 export function getWorkspaceOutputParameterNames(workspacePath: string): string[] {
@@ -141,17 +146,24 @@ export function isOutputDirectoryParameter(
   return (parameter.type === "folder" || parameter.type === "path") && hasOutputMeaning && !hasNameOrFormatMeaning;
 }
 
-function parseWorkspaceParameterText(text: string): ParsedWorkspaceParameter[] {
+function parseWorkspaceParameterText(
+  text: string,
+  context: WorkspaceParseContext = { packageRoot: null }
+): ParsedWorkspaceParameter[] {
   const parameters = normalizeParameters([
     ...parseUserParameterForms(text),
     ...parseXmlGuiLineParameters(text),
     ...parseJsonLikeParameters(text),
     ...parseTextBlocks(text),
-    ...parseCommandLineParameters(text)
+    ...parseCommandLineParameters(text),
+    ...parsePackagedPathParameters(text)
   ]);
 
   return parameters.map((parameter, index) => ({
     ...parameter,
+    defaultValue: parameter.direction === "output"
+      ? parameter.defaultValue
+      : resolveWorkspacePackagePath(parameter.defaultValue, context),
     sortOrder: index
   }));
 }
@@ -363,6 +375,64 @@ function spawnCapture(command: string, args: string[], timeoutMs: number) {
       });
     });
   });
+}
+
+export function getWorkspacePackageResourceDir(workspacePath: string): string {
+  return path.join(templatePackageStorageDir, path.parse(workspacePath).name);
+}
+
+export function removeWorkspacePackageResources(workspacePath: string): void {
+  removeIfExists(getWorkspacePackageResourceDir(workspacePath));
+}
+
+function prepareWorkspaceParseContext(workspacePath: string): WorkspaceParseContext {
+  if (path.extname(workspacePath).toLowerCase() !== ".fmwt") {
+    return { packageRoot: null };
+  }
+
+  return {
+    packageRoot: extractWorkspacePackageResources(workspacePath)
+  };
+}
+
+function extractWorkspacePackageResources(workspacePath: string): string {
+  const packageRoot = getWorkspacePackageResourceDir(workspacePath);
+  fs.mkdirSync(packageRoot, { recursive: true });
+
+  const zip = new AdmZip(workspacePath);
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) {
+      continue;
+    }
+
+    const relativePath = normalizeZipEntryPath(entry.entryName);
+    if (!relativePath) {
+      continue;
+    }
+
+    const targetPath = assertPathInside(packageRoot, path.join(packageRoot, relativePath));
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    if (fs.existsSync(targetPath) && fs.statSync(targetPath).size === entry.header.size) {
+      continue;
+    }
+    fs.writeFileSync(targetPath, entry.getData());
+  }
+
+  return packageRoot;
+}
+
+function normalizeZipEntryPath(entryName: string): string | null {
+  const normalized = entryName
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== ".")
+    .join(path.sep);
+
+  if (!normalized || path.isAbsolute(normalized) || normalized.split(path.sep).some((segment) => segment === "..")) {
+    return null;
+  }
+
+  return normalized;
 }
 
 function readWorkspaceText(workspacePath: string): string {
@@ -684,6 +754,59 @@ function parseCommandLineParameters(text: string): ParsedWorkspaceParameter[] {
   return parameters;
 }
 
+function parsePackagedPathParameters(text: string): ParsedWorkspaceParameter[] {
+  const parameters: ParsedWorkspaceParameter[] = [];
+  const regex = /(?:^|[{\s])DEFAULT_MACRO\s+([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.-]*)\s+([^\r\n}]*)/gmi;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    const name = normalizeFmeParameterName(match[1]);
+    if (!name || shouldSkipParameterName(name)) {
+      continue;
+    }
+
+    const defaultValue = extractPackagedPathValue(match[2]);
+    if (!defaultValue) {
+      continue;
+    }
+
+    const label = prettifyName(name);
+    parameters.push({
+      name,
+      label,
+      ...inferParameterMetadata({
+        name,
+        label,
+        declaredType: "file",
+        defaultValue,
+        options: []
+      }),
+      defaultValue,
+      required: false,
+      options: [],
+      description: "FMWT 模板包内置数据路径",
+      sortOrder: parameters.length
+    });
+  }
+
+  return parameters;
+}
+
+function extractPackagedPathValue(rawValue: string): string | null {
+  const decoded = decodeFmeTokens(decodeXmlEntities(rawValue.trim()).replace(/^["']|["']$/g, ""));
+  const macroMatch = decoded.match(/\$\(FME_MF_DIR(?:_USERTYPED|_ENCODED)?\)/i);
+  if (!macroMatch || macroMatch.index === undefined) {
+    return null;
+  }
+
+  let value = decoded.slice(macroMatch.index).trim();
+  const expressionSeparator = value.search(/,\s*[^\\/)]/);
+  if (expressionSeparator > 0) {
+    value = value.slice(0, expressionSeparator);
+  }
+  return value.replace(/[)}\s]+$/g, "").replace(/^["'{]+|["'}]+$/g, "") || null;
+}
+
 function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspaceParameter | null {
   const name = stringValue(raw.name ?? raw.parameterName ?? raw.identifier ?? raw.macroName ?? raw.id);
   if (!name || shouldSkipParameterName(name)) {
@@ -1001,6 +1124,33 @@ function findAliasSeparator(value: string): number {
     }
   }
   return -1;
+}
+
+function resolveWorkspacePackagePath(value: string | null, context: WorkspaceParseContext): string | null {
+  if (!value || !context.packageRoot) {
+    return value;
+  }
+
+  const decoded = decodeFmeTokens(value);
+  if (!/\$\(FME_MF_DIR(?:_USERTYPED|_ENCODED)?\)/i.test(decoded)) {
+    return value;
+  }
+
+  const packageRoot = context.packageRoot.replace(/[\\/]+$/g, "");
+  return decoded.replace(
+    /\$\(FME_MF_DIR(?:_USERTYPED|_ENCODED)?\)([^"'\r\n]*)/gi,
+    (_match, relativePath: string) => {
+      const expressionSeparator = relativePath.search(/,\s*[^\\/)]/);
+      const pathText = expressionSeparator > 0
+        ? relativePath.slice(0, expressionSeparator)
+        : relativePath;
+      const cleanRelativePath = pathText
+        .replace(/[)}\s]+$/g, "")
+        .replace(/^[\\/]+/, "");
+
+      return path.normalize(path.join(packageRoot, cleanRelativePath));
+    }
+  );
 }
 
 function decodeFmeTokens(value: string): string {

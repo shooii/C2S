@@ -86,6 +86,16 @@ export default function ResultManage() {
     void loadTasks();
   }, [loadTasks]);
 
+  useEffect(() => {
+    const handleTaskSubmissionSettled = () => {
+      void loadTasks(true);
+    };
+    window.addEventListener("c2s:task-submission-settled", handleTaskSubmissionSettled);
+    return () => {
+      window.removeEventListener("c2s:task-submission-settled", handleTaskSubmissionSettled);
+    };
+  }, [loadTasks]);
+
   const pendingTaskSubmittedAt = (
     location.state as { pendingTaskSubmittedAt?: number } | null
   )?.pendingTaskSubmittedAt;
@@ -144,18 +154,11 @@ export default function ResultManage() {
     fallbackRowHeight: 54
   });
 
-  const downloadFirst = async (task: ConversionTask) => {
-    try {
-      const files = await api.getResultFiles(task.id);
-      const first = files.find((file) => file.downloadable);
-      if (!first) {
-        message.warning("暂无可下载成果文件");
-        return;
-      }
-      window.open(api.downloadUrl(task.id, first.id), "_blank");
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "成果下载失败");
+  const downloadArchive = (task: ConversionTask) => {
+    if (task.status !== "success") {
+      return;
     }
+    window.open(api.downloadArchiveUrl(task.id), "_blank");
   };
 
   const rerun = async (task: ConversionTask) => {
@@ -319,7 +322,7 @@ export default function ResultManage() {
             <Button icon={<PlayCircleOutlined />} disabled={!record.previewUrl} onClick={() => navigate(`/preview/${record.id}`)} />
           </Tooltip>
           <Tooltip title="下载">
-            <Button icon={<DownloadOutlined />} disabled={record.status !== "success"} onClick={() => downloadFirst(record)} />
+            <Button icon={<DownloadOutlined />} disabled={record.status !== "success"} onClick={() => downloadArchive(record)} />
           </Tooltip>
           <Tooltip title="日志">
             <Button icon={<FileTextOutlined />} onClick={() => setLogTask(record)} />

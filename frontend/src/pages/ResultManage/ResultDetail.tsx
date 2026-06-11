@@ -101,6 +101,8 @@ export default function ResultDetail() {
     return <Empty description="任务不存在" />;
   }
 
+  const hasDownloadableFiles = files.some((file) => file.downloadable);
+
   const columns: ColumnsType<ResultFile> = [
     { title: "文件名", dataIndex: "fileName", ellipsis: true },
     { title: "类型", dataIndex: "fileType", width: 120 },
@@ -108,16 +110,11 @@ export default function ResultDetail() {
     { title: "创建时间", dataIndex: "createdAt", width: 170, render: (value) => dayjs(value).format("YYYY-MM-DD HH:mm") },
     {
       title: "操作",
-      width: 160,
+      width: 100,
       render: (_, record) => (
-        <Space>
-          <Button icon={<DownloadOutlined />} onClick={() => window.open(api.downloadUrl(task.id, record.id), "_blank")}>
-            下载
-          </Button>
-          <Button icon={<PlayCircleOutlined />} disabled={!record.previewable} onClick={() => navigate(`/preview/${task.id}`)}>
-            预览
-          </Button>
-        </Space>
+        <Button icon={<PlayCircleOutlined />} disabled={!record.previewable} onClick={() => navigate(`/preview/${task.id}`)}>
+          预览
+        </Button>
       )
     }
   ];
@@ -162,7 +159,19 @@ export default function ResultDetail() {
             </Descriptions>
           </Card>
 
-          <Card className="detail-card" title="成果文件">
+          <Card
+            className="detail-card"
+            title="成果文件"
+            extra={(
+              <Button
+                icon={<DownloadOutlined />}
+                disabled={task.status !== "success" || !hasDownloadableFiles}
+                onClick={() => window.open(api.downloadArchiveUrl(task.id), "_blank")}
+              >
+                下载压缩包
+              </Button>
+            )}
+          >
             <Table
               size="small"
               rowKey="id"
@@ -202,4 +211,3 @@ function formatSize(value: number): string {
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
-

@@ -574,11 +574,7 @@ export default function TemplateManage() {
 
         <Card className="table-card management-table-card template-table-card">
           <div className="template-table-heading">
-            <Space size={10}>
-              <Typography.Text type="secondary">模板管理</Typography.Text>
-              <Typography.Text type="secondary">/</Typography.Text>
-              <Typography.Text className="template-active-group">{getGroupLabel(activeGroup, groups)}</Typography.Text>
-            </Space>
+            <Typography.Text className="template-active-group">{getGroupLabel(activeGroup, groups)}</Typography.Text>
           </div>
 
           <div className="filter-row template-filter-row">
