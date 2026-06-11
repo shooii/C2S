@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -67,6 +68,7 @@ export default function TemplateManage() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [groupPage, setGroupPage] = useState(1);
   const [groupPageSize, setGroupPageSize] = useState(8);
+  const [tablePage, setTablePage] = useState(1);
   const groupListRef = useRef<HTMLDivElement>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const uploadTokenRef = useRef<string | null>(null);
@@ -114,6 +116,17 @@ export default function TemplateManage() {
     return result;
   }, [templates, visibleGroupKeys]);
 
+  const pendingDuplicate = useMemo(() => {
+    if (!pendingUploadFile || !pendingUploadGroup) {
+      return null;
+    }
+    const candidateName = templateNameFromFile(pendingUploadFile.name).toLowerCase();
+    return templates.find((template) => (
+      template.groupId === pendingUploadGroup &&
+      template.name.toLowerCase() === candidateName
+    )) || null;
+  }, [pendingUploadFile, pendingUploadGroup, templates]);
+
   const currentGroupTemplates = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase();
     const filtered = (groupedTemplates[activeGroup] || []).filter((template) => {
@@ -140,9 +153,16 @@ export default function TemplateManage() {
 
   const tablePageSize = useManagementPageSize({
     cardSelector: ".template-table-card",
-    fallbackRowHeight: 52,
-    totalItems: currentGroupTemplates.length
+    fallbackRowHeight: 52
   });
+
+  const selectGroup = (key: GroupKey) => {
+    if (key === activeGroup) {
+      return;
+    }
+    setActiveGroup(key);
+    setTablePage(1);
+  };
 
   const pagedGroupKeys = useMemo(
     () => visibleGroupKeys.slice((groupPage - 1) * groupPageSize, groupPage * groupPageSize),
@@ -182,6 +202,13 @@ export default function TemplateManage() {
       setGroupPage(maxPage);
     }
   }, [groupPage, groupPageSize, visibleGroupKeys]);
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(currentGroupTemplates.length / tablePageSize));
+    if (tablePage > maxPage) {
+      setTablePage(maxPage);
+    }
+  }, [currentGroupTemplates.length, tablePage, tablePageSize]);
 
   useEffect(() => {
     const groupList = groupListRef.current;
@@ -354,16 +381,30 @@ export default function TemplateManage() {
     setUploadProgress(0);
 
     try {
-      await api.uploadTemplate(
-        pendingUploadFile,
-        pendingUploadGroup,
-        uploadToken,
-        setUploadProgress,
-        controller.signal
-      );
+      if (pendingDuplicate) {
+        await api.replaceTemplate(
+          pendingDuplicate.id,
+          pendingUploadFile,
+          uploadToken,
+          setUploadProgress,
+          controller.signal
+        );
+      } else {
+        await api.uploadTemplate(
+          pendingUploadFile,
+          pendingUploadGroup,
+          uploadToken,
+          setUploadProgress,
+          controller.signal
+        );
+      }
       setActiveGroup(pendingUploadGroup);
       const groupName = getGroupLabel(pendingUploadGroup, groups);
-      message.success(`模板已上传到「${groupName}」`);
+      message.success(
+        pendingDuplicate
+          ? `模板“${pendingDuplicate.name}”已覆盖更新`
+          : `模板已上传到「${groupName}」`
+      );
       closeUploadDialog(false);
       await loadData();
     } catch (error) {
@@ -481,10 +522,11 @@ export default function TemplateManage() {
                   role="button"
                   tabIndex={0}
                   className={`template-group-item${active ? " is-active" : ""}`}
-                  onClick={() => setActiveGroup(key)}
+                  onClick={() => selectGroup(key)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
-                      setActiveGroup(key);
+                      event.preventDefault();
+                      selectGroup(key);
                     }
                   }}
                 >
@@ -545,11 +587,17 @@ export default function TemplateManage() {
               prefix={<SearchOutlined />}
               placeholder="搜索模板名称或说明"
               value={keyword}
-              onChange={(event) => setKeyword(event.target.value)}
+              onChange={(event) => {
+                setKeyword(event.target.value);
+                setTablePage(1);
+              }}
             />
             <Select
               value={status}
-              onChange={setStatus}
+              onChange={(value) => {
+                setStatus(value);
+                setTablePage(1);
+              }}
               options={[
                 { value: "all", label: "状态：全部" },
                 { value: "enabled", label: "启用中" },
@@ -564,11 +612,13 @@ export default function TemplateManage() {
             columns={columns}
             dataSource={currentGroupTemplates}
             pagination={{
+              current: tablePage,
               pageSize: tablePageSize,
               showSizeChanger: false,
               position: ["bottomCenter"],
               hideOnSinglePage: false,
-              showTotal: (total) => `共 ${total} 个模板`
+              showTotal: (total) => `共 ${total} 个模板`,
+              onChange: setTablePage
             }}
             locale={{ emptyText: <Empty description="当前分组暂无模板" /> }}
           />
@@ -576,7 +626,7 @@ export default function TemplateManage() {
       </div>
 
       <Modal
-        title="上传模板"
+        title={pendingDuplicate ? "更新同名模板" : "上传模板"}
         open={Boolean(pendingUploadFile)}
         onCancel={() => closeUploadDialog()}
         footer={[
@@ -586,11 +636,12 @@ export default function TemplateManage() {
           <Button
             key="upload"
             type="primary"
+            danger={Boolean(pendingDuplicate)}
             loading={uploading}
             disabled={!pendingUploadFile || !pendingUploadGroup}
             onClick={confirmTemplateUpload}
           >
-            确认上传
+            {pendingDuplicate ? "覆盖并重新解析" : "确认上传"}
           </Button>
         ]}
         closable
@@ -615,17 +666,28 @@ export default function TemplateManage() {
 
           <div className="template-upload-step">
             <Typography.Text type="secondary">2. 选择归类分组</Typography.Text>
-          <Select
-            value={pendingUploadGroup}
-            options={groupOptions}
-            onChange={setPendingUploadGroup}
-            disabled={uploading}
-            style={{ width: "100%" }}
-          />
+            <Select
+              value={pendingUploadGroup}
+              options={groupOptions}
+              onChange={setPendingUploadGroup}
+              disabled={uploading}
+              style={{ width: "100%" }}
+            />
           </div>
 
+          {pendingDuplicate && (
+            <Alert
+              type="warning"
+              showIcon
+              message={`当前分组已存在“${pendingDuplicate.name}”`}
+              description="覆盖后将保留模板说明、版本、启用状态，以及内部名称相同的参数别名；模板文件和解析参数会更新。"
+            />
+          )}
+
           <div className="template-upload-step">
-            <Typography.Text type="secondary">3. 确认后开始上传模板</Typography.Text>
+            <Typography.Text type="secondary">
+              {pendingDuplicate ? "3. 确认后覆盖模板并重新解析参数" : "3. 确认后开始上传模板"}
+            </Typography.Text>
             {uploading && <Progress percent={uploadProgress} size="small" />}
           </div>
         </Space>
@@ -709,4 +771,17 @@ function formatFileSize(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function templateNameFromFile(fileName: string): string {
+  const normalizedName = fileName.replace(/\\/g, "/").split("/").pop() || fileName;
+  const extensionIndex = normalizedName.lastIndexOf(".");
+  const baseName = extensionIndex > 0 ? normalizedName.slice(0, extensionIndex) : normalizedName;
+  return baseName
+    .normalize("NFKD")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/\.+/g, ".")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80) || "file";
 }

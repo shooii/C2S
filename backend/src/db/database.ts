@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS template_parameters (
   defaultValue TEXT,
   required INTEGER NOT NULL DEFAULT 0,
   options TEXT NOT NULL DEFAULT '[]',
+  direction TEXT NOT NULL DEFAULT 'none',
+  pathKind TEXT,
+  multiple INTEGER NOT NULL DEFAULT 0,
   description TEXT,
   sortOrder INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (templateId) REFERENCES templates(id) ON DELETE CASCADE
@@ -144,6 +147,16 @@ function migrateDatabase(database: SqliteDatabase): void {
   if (!templateColumns.some((column) => column.name === "enabled")) {
     database.exec("ALTER TABLE templates ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1");
   }
+  const parameterColumns = database.prepare("PRAGMA table_info(template_parameters)").all() as unknown as Array<{ name: string }>;
+  if (!parameterColumns.some((column) => column.name === "direction")) {
+    database.exec("ALTER TABLE template_parameters ADD COLUMN direction TEXT NOT NULL DEFAULT 'none'");
+  }
+  if (!parameterColumns.some((column) => column.name === "pathKind")) {
+    database.exec("ALTER TABLE template_parameters ADD COLUMN pathKind TEXT");
+  }
+  if (!parameterColumns.some((column) => column.name === "multiple")) {
+    database.exec("ALTER TABLE template_parameters ADD COLUMN multiple INTEGER NOT NULL DEFAULT 0");
+  }
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_enabled ON templates(enabled)");
   const duplicateTemplateName = database.prepare(
@@ -210,7 +223,10 @@ function migrateStoragePaths(database: SqliteDatabase): void {
     const inputDataPath = task.inputDataPath
       ? path.join(inputStorageDir, path.basename(task.inputDataPath))
       : null;
-    const outputPath = path.join(outputStorageDir, task.id);
+    const managedOutputPath = path.join(outputStorageDir, task.id);
+    const outputPath = isLegacyManagedOutputPath(task.outputPath, task.id)
+      ? managedOutputPath
+      : task.outputPath;
     const logPath = path.join(logStorageDir, `${task.id}.log`);
     const inputChanged = inputDataPath
       ? path.resolve(task.inputDataPath!) !== path.resolve(inputDataPath)
@@ -226,8 +242,15 @@ function migrateStoragePaths(database: SqliteDatabase): void {
   });
 
   const resultFiles = database.prepare(
-    "SELECT id, taskId, fileName, filePath FROM result_files"
-  ).all() as unknown as Array<{ id: string; taskId: string; fileName: string; filePath: string }>;
+    `SELECT result_files.id, result_files.taskId, result_files.fileName, result_files.filePath
+     FROM result_files
+     INNER JOIN conversion_tasks ON conversion_tasks.id = result_files.taskId`
+  ).all() as unknown as Array<{
+    id: string;
+    taskId: string;
+    fileName: string;
+    filePath: string;
+  }>;
   const updateResultFile = database.prepare("UPDATE result_files SET filePath = ? WHERE id = ?");
   resultFiles.forEach((file) => {
     const taskRoot = path.join(outputStorageDir, file.taskId);
@@ -239,7 +262,17 @@ function migrateStoragePaths(database: SqliteDatabase): void {
       !path.isAbsolute(relative) &&
       path.resolve(file.filePath) !== target
     ) {
+      if (fs.existsSync(file.filePath) && !fs.existsSync(target)) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(file.filePath, target);
+      }
       updateResultFile.run(target, file.id);
     }
   });
+}
+
+function isLegacyManagedOutputPath(outputPath: string, taskId: string): boolean {
+  const normalized = path.normalize(outputPath).toLowerCase();
+  const storageSegment = `${path.sep}storage${path.sep}outputs${path.sep}`.toLowerCase();
+  return normalized.includes(storageSegment) && path.basename(normalized) === taskId.toLowerCase();
 }

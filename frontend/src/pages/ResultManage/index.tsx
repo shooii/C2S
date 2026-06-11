@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   App,
   Button,
@@ -24,7 +24,7 @@ import {
   SearchOutlined
 } from "@ant-design/icons";
 import dayjs from "dayjs";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { LogDrawer } from "../../components/LogDrawer";
 import { TaskStatusTag } from "../../components/StatusTag";
 import { useManagementPageSize } from "../../hooks/useManagementPageSize";
@@ -34,44 +34,92 @@ import type { ConversionTask, TaskStatus } from "../../types";
 export default function ResultManage() {
   const { message, modal } = App.useApp();
   const navigate = useNavigate();
+  const location = useLocation();
   const [allTasks, setAllTasks] = useState<ConversionTask[]>([]);
-  const [tasks, setTasks] = useState<ConversionTask[]>([]);
   const [loading, setLoading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<TaskStatus | undefined>();
   const [logTask, setLogTask] = useState<ConversionTask | null>(null);
 
-  const loadAllTasks = async () => {
+  const filteredTasks = useMemo(() => {
+    let list = allTasks;
+    if (status) {
+      list = list.filter((t) => t.status === status);
+    }
+    if (search) {
+      const q = search.toLowerCase();
+      list = list.filter(
+        (t) =>
+          t.taskName.toLowerCase().includes(q) ||
+          (t.templateName && t.templateName.toLowerCase().includes(q)) ||
+          (t.inputDataName && t.inputDataName.toLowerCase().includes(q))
+      );
+    }
+    return list;
+  }, [allTasks, search, status]);
+
+  const loadTasks = useCallback(async (background = false) => {
+    if (!background) {
+      setLoading(true);
+    }
     try {
       const result = await api.listTasks({});
       setAllTasks(result);
+      setSelectedTaskIds((current) => {
+        const availableIds = new Set(result.map((task) => task.id));
+        return current.filter((id) => availableIds.has(id));
+      });
       return result;
-    } catch {
-      return [];
-    }
-  };
-
-  const loadTasks = async (filters?: { search?: string; status?: TaskStatus }) => {
-    setLoading(true);
-    try {
-      const s = filters && Object.prototype.hasOwnProperty.call(filters, "search")
-        ? filters.search || ""
-        : search;
-      const st = filters && Object.prototype.hasOwnProperty.call(filters, "status")
-        ? filters.status
-        : status;
-      setTasks(await api.listTasks({ search: s || undefined, status: st || undefined }));
     } catch (error) {
       message.error(error instanceof Error ? error.message : "成果列表加载失败");
+      return [];
     } finally {
-      setLoading(false);
+      if (!background) {
+        setLoading(false);
+      }
     }
-  };
+  }, [message]);
 
   useEffect(() => {
-    void loadAllTasks();
     void loadTasks();
-  }, []);
+  }, [loadTasks]);
+
+  const pendingTaskSubmittedAt = (
+    location.state as { pendingTaskSubmittedAt?: number } | null
+  )?.pendingTaskSubmittedAt;
+
+  useEffect(() => {
+    if (!pendingTaskSubmittedAt) {
+      return;
+    }
+
+    let disposed = false;
+    let timer: number | undefined;
+    const pollForCreatedTask = async () => {
+      const tasks = await loadTasks(true);
+      if (disposed) {
+        return;
+      }
+      const taskAppeared = tasks.some(
+        (task) => new Date(task.createdAt).getTime() >= pendingTaskSubmittedAt - 1000
+      );
+      if (taskAppeared || Date.now() - pendingTaskSubmittedAt >= 15_000) {
+        navigate("/results", { replace: true });
+        return;
+      }
+      timer = window.setTimeout(pollForCreatedTask, 750);
+    };
+
+    timer = window.setTimeout(pollForCreatedTask, 250);
+    return () => {
+      disposed = true;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [loadTasks, navigate, pendingTaskSubmittedAt]);
 
   useEffect(() => {
     const hasRunning = allTasks.some((task) => task.status === "running" || task.status === "pending");
@@ -79,11 +127,10 @@ export default function ResultManage() {
       return;
     }
     const timer = window.setInterval(() => {
-      void loadAllTasks();
-      void loadTasks();
+      void loadTasks(true);
     }, 4000);
     return () => window.clearInterval(timer);
-  }, [allTasks]);
+  }, [allTasks, loadTasks]);
 
   const stats = useMemo(() => ({
     total: allTasks.length,
@@ -94,8 +141,7 @@ export default function ResultManage() {
 
   const tablePageSize = useManagementPageSize({
     cardSelector: ".result-table-card",
-    fallbackRowHeight: 54,
-    totalItems: tasks.length
+    fallbackRowHeight: 54
   });
 
   const downloadFirst = async (task: ConversionTask) => {
@@ -126,11 +172,65 @@ export default function ResultManage() {
     try {
       await api.deleteTask(task.id);
       message.success("任务已删除");
-      await loadAllTasks();
       await loadTasks();
     } catch (error) {
       message.error(error instanceof Error ? error.message : "删除任务失败");
     }
+  };
+
+  const deleteSelectedTasks = async () => {
+    if (!selectedTaskIds.length) {
+      return;
+    }
+    setDeleting(true);
+    try {
+      const result = await api.deleteTasks(selectedTaskIds);
+      setSelectedTaskIds([]);
+      message.success(`已删除 ${result.deletedCount} 个任务`);
+      await loadTasks(true);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "批量删除任务失败");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const clearAllTasks = async () => {
+    setDeleting(true);
+    try {
+      const result = await api.clearTasks();
+      setSelectedTaskIds([]);
+      message.success(`已清空 ${result.deletedCount} 个任务`);
+      await loadTasks(true);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "清空任务失败");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const confirmDeleteSelectedTasks = () => {
+    modal.confirm({
+      title: "批量删除任务",
+      content: `确定删除已选择的 ${selectedTaskIds.length} 个任务吗？任务记录、成果文件和日志都会被永久删除。`,
+      okText: "批量删除",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: deleteSelectedTasks
+    });
+  };
+
+  const confirmClearAllTasks = () => {
+    modal.confirm({
+      title: "一键清空任务",
+      content: `确定清空全部 ${allTasks.length} 个任务吗？该操作不可恢复。`,
+      okText: "全部清空",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: clearAllTasks
+    });
   };
 
   const confirmDeleteTask = (task: ConversionTask) => {
@@ -224,8 +324,12 @@ export default function ResultManage() {
           <Tooltip title="日志">
             <Button icon={<FileTextOutlined />} onClick={() => setLogTask(record)} />
           </Tooltip>
-          <Tooltip title="重新运行">
-            <Button icon={<ReloadOutlined />} onClick={() => rerun(record)} />
+          <Tooltip title={record.rerunnable ? "重新运行" : "关联模板不可用或原始输入文件已丢失"}>
+            <Button
+              icon={<ReloadOutlined />}
+              disabled={!record.rerunnable}
+              onClick={() => rerun(record)}
+            />
           </Tooltip>
           <Tooltip title="删除">
             <Button danger icon={<DeleteOutlined />} onClick={() => confirmDeleteTask(record)} />
@@ -261,9 +365,7 @@ export default function ResultManage() {
             placeholder="搜索任务、模板或输入数据"
             value={search}
             onChange={(event) => {
-              const value = event.target.value;
-              setSearch(value);
-              void loadTasks({ search: value });
+              setSearch(event.target.value);
             }}
           />
           <Select
@@ -272,11 +374,9 @@ export default function ResultManage() {
             value={status}
             onChange={(value) => {
               setStatus(value);
-              void loadTasks({ status: value });
             }}
             onClear={() => {
               setStatus(undefined);
-              void loadTasks({ status: undefined });
             }}
             options={[
               { value: "pending", label: "排队中" },
@@ -286,12 +386,35 @@ export default function ResultManage() {
               { value: "cancelled", label: "已取消" }
             ]}
           />
+          <Space className="task-bulk-actions">
+            <Button
+              danger
+              icon={<DeleteOutlined />}
+              disabled={!selectedTaskIds.length}
+              loading={deleting && Boolean(selectedTaskIds.length)}
+              onClick={confirmDeleteSelectedTasks}
+            >
+              批量删除{selectedTaskIds.length ? ` (${selectedTaskIds.length})` : ""}
+            </Button>
+            <Button
+              danger
+              disabled={!allTasks.length}
+              loading={deleting && !selectedTaskIds.length}
+              onClick={confirmClearAllTasks}
+            >
+              一键清空
+            </Button>
+          </Space>
         </div>
         <Table
           rowKey="id"
           loading={loading}
           columns={columns}
-          dataSource={tasks}
+          dataSource={filteredTasks}
+          rowSelection={{
+            selectedRowKeys: selectedTaskIds,
+            onChange: (keys) => setSelectedTaskIds(keys.map(String))
+          }}
           pagination={{
             pageSize: tablePageSize,
             showSizeChanger: false,

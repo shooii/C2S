@@ -5,6 +5,8 @@ import {
   deleteTemplate,
   getTemplate,
   listTemplates,
+  parseTemplate,
+  replaceTemplateFromUpload,
   updateTemplateConfiguration
 } from "../services/template.service";
 import { asyncHandler } from "../utils/asyncHandler";
@@ -74,6 +76,42 @@ router.post(
   })
 );
 
+router.post(
+  "/:id/replace",
+  (req, res, next) => {
+    res.locals.uploadAborted = false;
+    req.once("aborted", () => {
+      res.locals.uploadAborted = true;
+      if (req.file?.path) {
+        removeIfExists(req.file.path);
+      }
+    });
+    next();
+  },
+  upload.single("file"),
+  asyncHandler(async (req, res) => {
+    if (!req.file) {
+      throw new HttpError(400, "请上传 .fmw / .fmwt 模板文件");
+    }
+    const uploadToken = typeof req.body?.uploadToken === "string" ? req.body.uploadToken : "";
+    if (uploadToken && cancelledUploads.has(uploadToken)) {
+      removeIfExists(req.file.path);
+      cancelledUploads.delete(uploadToken);
+      res.status(204).send();
+      return;
+    }
+    try {
+      const template = await replaceTemplateFromUpload(req.params.id, req.file);
+      cancelledUploads.delete(uploadToken);
+      res.json({ data: template });
+    } catch (error) {
+      removeIfExists(req.file.path);
+      cancelledUploads.delete(uploadToken);
+      throw error;
+    }
+  })
+);
+
 router.get(
   "/",
   asyncHandler(async (req, res) => {
@@ -91,6 +129,13 @@ router.get(
   "/:id",
   asyncHandler(async (req, res) => {
     res.json({ data: getTemplate(req.params.id) });
+  })
+);
+
+router.post(
+  "/:id/parse",
+  asyncHandler(async (req, res) => {
+    res.json({ data: await parseTemplate(req.params.id) });
   })
 );
 

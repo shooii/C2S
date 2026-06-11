@@ -177,6 +177,92 @@ export function createInputUpload() {
   });
 }
 
+export interface ParameterUploadManifestEntry {
+  parameterName: string;
+  kind: "file" | "folder";
+  relativePath: string;
+}
+
+export interface MaterializedParameterUploads {
+  values: Record<string, string | string[]>;
+  primaryName: string | null;
+  primaryPath: string | null;
+  cleanupPaths: string[];
+}
+
+export function materializeParameterUploads(
+  files: Express.Multer.File[],
+  manifest: ParameterUploadManifestEntry[]
+): MaterializedParameterUploads {
+  if (files.length !== manifest.length) {
+    files.forEach((file) => removeIfExists(file.path));
+    throw new HttpError(400, "本地路径上传信息不完整");
+  }
+
+  const values: Record<string, string | string[]> = {};
+  const cleanupPaths: string[] = [];
+  let primaryName: string | null = null;
+  let primaryPath: string | null = null;
+
+  try {
+    const groups = new Map<string, Array<{ file: Express.Multer.File; entry: ParameterUploadManifestEntry }>>();
+    files.forEach((file, index) => {
+      const entry = manifest[index];
+      const parameterName = entry?.parameterName?.trim();
+      if (!parameterName || !["file", "folder"].includes(entry.kind)) {
+        throw new HttpError(400, "本地路径上传参数无效");
+      }
+      const group = groups.get(parameterName) || [];
+      group.push({ file, entry: { ...entry, parameterName } });
+      groups.set(parameterName, group);
+    });
+
+    for (const [parameterName, group] of groups) {
+      const kind = group[0].entry.kind;
+      if (group.some((item) => item.entry.kind !== kind)) {
+        throw new HttpError(400, `参数 ${parameterName} 的上传类型不一致`);
+      }
+
+      if (kind === "folder") {
+        const folderRoot = path.join(
+          inputStorageDir,
+          `${Date.now()}-${cryptoRandom()}-${safeFileName(parameterName)}`
+        );
+        const relativePaths = group.map((item) => normalizeUploadRelativePath(item.entry.relativePath));
+        const commonRoot = getCommonUploadRoot(relativePaths);
+        fs.mkdirSync(folderRoot, { recursive: true });
+        cleanupPaths.push(folderRoot);
+
+        group.forEach((item, index) => {
+          const relativePath = commonRoot
+            ? relativePaths[index].slice(commonRoot.length + 1)
+            : relativePaths[index];
+          const targetPath = assertPathInside(folderRoot, path.join(folderRoot, relativePath));
+          fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          moveUploadedFile(item.file.path, targetPath);
+        });
+
+        values[parameterName] = folderRoot;
+        primaryName ||= commonRoot || path.basename(folderRoot);
+        primaryPath ||= folderRoot;
+        continue;
+      }
+
+      const uploadedPaths = group.map((item) => item.file.path);
+      cleanupPaths.push(...uploadedPaths);
+      values[parameterName] = uploadedPaths.length === 1 ? uploadedPaths[0] : uploadedPaths;
+      primaryName ||= decodeFileName(group[0].entry.relativePath || group[0].file.originalname);
+      primaryPath ||= uploadedPaths[0];
+    }
+
+    return { values, primaryName, primaryPath, cleanupPaths };
+  } catch (error) {
+    cleanupPaths.forEach(removeIfExists);
+    files.forEach((file) => removeIfExists(file.path));
+    throw error;
+  }
+}
+
 export function assertPathInside(root: string, targetPath: string): string {
   const resolvedRoot = path.resolve(root);
   const resolvedTarget = path.resolve(targetPath);
@@ -202,12 +288,14 @@ export function isPreviewable(fileName: string): boolean {
   return previewExtensions.has(path.extname(lower)) || lower.endsWith("tileset.json");
 }
 
-export function listFilesRecursive(dir: string): Array<{ filePath: string; fileName: string; fileSize: number }> {
+export function listFilesRecursive(
+  dir: string
+): Array<{ filePath: string; fileName: string; fileSize: number; modifiedAt: number }> {
   if (!fs.existsSync(dir)) {
     return [];
   }
 
-  const files: Array<{ filePath: string; fileName: string; fileSize: number }> = [];
+  const files: Array<{ filePath: string; fileName: string; fileSize: number; modifiedAt: number }> = [];
   const walk = (current: string) => {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const entryPath = path.join(current, entry.name);
@@ -219,7 +307,8 @@ export function listFilesRecursive(dir: string): Array<{ filePath: string; fileN
       files.push({
         filePath: entryPath,
         fileName: decodeFileName(path.relative(dir, entryPath).replace(/\\/g, "/")),
-        fileSize: stat.size
+        fileSize: stat.size,
+        modifiedAt: stat.mtimeMs
       });
     }
   };
@@ -251,3 +340,36 @@ function cryptoRandom(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+function normalizeUploadRelativePath(value: string): string {
+  const normalized = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== ".")
+    .join(path.sep);
+  if (!normalized || normalized.split(path.sep).some((segment) => segment === "..")) {
+    throw new HttpError(400, "本地目录包含非法路径");
+  }
+  return normalized;
+}
+
+function getCommonUploadRoot(relativePaths: string[]): string | null {
+  if (!relativePaths.length) {
+    return null;
+  }
+  const firstSegments = relativePaths.map((value) => value.split(path.sep)[0]);
+  const candidate = firstSegments[0];
+  return candidate &&
+    relativePaths.every((value) => value.split(path.sep).length > 1) &&
+    firstSegments.every((segment) => segment === candidate)
+    ? candidate
+    : null;
+}
+
+function moveUploadedFile(sourcePath: string, targetPath: string): void {
+  try {
+    fs.renameSync(sourcePath, targetPath);
+  } catch {
+    fs.copyFileSync(sourcePath, targetPath);
+    fs.unlinkSync(sourcePath);
+  }
+}

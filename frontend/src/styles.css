@@ -146,9 +146,20 @@ body,
   gap: 16px;
 }
 
-.parameter-name-setting .parameter-help {
-  margin-top: 4px;
-  overflow-wrap: anywhere;
+.editable-parameter-label {
+  font-weight: 500;
+}
+
+.editable-parameter-label .ant-typography-edit {
+  margin-inline-start: 5px;
+  color: #7b8798;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.ant-form-item-label > label:hover .editable-parameter-label .ant-typography-edit,
+.editable-parameter-label:focus-within .ant-typography-edit {
+  opacity: 1;
 }
 
 .config-grid {

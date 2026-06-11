@@ -3,8 +3,14 @@ import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import AdmZip from "adm-zip";
 import iconv from "iconv-lite";
-import { fmeCandidates, logStorageDir, outputStorageDir } from "../config/paths";
-import type { ParameterType, ResultFile } from "../types";
+import { fmeCandidates, logStorageDir } from "../config/paths";
+import type {
+  ParameterDirection,
+  ParameterOption,
+  ParameterPathKind,
+  ParameterType,
+  ResultFile
+} from "../types";
 import { getResultFileType, isPreviewable, listFilesRecursive } from "./file.service";
 
 export interface ParsedWorkspaceParameter {
@@ -13,7 +19,10 @@ export interface ParsedWorkspaceParameter {
   type: ParameterType;
   defaultValue: string | null;
   required: boolean;
-  options: string[];
+  options: ParameterOption[];
+  direction: ParameterDirection;
+  pathKind: ParameterPathKind;
+  multiple: boolean;
   description: string | null;
   sortOrder: number;
 }
@@ -88,8 +97,15 @@ export function getWorkspaceOutputParameterNames(workspacePath: string): string[
 }
 
 export function isOutputDirectoryParameter(
-  parameter: Pick<ParsedWorkspaceParameter, "name" | "label" | "type" | "defaultValue" | "description">
+  parameter: Pick<
+    ParsedWorkspaceParameter,
+    "name" | "label" | "type" | "defaultValue" | "description" | "direction" | "pathKind"
+  >
 ): boolean {
+  if (parameter.direction === "output" && isPathParameter(parameter.type, parameter.pathKind)) {
+    return true;
+  }
+
   const name = normalizeFmeParameterName(parameter.name);
   const upperName = name.toUpperCase();
 
@@ -251,17 +267,33 @@ export function cancelWorkspace(taskId: string): boolean {
   return true;
 }
 
-export function scanOutputFiles(taskId: string): Array<Omit<ResultFile, "id" | "createdAt">> {
-  const outputDir = path.join(outputStorageDir, taskId);
-  return listFilesRecursive(outputDir).map((file) => ({
-    taskId,
-    fileName: file.fileName,
-    fileType: getResultFileType(file.fileName),
-    fileSize: file.fileSize,
-    filePath: file.filePath,
-    downloadable: true,
-    previewable: isPreviewable(file.fileName)
-  }));
+export type OutputFileSnapshot = Map<string, string>;
+
+export function snapshotOutputFiles(outputDir: string): OutputFileSnapshot {
+  return new Map(
+    listFilesRecursive(outputDir).map((file) => [
+      path.resolve(file.filePath),
+      `${file.fileSize}:${file.modifiedAt}`
+    ])
+  );
+}
+
+export function scanOutputFiles(
+  taskId: string,
+  outputDir: string,
+  baseline: OutputFileSnapshot = new Map()
+): Array<Omit<ResultFile, "id" | "createdAt">> {
+  return listFilesRecursive(outputDir)
+    .filter((file) => baseline.get(path.resolve(file.filePath)) !== `${file.fileSize}:${file.modifiedAt}`)
+    .map((file) => ({
+      taskId,
+      fileName: file.fileName,
+      fileType: getResultFileType(file.fileName),
+      fileSize: file.fileSize,
+      filePath: file.filePath,
+      downloadable: true,
+      previewable: isPreviewable(file.fileName)
+    }));
 }
 
 async function resolveFmeCommand(): Promise<string> {
@@ -521,16 +553,24 @@ function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
     }
 
     const label = parsedGui?.label || attrs.PROMPT || attrs.LABEL || prettifyName(name);
-    const defaultValue = attrs.DEFAULT_VALUE || attrs.VALUE || null;
+    const defaultValue = attrs.DEFAULT_VALUE || attrs.VALUE
+      ? decodeFmeTokens(attrs.DEFAULT_VALUE || attrs.VALUE)
+      : null;
     const declaredType = [parsedGui?.type, attrs.TYPE, attrs.PARAMETER_TYPE].filter(Boolean).join(" ");
 
     parameters.push({
       name,
       label,
-      type: inferType(name, label, declaredType, defaultValue, splitOptions(parsedGui?.choices || null)),
+      ...inferParameterMetadata({
+        name,
+        label,
+        declaredType,
+        defaultValue,
+        options: parseOptions(parsedGui?.choices || null)
+      }),
       defaultValue,
       required: /required|mandatory/i.test(guiLine),
-      options: splitOptions(parsedGui?.choices || null),
+      options: parseOptions(parsedGui?.choices || null),
       description: attrs.DESCRIPTION || attrs.HELP || null,
       sortOrder: parameters.length
     });
@@ -585,14 +625,20 @@ function parseTextBlocks(text: string): ParsedWorkspaceParameter[] {
     const required = /(?:required|mandatory)\s*[:=]\s*(true|yes|1)/i.test(block);
     const description =
       capture(block, /(?:description|help|tooltip)\s*[:=]\s*["']?([^"'\r\n]+)/i) || null;
-    const options = splitOptions(
+    const options = parseOptions(
       capture(block, /(?:options|choices|choiceList|items)\s*[:=]\s*["']?([^"'\r\n]+)/i)
     );
 
     parameters.push({
       name,
       label,
-      type: inferType(name, label, declaredType, defaultValue || null, options),
+      ...inferParameterMetadata({
+        name,
+        label,
+        declaredType,
+        defaultValue: defaultValue || null,
+        options
+      }),
       defaultValue: defaultValue || null,
       required,
       options,
@@ -620,7 +666,13 @@ function parseCommandLineParameters(text: string): ParsedWorkspaceParameter[] {
     parameters.push({
       name,
       label,
-      type: inferType(name, label, null, defaultValue, []),
+      ...inferParameterMetadata({
+        name,
+        label,
+        declaredType: null,
+        defaultValue,
+        options: []
+      }),
       defaultValue,
       required: false,
       options: [],
@@ -640,7 +692,8 @@ function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspacePar
 
   const label = stringValue(raw.label ?? raw.displayName ?? raw.prompt ?? raw.title) || prettifyName(name);
   const rawOptions = extractOptions(raw);
-  const defaultValue = stringValue(raw.defaultValue ?? raw.default ?? raw.value);
+  const rawDefaultValue = stringValue(raw.defaultValue ?? raw.default ?? raw.value);
+  const defaultValue = rawDefaultValue ? decodeFmeTokens(rawDefaultValue) : null;
   const declaredType = [
     stringValue(raw.type ?? raw.parameterType ?? raw.valueType),
     stringValue(raw.valueType),
@@ -649,11 +702,21 @@ function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspacePar
     stringValue(raw.guiType ?? raw.editor ?? raw.category),
     Boolean(raw.selectMultiple) ? "multiple" : null
   ].filter((value): value is string => Boolean(value)).join(" ");
+  const metadata = inferParameterMetadata({
+    name,
+    label,
+    declaredType,
+    defaultValue,
+    options: rawOptions,
+    accessMode: stringValue(raw.accessMode),
+    itemsToSelect: stringValue(raw.itemsToSelect),
+    selectMultiple: Boolean(raw.selectMultiple)
+  });
 
   return {
     name,
     label,
-    type: inferType(name, label, declaredType, defaultValue, rawOptions),
+    ...metadata,
     defaultValue,
     required: Boolean(raw.required ?? raw.mandatory ?? false),
     options: rawOptions,
@@ -677,33 +740,94 @@ function normalizeParameters(parameters: ParsedWorkspaceParameter[]): ParsedWork
   return [...byName.values()].sort((a, b) => a.sortOrder - b.sortOrder);
 }
 
-function extractOptions(raw: Record<string, unknown>): string[] {
-  const source = raw.options ?? raw.choices ?? raw.choiceList ?? raw.items ?? raw.values;
+function extractOptions(raw: Record<string, unknown>): ParameterOption[] {
+  const choiceSettings = raw.choiceSettings;
+  const choiceSettingsRecord = choiceSettings && typeof choiceSettings === "object"
+    ? choiceSettings as Record<string, unknown>
+    : null;
+  const source =
+    choiceSettingsRecord?.choices ??
+    raw.options ??
+    raw.choices ??
+    raw.choiceList ??
+    raw.items ??
+    raw.values;
   if (Array.isArray(source)) {
     return source
       .map((option) => {
         if (option && typeof option === "object") {
           const optionRecord = option as Record<string, unknown>;
-          return stringValue(optionRecord.value ?? optionRecord.name ?? optionRecord.label ?? optionRecord.displayName);
+          const value = stringValue(
+            optionRecord.value ??
+            optionRecord.name ??
+            optionRecord.id ??
+            optionRecord.label ??
+            optionRecord.display ??
+            optionRecord.displayName
+          );
+          const label = stringValue(
+            optionRecord.display ??
+            optionRecord.displayName ??
+            optionRecord.label ??
+            optionRecord.name ??
+            value
+          );
+          return value ? { label: decodeFmeTokens(label || value), value: decodeFmeTokens(value) } : null;
         }
-        return stringValue(option);
+        const value = stringValue(option);
+        return value ? { label: decodeFmeTokens(value), value: decodeFmeTokens(value) } : null;
       })
-      .filter((option): option is string => Boolean(option));
+      .filter((option): option is ParameterOption => Boolean(option));
   }
-  return splitOptions(stringValue(source));
+  return parseOptions(stringValue(source));
+}
+
+interface ParameterMetadataInput {
+  name: string;
+  label: string;
+  declaredType: string | null | undefined;
+  defaultValue: string | null;
+  options: ParameterOption[];
+  accessMode?: string | null;
+  itemsToSelect?: string | null;
+  selectMultiple?: boolean;
+}
+
+function inferParameterMetadata(input: ParameterMetadataInput): {
+  type: ParameterType;
+  direction: ParameterDirection;
+  pathKind: ParameterPathKind;
+  multiple: boolean;
+} {
+  const direction = inferDirection(input);
+  const pathKind = inferPathKind(input);
+  const multiple = Boolean(input.selectMultiple) || /\b(multi|multiple)\b|多选|复选/i.test(input.declaredType || "");
+  return {
+    type: inferType(input, direction, pathKind, multiple),
+    direction,
+    pathKind,
+    multiple
+  };
 }
 
 function inferType(
-  name: string,
-  label: string,
-  declaredType: string | null | undefined,
-  defaultValue: string | null,
-  options: string[]
+  input: ParameterMetadataInput,
+  direction: ParameterDirection,
+  pathKind: ParameterPathKind,
+  multiple: boolean
 ): ParameterType {
+  const { name, label, declaredType, defaultValue, options } = input;
   const text = `${declaredType || ""} ${name} ${label}`.toLowerCase();
+  const declared = (declaredType || "").toLowerCase();
+  const hasAliases = options.some((option) => option.label !== option.value);
+
+  if (isSourceDatasetText(text)) return "source_dataset";
+  if (isDestinationDatasetText(text)) return "destination_dataset";
   if (/message|notice|info|提示|说明|消息/.test(text)) return "message";
   if (/password|secret|credential|密码|密钥/.test(text)) return "password";
-  if (/datetime|date_time|timestamp|日期|时间/.test(text)) return "datetime";
+  if (/datetime|date_time|timestamp|日期时间/.test(text)) return "datetime";
+  if (/(^|[\s_.-])date([\s_.-]|$)|日期/.test(text) && !/update|metadata/.test(text)) return "date";
+  if (/(^|[\s_.-])time([\s_.-]|$)|时间/.test(text)) return "time";
   if (/color|colour|颜色|色值/.test(text)) return "color";
   if (/encoding|charset|codepage|字符编码|编码/.test(text)) return "encoding";
   if (/table|matrix|grid|表格|二维表/.test(text)) return "table";
@@ -712,29 +836,38 @@ function inferType(
   if (/scripted selection|scripted_selection|python.*selection|动态选项|脚本选项/.test(text)) return "scripted_selection";
   if (/scripted value|scripted_value|python.*value|脚本值|后台计算/.test(text)) return "scripted_value";
   if (/expose attributes|expose_attribute|暴露属性|暴露字段/.test(text)) return "attribute_expose";
-  if (/select attributes|select_attribute|attribute.*select|选择属性|选择字段|字段选择/.test(text)) return "attribute_select";
+  if (/attribute name|attribute_name|attr(?:ibute)?(?:name)?|属性名|字段名|选择属性|选择字段|字段选择/.test(text)) return "attribute_name";
+  if (/feature type|feature_type|featuretype|要素类型|图层|表名/.test(text)) return "feature_type";
   if (/geometry|geojson|bounding|extent|polygon|几何|范围/.test(text)) return "geometry";
   if (/reprojection file|grid file|datum.*grid|坐标转换网格|重投影文件/.test(text)) return "reprojection_file";
   if (/coord|coordinate system|coordsys|epsg|projection|坐标系/.test(text)) return "coordinate_system";
   if (/url|uri|endpoint|网址|链接/.test(text)) return "url";
-  if (/format|格式|output_format/.test(text)) return "output_format";
+  if (/output_format|(^|[\s_.-])(output|dest|writer)[\s_.-]*format|输出格式|输出文件格式/.test(text)) return "output_format";
   if (/checkbox_group|checklist|check boxes|复选|勾选/.test(text) && options.length > 0) return "checkbox_group";
+  if (multiple && options.length > 0) return "multi_choice";
   if (/multi|multiple|checklist|checkbox_group|多选|复选|勾选/.test(text) && options.length > 0) return "multi_choice";
-  if (/choice|enum|select|lookup|radio|选项|选择|单选/.test(text) || options.length > 0) return "enum";
+  if (/choice|enum|select|lookup|radio|dropdown|选项|选择|单选/.test(text) || options.length > 0) {
+    return hasAliases ? "choice_alias" : "enum";
+  }
   if (/yes\/no|yesno|bool|boolean|checkbox|switch|toggle|是\/否|是否|布尔/.test(text)) return "boolean";
   if (/number|integer|float|double|numeric|decimal|slider|数字|数值|数量|整数|浮点/.test(text)) return "number";
-  if (/textarea|multiline|multi-line|long text|多行|长文本/.test(text)) return "textarea";
-  if (/(^|[\s_.-])text([\s_.-]|$)|文本/.test(text)) return "text";
+  if (/textarea|multiline|multi-line|long text|text_edit|多行|长文本/.test(text)) return "textarea";
+  if (/(^|[\s_.-])text([\s_.-]|$)|plaintext|文本/.test(text)) return "text";
   if (/(^|[\s_.-])(filename|file_name)([\s_.-]|$)|feature type name|文件名称|文件名|名称/.test(text)
     && !/path|dir|directory|folder|dataset|目录|路径|文件夹|数据集/.test(text)) {
     return "string";
   }
+  if (pathKind === "folder") return "folder";
+  if (pathKind === "file") return "file";
   if (defaultValue && /\.[A-Za-z0-9]{2,8}($|[?#])/.test(defaultValue) && !/folder|directory|dir|目录|文件夹/.test(text)) return "file";
   if (/folder|folders|directory|dirname|dir|目录|文件夹/.test(text)) return "folder";
   if (/path|路径/.test(text)) return "path";
   if (/file|filename|dataset|source|input|reader|文件|数据集/.test(text)) return "file";
   if (defaultValue && /^(true|false|yes|no|0|1)$/i.test(defaultValue)) return "boolean";
   if (defaultValue && /^-?\d+(\.\d+)?$/.test(defaultValue)) return "number";
+  if (direction !== "none" && /dataset/.test(declared)) {
+    return direction === "output" ? "destination_dataset" : "source_dataset";
+  }
   return "string";
 }
 
@@ -751,16 +884,150 @@ function stringifyFmeValue(value: unknown): string {
   return String(value);
 }
 
-function splitOptions(raw: string | null): string[] {
+function inferDirection(input: ParameterMetadataInput): ParameterDirection {
+  const accessMode = (input.accessMode || "").toLowerCase();
+  if (/write|output|destination/.test(accessMode)) {
+    return "output";
+  }
+  if (/read|input|source/.test(accessMode)) {
+    return "input";
+  }
+
+  const text = `${input.declaredType || ""} ${input.name} ${input.label}`.toLowerCase();
+  if (isDestinationDatasetText(text)) {
+    return "output";
+  }
+  if (isSourceDatasetText(text)) {
+    return "input";
+  }
+  if (/(^|[\s_.-])(output|out|dest|destination|writer|result|target|export|sink)([\s_.-]|$)|输出|成果|结果|目标|写入|导出/.test(text)) {
+    return "output";
+  }
+  if (/(^|[\s_.-])(input|source|reader|src)([\s_.-]|$)|输入|源数据|来源|读取/.test(text)) {
+    return "input";
+  }
+  return "none";
+}
+
+function inferPathKind(input: ParameterMetadataInput): ParameterPathKind {
+  const itemsToSelect = (input.itemsToSelect || "").toLowerCase();
+  if (/folder|directory/.test(itemsToSelect)) {
+    return "folder";
+  }
+  if (/file/.test(itemsToSelect)) {
+    return "file";
+  }
+
+  const text = `${input.declaredType || ""} ${input.name} ${input.label}`.toLowerCase();
+  if (/folder|folders|directory|dirname|multidirectory|目录|文件夹/.test(text)) {
+    return "folder";
+  }
+  if (/file_or_url|multifile|(^|[\s_.-])file([\s_.-]|$)|文件路径/.test(text)) {
+    return "file";
+  }
+  if (
+    input.defaultValue &&
+    /[\\/]/.test(input.defaultValue) &&
+    /\.[A-Za-z][A-Za-z0-9]{1,7}($|[?#])/.test(input.defaultValue)
+  ) {
+    return "file";
+  }
+  if (/dataset|path|路径|数据集/.test(text)) {
+    return /dest|destination|writer|output|输出/.test(text) ? "folder" : null;
+  }
+  return null;
+}
+
+function isSourceDatasetText(text: string): boolean {
+  return /source[\s_.-]*dataset|sourcedataset_|reader[\s_.-]*dataset|源数据集|输入数据集/.test(text);
+}
+
+function isDestinationDatasetText(text: string): boolean {
+  return /destination[\s_.-]*dataset|destdataset_|featurewriterdataset_|writer[\s_.-]*dataset|目标数据集|输出数据集/.test(text);
+}
+
+function isPathParameter(type: ParameterType, pathKind: ParameterPathKind): boolean {
+  return Boolean(pathKind) || [
+    "file",
+    "folder",
+    "path",
+    "reprojection_file",
+    "source_dataset",
+    "destination_dataset"
+  ].includes(type);
+}
+
+function parseOptions(raw: string | null): ParameterOption[] {
   if (!raw) {
     return [];
   }
-  return raw
-    .replace(/%space%/gi, " ")
-    .replace(/<space>/gi, " ")
-    .split(/[|;,%]/)
-    .map((value) => value.trim().replace(/^["']|["']$/g, ""))
-    .filter(Boolean);
+  const normalized = raw.replace(/%space%/gi, " ");
+  const rawOptions = normalized.includes("%")
+    ? normalized.split("%")
+    : normalized.includes("|")
+      ? normalized.split("|")
+      : normalized.includes(";")
+        ? normalized.split(";")
+        : normalized.split(",");
+
+  return rawOptions
+    .map((rawOption): ParameterOption | null => {
+      const option = rawOption.trim().replace(/^["']|["']$/g, "");
+      if (!option) {
+        return null;
+      }
+      const aliasSeparator = findAliasSeparator(option);
+      if (aliasSeparator < 0) {
+        const value = decodeFmeTokens(option);
+        return { label: value, value };
+      }
+      const label = decodeFmeTokens(option.slice(0, aliasSeparator).trim());
+      const value = decodeFmeTokens(option.slice(aliasSeparator + 1).trim());
+      return value ? { label: label || value, value } : null;
+    })
+    .filter((option): option is ParameterOption => Boolean(option));
+}
+
+function findAliasSeparator(value: string): number {
+  let angleDepth = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "<") {
+      angleDepth += 1;
+    } else if (character === ">" && angleDepth > 0) {
+      angleDepth -= 1;
+    } else if (character === "," && angleDepth === 0) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function decodeFmeTokens(value: string): string {
+  const namedTokens: Record<string, string> = {
+    space: " ",
+    solidus: "/",
+    backslash: "\\",
+    comma: ",",
+    colon: ":",
+    semicolon: ";",
+    percent: "%",
+    lt: "<",
+    gt: ">",
+    amp: "&",
+    quote: "\"",
+    apos: "'",
+    openparen: "(",
+    closeparen: ")",
+    openbracket: "[",
+    closebracket: "]",
+    opencurly: "{",
+    closecurly: "}"
+  };
+  return value
+    .replace(/<u([0-9a-f]{4,6})>/gi, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/<([a-z]+)>/gi, (match, token: string) => namedTokens[token.toLowerCase()] ?? match)
+    .trim();
 }
 
 function capture(text: string, regex: RegExp): string | null {
@@ -786,7 +1053,10 @@ function parseGuiLine(guiLine: string): { type: string; name: string; label: str
   }
   const tokens = [...guiLine.matchAll(/"([^"]*)"|(\S+)/g)].map((match) => match[1] ?? match[2]);
   const guiIndex = tokens.findIndex((token) => token.toUpperCase() === "GUI");
-  const start = guiIndex >= 0 ? guiIndex + 1 : 0;
+  let start = guiIndex >= 0 ? guiIndex + 1 : 0;
+  while (["OPTIONAL", "WHOLE_LINE"].includes((tokens[start] || "").toUpperCase())) {
+    start += 1;
+  }
   const type = tokens[start];
   const name = tokens[start + 1];
   if (!type || !name) {
@@ -797,7 +1067,7 @@ function parseGuiLine(guiLine: string): { type: string; name: string; label: str
   return {
     type,
     name,
-    label: labelTokens.filter((token) => token !== choiceToken).join(" ") || prettifyName(name),
+    label: decodeFmeTokens(labelTokens.filter((token) => token !== choiceToken).join(" ")) || prettifyName(name),
     choices: choiceToken || null
   };
 }

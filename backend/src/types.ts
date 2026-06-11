@@ -8,8 +8,11 @@ export type ParameterType =
   | "number"
   | "boolean"
   | "enum"
+  | "choice_alias"
   | "multi_choice"
   | "checkbox_group"
+  | "date"
+  | "time"
   | "datetime"
   | "file"
   | "folder"
@@ -20,6 +23,10 @@ export type ParameterType =
   | "color"
   | "table"
   | "encoding"
+  | "source_dataset"
+  | "destination_dataset"
+  | "attribute_name"
+  | "feature_type"
   | "attribute_select"
   | "attribute_expose"
   | "coordinate_system"
@@ -30,6 +37,14 @@ export type ParameterType =
   | "scripted_selection"
   | "scripted_value"
   | "output_format";
+
+export type ParameterDirection = "input" | "output" | "none";
+export type ParameterPathKind = "file" | "folder" | null;
+
+export interface ParameterOption {
+  label: string;
+  value: string;
+}
 
 export interface TemplateRecord {
   id: string;
@@ -69,7 +84,10 @@ export interface TemplateParameter {
   type: ParameterType;
   defaultValue: string | null;
   required: boolean;
-  options: string[];
+  options: ParameterOption[];
+  direction: ParameterDirection;
+  pathKind: ParameterPathKind;
+  multiple: boolean;
   description: string | null;
   sortOrder: number;
 }
@@ -83,6 +101,7 @@ export interface ConversionTask {
   taskName: string;
   templateId: string;
   templateName: string;
+  rerunnable: boolean;
   inputDataName: string | null;
   inputDataPath: string | null;
   status: TaskStatus;

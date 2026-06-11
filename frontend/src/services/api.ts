@@ -38,10 +38,21 @@ async function unwrap<T>(request: Promise<{ data: ApiEnvelope<T> }>): Promise<T>
 export const api = {
   getFmeStatus: () => unwrap<FmeStatus>(http.get("/api/fme/status")),
 
+  selectLocalPath: (payload: {
+    kind: "file" | "folder";
+    initialPath?: string;
+    multiple?: boolean;
+  }) => unwrap<{ cancelled: boolean; paths: string[] }>(
+    http.post("/api/local-paths/select", payload, { timeout: 0 })
+  ),
+
   listTemplates: (params?: { search?: string; enabled?: boolean }) =>
     unwrap<TemplateRecord[]>(http.get("/api/templates", { params })),
 
   getTemplate: (id: string) => unwrap<TemplateDetail>(http.get(`/api/templates/${id}`)),
+
+  parseTemplate: (id: string) =>
+    unwrap<TemplateDetail>(http.post(`/api/templates/${id}/parse`)),
 
   updateTemplateConfiguration: (
     id: string,
@@ -90,6 +101,29 @@ export const api = {
     );
   },
 
+  replaceTemplate: (
+    id: string,
+    file: File,
+    uploadToken: string,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal
+  ) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("uploadToken", uploadToken);
+    return unwrap<TemplateDetail>(
+      http.post(`/api/templates/${id}/replace`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+        signal,
+        onUploadProgress: (event) => {
+          if (event.total && onProgress) {
+            onProgress(Math.round((event.loaded / event.total) * 100));
+          }
+        }
+      })
+    );
+  },
+
   cancelTemplateUpload: (uploadToken: string) =>
     http.post(`/api/templates/upload-cancellations/${encodeURIComponent(uploadToken)}`),
 
@@ -101,16 +135,41 @@ export const api = {
     parameters: Record<string, unknown>;
     outputFormat?: string;
     inputFile?: File | null;
+    parameterUploads?: Array<{
+      parameterName: string;
+      kind: "file" | "folder";
+      files: File[];
+    }>;
   }) => {
     const formData = new FormData();
+    const uploadManifest: Array<{
+      parameterName: string;
+      kind: "file" | "folder";
+      relativePath: string;
+    }> = [];
     formData.append("templateId", payload.templateId);
     if (payload.taskName) formData.append("taskName", payload.taskName);
     if (payload.outputFormat) formData.append("outputFormat", payload.outputFormat);
     formData.append("parameters", JSON.stringify(payload.parameters || {}));
     if (payload.inputFile) formData.append("inputData", payload.inputFile);
+    payload.parameterUploads?.forEach((upload) => {
+      upload.files.forEach((file) => {
+        const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+        formData.append("parameterFiles", file, file.name);
+        uploadManifest.push({
+          parameterName: upload.parameterName,
+          kind: upload.kind,
+          relativePath
+        });
+      });
+    });
+    if (uploadManifest.length) {
+      formData.append("parameterUploadManifest", JSON.stringify(uploadManifest));
+    }
     return unwrap<ConversionTask>(
       http.post("/api/tasks/run", formData, {
-        headers: { "Content-Type": "multipart/form-data" }
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 0
       })
     );
   },
@@ -136,6 +195,12 @@ export const api = {
   deleteResults: (taskId: string) => http.delete(`/api/results/${taskId}`),
 
   deleteTask: (taskId: string) => http.delete(`/api/tasks/${taskId}`),
+
+  deleteTasks: (taskIds: string[]) =>
+    unwrap<{ deletedCount: number }>(http.post("/api/tasks/batch-delete", { ids: taskIds })),
+
+  clearTasks: () =>
+    unwrap<{ deletedCount: number }>(http.delete("/api/tasks")),
 
   downloadUrl: (taskId: string, fileId: string) => `${API_BASE_URL}/api/results/${taskId}/download/${fileId}`,
 

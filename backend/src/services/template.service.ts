@@ -1,7 +1,15 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getDb, nowIso, runTransaction } from "../db/database";
-import type { ParseStatus, TemplateDetail, TemplateParameter, TemplateRecord } from "../types";
+import type {
+  ParameterDirection,
+  ParameterOption,
+  ParameterPathKind,
+  ParseStatus,
+  TemplateDetail,
+  TemplateParameter,
+  TemplateRecord
+} from "../types";
 import { assertTemplateFile, decodeFileName, removeIfExists, safeFileName } from "./file.service";
 import { parseWorkspaceParameters } from "./fme.service";
 import { assertFound, HttpError } from "../utils/httpError";
@@ -11,9 +19,10 @@ type TemplateRow = Omit<TemplateRecord, "tags" | "enabled"> & {
   tags: string;
   enabled: number;
 };
-type ParameterRow = Omit<TemplateParameter, "required" | "options"> & {
+type ParameterRow = Omit<TemplateParameter, "required" | "options" | "multiple"> & {
   required: number;
   options: string;
+  multiple: number;
 };
 
 export interface UpdateTemplateConfigurationInput {
@@ -116,10 +125,75 @@ export async function createTemplateFromUpload(
   return parseTemplate(id);
 }
 
+export async function replaceTemplateFromUpload(
+  id: string,
+  file: Express.Multer.File
+): Promise<TemplateDetail> {
+  if (!file) {
+    throw new HttpError(400, "请上传模板文件");
+  }
+
+  const template = getTemplate(id);
+  assertTemplateFile(file.originalname);
+  const decodedOriginalName = decodeFileName(file.originalname);
+  const fileType = path.extname(decodedOriginalName).toLowerCase() as ".fmw" | ".fmwt";
+  const displayFileName = safeFileName(decodedOriginalName);
+  const name = path.parse(displayFileName).name;
+  assertTemplateNameAvailable(template.groupId, name, id);
+
+  getDb()
+    .prepare(
+      `UPDATE templates
+       SET name = ?, fileName = ?, fileType = ?, filePath = ?,
+           parseStatus = ?, parseMessage = ?, updatedAt = ?
+       WHERE id = ?`
+    )
+    .run(
+      name,
+      displayFileName,
+      fileType,
+      file.path,
+      "pending",
+      "模板文件已更新，等待解析",
+      nowIso(),
+      id
+    );
+
+  try {
+    const parsed = await parseTemplate(id);
+    if (path.resolve(template.filePath) !== path.resolve(file.path)) {
+      removeIfExists(template.filePath);
+    }
+    return parsed;
+  } catch (error) {
+    getDb()
+      .prepare(
+        `UPDATE templates
+         SET name = ?, fileName = ?, fileType = ?, filePath = ?,
+             parseStatus = ?, parseMessage = ?, updatedAt = ?
+         WHERE id = ?`
+      )
+      .run(
+        template.name,
+        template.fileName,
+        template.fileType,
+        template.filePath,
+        template.parseStatus,
+        template.parseMessage,
+        template.updatedAt,
+        id
+      );
+    throw error;
+  }
+}
+
 export async function parseTemplate(id: string): Promise<TemplateDetail> {
   const template = getTemplate(id);
   const db = getDb();
   const parsingAt = nowIso();
+  const existingLabels = new Map(
+    template.parameters.map((parameter) => [parameter.name.toLowerCase(), parameter.label])
+  );
 
   db.prepare("UPDATE templates SET parseStatus = ?, parseMessage = ?, updatedAt = ? WHERE id = ?")
     .run("parsing", "正在解析 FME Published Parameters / User Parameters", parsingAt, id);
@@ -128,9 +202,11 @@ export async function parseTemplate(id: string): Promise<TemplateDetail> {
     const parameters = await parseWorkspaceParameters(template.filePath);
     const insertParameter = db.prepare(
       `INSERT INTO template_parameters (
-        id, templateId, name, label, type, defaultValue, required, options, description, sortOrder
+        id, templateId, name, label, type, defaultValue, required, options,
+        direction, pathKind, multiple, description, sortOrder
       ) VALUES (
-        @id, @templateId, @name, @label, @type, @defaultValue, @required, @options, @description, @sortOrder
+        @id, @templateId, @name, @label, @type, @defaultValue, @required, @options,
+        @direction, @pathKind, @multiple, @description, @sortOrder
       )`
     );
 
@@ -151,11 +227,14 @@ export async function parseTemplate(id: string): Promise<TemplateDetail> {
           id: randomUUID(),
           templateId: id,
           name: parameter.name,
-          label: parameter.label,
+          label: existingLabels.get(parameter.name.toLowerCase()) || parameter.label,
           type: parameter.type,
           defaultValue: parameter.defaultValue,
           required: parameter.required ? 1 : 0,
           options: JSON.stringify(parameter.options),
+          direction: parameter.direction,
+          pathKind: parameter.pathKind,
+          multiple: parameter.multiple ? 1 : 0,
           description: parameter.description,
           sortOrder: index
         });
@@ -282,7 +361,10 @@ function mapParameterRow(row: ParameterRow): TemplateParameter {
   return {
     ...row,
     required: Boolean(row.required),
-    options: safeJsonArray(row.options)
+    multiple: Boolean(row.multiple),
+    direction: normalizeDirection(row.direction),
+    pathKind: normalizePathKind(row.pathKind),
+    options: safeParameterOptions(row.options)
   };
 }
 
@@ -296,6 +378,42 @@ function safeJsonArray(value: string | null): string[] {
   } catch {
     return [];
   }
+}
+
+function safeParameterOptions(value: string | null): ParameterOption[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .map((option): ParameterOption | null => {
+        if (typeof option === "string") {
+          return { label: option, value: option };
+        }
+        if (!option || typeof option !== "object") {
+          return null;
+        }
+        const record = option as Record<string, unknown>;
+        const optionValue = String(record.value ?? record.label ?? "").trim();
+        const optionLabel = String(record.label ?? record.display ?? optionValue).trim();
+        return optionValue ? { label: optionLabel || optionValue, value: optionValue } : null;
+      })
+      .filter((option): option is ParameterOption => Boolean(option));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeDirection(value: string): ParameterDirection {
+  return value === "input" || value === "output" ? value : "none";
+}
+
+function normalizePathKind(value: string | null): ParameterPathKind {
+  return value === "file" || value === "folder" ? value : null;
 }
 
 function inferOutputDataType(values: Array<string | null>): string | null {

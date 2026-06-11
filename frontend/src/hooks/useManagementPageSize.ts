@@ -3,7 +3,6 @@ import { useLayoutEffect, useState } from "react";
 interface ManagementPageSizeOptions {
   cardSelector: string;
   fallbackRowHeight: number;
-  totalItems: number;
 }
 
 const fallbackPaginationHeight = 44;
@@ -11,8 +10,7 @@ const fallbackHeaderHeight = 47;
 
 export function useManagementPageSize({
   cardSelector,
-  fallbackRowHeight,
-  totalItems
+  fallbackRowHeight
 }: ManagementPageSizeOptions): number {
   const [pageSize, setPageSize] = useState(8);
 
@@ -44,11 +42,11 @@ export function useManagementPageSize({
         horizontalScrollbar.scrollWidth > horizontalScrollbar.clientWidth
         ? 10
         : 0;
-      const usableHeight = Math.max(0, wrapperHeight - headerHeight - scrollbarHeight);
-      const capacityWithoutPagination = Math.max(1, Math.floor(usableHeight / rowHeight));
-      const nextPageSize = totalItems <= capacityWithoutPagination
-        ? capacityWithoutPagination
-        : Math.max(1, Math.floor((usableHeight - paginationHeight) / rowHeight));
+      const usableHeight = Math.max(
+        0,
+        wrapperHeight - headerHeight - paginationHeight - scrollbarHeight
+      );
+      const nextPageSize = Math.max(1, Math.floor(usableHeight / rowHeight));
 
       setPageSize((current) => current === nextPageSize ? current : nextPageSize);
     };
@@ -72,7 +70,7 @@ export function useManagementPageSize({
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [cardSelector, fallbackRowHeight, totalItems]);
+  }, [cardSelector, fallbackRowHeight]);
 
   return pageSize;
 }

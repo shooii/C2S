@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import {
   App,
   Alert,
@@ -17,15 +18,19 @@ import {
   Spin,
   Switch,
   Table,
+  TimePicker,
   Typography
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   ArrowLeftOutlined,
   DeleteOutlined,
+  FileSearchOutlined,
+  FolderOpenOutlined,
   PlusOutlined,
   PlayCircleOutlined,
-  SaveOutlined
+  SaveOutlined,
+  SyncOutlined
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate, useParams } from "react-router-dom";
@@ -53,43 +58,9 @@ const encodingOptions = [
 
 const { TextArea, Password } = Input;
 
-function isAutoOutputDirectoryParameter(parameter: TemplateParameter): boolean {
-  const name = parameter.name.trim().replace(/^-+/, "");
-  if (/^(OUTPUT_DIR|OUTPUT_DIRECTORY|OUTPUT_PATH|DESTINATION_DATASET|DESTINATIONDATASET)$/i.test(name)) {
-    return true;
-  }
-  if (/^(DESTDATASET_|FEATUREWRITERDATASET_)/i.test(name)) {
-    return true;
-  }
-  if (/^(SOURCEDATASET_|SOURCE_DATASET|INPUT_DATA|INPUT_PATH|INPUT_FILE)$/i.test(name)) {
-    return false;
-  }
-
-  const text = [
-    parameter.name,
-    parameter.label,
-    parameter.type,
-    parameter.defaultValue || "",
-    parameter.description || ""
-  ].join(" ").toLowerCase();
-  const hasOutputMeaning = /(^|[\s_.-])(output|out|dest|destination|writer|result|target|export|sink)([\s_.-]|$)/i.test(text)
-    || /输出|成果|结果|目标|写入|导出/.test(text);
-  const hasPathMeaning = /path|dir|directory|folder|dataset|location|root|workspace|目录|路径|文件夹|数据集|位置/.test(text);
-  const hasInputMeaning = /(^|[\s_.-])(input|source|reader|src)([\s_.-]|$)|输入|源数据|来源|读取/.test(text);
-  const hasNameOrFormatMeaning = /filename|file_name|feature type|extension|format|name|名称|文件名|扩展|格式|类型/.test(text);
-
-  if (hasInputMeaning) {
-    return false;
-  }
-  if (hasOutputMeaning && hasPathMeaning && !hasNameOrFormatMeaning) {
-    return true;
-  }
-  return (parameter.type === "folder" || parameter.type === "path") && hasOutputMeaning && !hasNameOrFormatMeaning;
-}
-
 export default function TemplateConfig() {
   const { id } = useParams<{ id: string }>();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const navigate = useNavigate();
   const [form] = Form.useForm();
   const [template, setTemplate] = useState<TemplateDetail | null>(null);
@@ -100,6 +71,26 @@ export default function TemplateConfig() {
   const [enabled, setEnabled] = useState(false);
   const [parameterLabels, setParameterLabels] = useState<Record<string, string>>({});
   const [savingConfiguration, setSavingConfiguration] = useState(false);
+  const [parsing, setParsing] = useState(false);
+
+  const applyTemplateDetail = (detail: TemplateDetail) => {
+    setTemplate(detail);
+    setDescription(detail.description || "");
+    setVersion(detail.version || "1.0.0");
+    setEnabled(detail.enabled);
+    setParameterLabels(Object.fromEntries(
+      detail.parameters.map((parameter) => [parameter.id, parameter.label])
+    ));
+    form.resetFields();
+    form.setFieldsValue({
+      parameters: Object.fromEntries(
+        detail.parameters.map((parameter) => [
+          parameter.name,
+          coerceDefaultValue(parameter)
+        ])
+      )
+    });
+  };
 
   useEffect(() => {
     if (!id) {
@@ -109,21 +100,7 @@ export default function TemplateConfig() {
       setLoading(true);
       try {
         const detail = await api.getTemplate(id);
-        setTemplate(detail);
-        setDescription(detail.description || "");
-        setVersion(detail.version || "1.0.0");
-        setEnabled(detail.enabled);
-        setParameterLabels(Object.fromEntries(
-          detail.parameters.map((parameter) => [parameter.id, parameter.label])
-        ));
-        form.setFieldsValue({
-          parameters: Object.fromEntries(
-            detail.parameters.map((parameter) => [
-              parameter.name,
-              coerceDefaultValue(parameter)
-            ])
-          )
-        });
+        applyTemplateDetail(detail);
       } catch (error) {
         message.error(error instanceof Error ? error.message : "模板加载失败");
       } finally {
@@ -190,6 +167,41 @@ export default function TemplateConfig() {
     }
   };
 
+  const reparseTemplate = async () => {
+    if (!template) {
+      return;
+    }
+    setParsing(true);
+    try {
+      const parsed = await api.parseTemplate(template.id);
+      applyTemplateDetail(parsed);
+      if (parsed.parseStatus === "failed") {
+        message.error(parsed.parseMessage || "模板重新解析失败");
+      } else {
+        message.success(parsed.parseMessage || `已识别 ${parsed.parameterCount} 个参数`);
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "模板重新解析失败");
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  const confirmReparse = () => {
+    if (!configurationChanged) {
+      void reparseTemplate();
+      return;
+    }
+    modal.confirm({
+      title: "重新解析模板参数",
+      content: "当前存在未保存的模板配置。重新解析会覆盖参数列表和未保存的参数别名。",
+      okText: "继续解析",
+      cancelText: "取消",
+      centered: true,
+      onOk: reparseTemplate
+    });
+  };
+
   const submit = async (values: {
     parameters?: Record<string, unknown>;
   }) => {
@@ -197,19 +209,29 @@ export default function TemplateConfig() {
       return;
     }
     setRunning(true);
-    try {
-      await api.runTask({
-        templateId: template.id,
-        taskName: `${template.name} 转换任务`,
-        parameters: normalizeParameters(values.parameters || {})
+
+    const taskPromise = api.runTask({
+      templateId: template.id,
+      taskName: `${template.name} 转换任务`,
+      parameters: normalizeParameters(values.parameters || {})
+    });
+
+    navigate("/results", {
+      state: {
+        pendingTaskSubmittedAt: Date.now()
+      }
+    });
+
+    taskPromise
+      .then(() => {
+        message.success("转换任务已创建");
+      })
+      .catch((error) => {
+        message.error(error instanceof Error ? error.message : "任务创建失败");
+      })
+      .finally(() => {
+        setRunning(false);
       });
-      message.success("转换任务已创建");
-      navigate("/results");
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "任务创建失败");
-    } finally {
-      setRunning(false);
-    }
   };
 
   if (loading) {
@@ -238,22 +260,39 @@ export default function TemplateConfig() {
             <Typography.Text type="secondary">{template.name}</Typography.Text>
           </Space>
         </Space>
-        <Button
-          type="primary"
-          icon={<SaveOutlined />}
-          loading={savingConfiguration}
-          disabled={!configurationChanged}
-          onClick={saveConfiguration}
-        >
-          保存配置
-        </Button>
+        <Space>
+          <Button
+            icon={<SyncOutlined />}
+            loading={parsing}
+            disabled={savingConfiguration}
+            onClick={confirmReparse}
+          >
+            重新解析
+          </Button>
+          <Button
+            type="primary"
+            icon={<SaveOutlined />}
+            loading={savingConfiguration}
+            disabled={!configurationChanged || parsing}
+            onClick={saveConfiguration}
+          >
+            保存配置
+          </Button>
+        </Space>
       </div>
 
       <div className="config-grid">
         <Card className="form-card" title="运行参数">
           <Form form={form} layout="vertical" onFinish={submit}>
             {template.parameters.length ? (
-              template.parameters.map((parameter) => renderParameterItem(parameter))
+              template.parameters.map((parameter) => renderParameterItem(
+                parameter,
+                parameterLabels[parameter.id] || parameter.label || parameter.name,
+                (label) => setParameterLabels((current) => ({
+                  ...current,
+                  [parameter.id]: label
+                }))
+              ))
             ) : (
               <Empty description="暂无可配置参数" />
             )}
@@ -317,62 +356,47 @@ export default function TemplateConfig() {
               <Descriptions.Item label="必填参数">{requiredCount}</Descriptions.Item>
             </Descriptions>
           </Card>
-
-          <Card className="detail-card" title="参数名称">
-            {template.parameters.length ? (
-              <Space direction="vertical" size={12} style={{ width: "100%" }}>
-                {template.parameters.map((parameter) => (
-                  <div key={parameter.id} className="parameter-name-setting">
-                    <Input
-                      value={parameterLabels[parameter.id] || ""}
-                      maxLength={100}
-                      onChange={(event) => setParameterLabels((current) => ({
-                        ...current,
-                        [parameter.id]: event.target.value
-                      }))}
-                    />
-                    <div className="parameter-help">
-                      {parameter.name} · {parameter.type}{parameter.required ? " · 必填" : ""}
-                    </div>
-                  </div>
-                ))}
-              </Space>
-            ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无参数" />
-            )}
-          </Card>
         </Space>
       </div>
     </div>
   );
 }
 
-function renderParameterItem(parameter: TemplateParameter) {
-  const autoOutputDirectory = isAutoOutputDirectoryParameter(parameter);
+function renderParameterItem(
+  parameter: TemplateParameter,
+  parameterLabel: string,
+  onParameterLabelChange: (label: string) => void
+) {
   const commonProps = {
     name: ["parameters", parameter.name],
-    label: parameter.label || parameter.name,
-    rules: parameter.required && !autoOutputDirectory ? [{ required: true, message: `请填写 ${parameter.label || parameter.name}` }] : undefined,
-    tooltip: autoOutputDirectory ? "运行时自动写入成果详情的输出目录" : parameter.description || parameter.name
+    label: (
+      <EditableParameterLabel
+        value={parameterLabel}
+        fallback={parameter.label || parameter.name}
+        onChange={onParameterLabelChange}
+      />
+    ),
+    rules: parameter.required ? [{ required: true, message: `请填写 ${parameterLabel}` }] : undefined,
+    tooltip: parameter.description || parameter.name
   };
 
-  if (autoOutputDirectory) {
+  if (parameter.type === "message") {
     return (
-      <Form.Item key={parameter.id} {...commonProps}>
-        <Input disabled placeholder="自动使用成果详情输出目录" />
+      <Form.Item key={parameter.id} label={commonProps.label} tooltip={parameter.description || parameter.name}>
+        <Alert
+          type="info"
+          showIcon
+          message={parameterLabel}
+          description={parameter.defaultValue || parameter.description || "运行时提示信息"}
+        />
       </Form.Item>
     );
   }
 
-  if (parameter.type === "message") {
+  if (isPathParameter(parameter)) {
     return (
-      <Form.Item key={parameter.id} label={parameter.label || parameter.name} tooltip={parameter.description || parameter.name}>
-        <Alert
-          type="info"
-          showIcon
-          message={parameter.label || parameter.name}
-          description={parameter.defaultValue || parameter.description || "运行时提示信息"}
-        />
+      <Form.Item key={parameter.id} {...commonProps}>
+        <PathParameterInput parameter={parameter} />
       </Form.Item>
     );
   }
@@ -401,6 +425,22 @@ function renderParameterItem(parameter: TemplateParameter) {
     );
   }
 
+  if (parameter.type === "date") {
+    return (
+      <Form.Item key={parameter.id} {...commonProps}>
+        <DatePicker style={{ width: "100%" }} />
+      </Form.Item>
+    );
+  }
+
+  if (parameter.type === "time") {
+    return (
+      <Form.Item key={parameter.id} {...commonProps}>
+        <TimePicker style={{ width: "100%" }} />
+      </Form.Item>
+    );
+  }
+
   if (parameter.type === "password") {
     return (
       <Form.Item key={parameter.id} {...commonProps}>
@@ -421,9 +461,9 @@ function renderParameterItem(parameter: TemplateParameter) {
     return renderTableParameter(parameter, commonProps);
   }
 
-  if (parameter.type === "enum" || parameter.type === "output_format") {
+  if (parameter.type === "enum" || parameter.type === "choice_alias" || parameter.type === "output_format") {
     const options = parameter.options.length
-      ? parameter.options.map((option) => ({ value: option, label: option }))
+      ? parameter.options
       : parameter.type === "output_format"
         ? outputFormatOptions
         : [];
@@ -438,8 +478,13 @@ function renderParameterItem(parameter: TemplateParameter) {
     );
   }
 
-  if (parameter.type === "multi_choice" || parameter.type === "attribute_select" || parameter.type === "attribute_expose") {
-    const options = parameter.options.map((option) => ({ value: option, label: option }));
+  if (
+    parameter.type === "multi_choice" ||
+    parameter.type === "attribute_name" ||
+    parameter.type === "attribute_select" ||
+    parameter.type === "attribute_expose"
+  ) {
+    const options = parameter.options;
     return (
       <Form.Item key={parameter.id} {...commonProps}>
         {parameter.type === "attribute_expose" && options.length > 0 ? (
@@ -451,8 +496,21 @@ function renderParameterItem(parameter: TemplateParameter) {
     );
   }
 
+  if (parameter.type === "feature_type" || parameter.type === "coordinate_system") {
+    const options = parameter.options;
+    return (
+      <Form.Item key={parameter.id} {...commonProps}>
+        {options.length ? (
+          <Select showSearch allowClear options={options} placeholder={placeholderFor(parameter)} />
+        ) : (
+          <Input placeholder={placeholderFor(parameter)} />
+        )}
+      </Form.Item>
+    );
+  }
+
   if (parameter.type === "checkbox_group") {
-    const options = parameter.options.map((option) => ({ value: option, label: option }));
+    const options = parameter.options;
     return (
       <Form.Item key={parameter.id} {...commonProps}>
         <Checkbox.Group options={options} />
@@ -462,7 +520,7 @@ function renderParameterItem(parameter: TemplateParameter) {
 
   if (parameter.type === "encoding") {
     const options = parameter.options.length
-      ? parameter.options.map((option) => ({ value: option, label: option }))
+      ? parameter.options
       : encodingOptions;
     return (
       <Form.Item key={parameter.id} {...commonProps}>
@@ -472,7 +530,7 @@ function renderParameterItem(parameter: TemplateParameter) {
   }
 
   if (parameter.type === "database_connection" || parameter.type === "web_connection" || parameter.type === "scripted_selection") {
-    const options = parameter.options.map((option) => ({ value: option, label: option }));
+    const options = parameter.options;
     return (
       <Form.Item key={parameter.id} {...commonProps}>
         {options.length ? (
@@ -515,10 +573,84 @@ function renderParameterItem(parameter: TemplateParameter) {
   );
 }
 
+function EditableParameterLabel({
+  value,
+  fallback,
+  onChange
+}: {
+  value: string;
+  fallback: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <Typography.Text
+      className="editable-parameter-label"
+      editable={{
+        tooltip: "修改参数别名",
+        triggerType: ["text", "icon"],
+        onChange: (nextValue) => onChange(nextValue.trim() || fallback)
+      }}
+    >
+      {value || fallback}
+    </Typography.Text>
+  );
+}
+
+function PathParameterInput({
+  parameter,
+  value,
+  onChange
+}: {
+  parameter: TemplateParameter;
+  value?: string;
+  onChange?: (value: string) => void;
+}) {
+  const { message } = App.useApp();
+  const [selecting, setSelecting] = useState(false);
+  const kind = getPathKind(parameter);
+
+  const selectPath = async () => {
+    setSelecting(true);
+    try {
+      const result = await api.selectLocalPath({
+        kind,
+        initialPath: value,
+        multiple: kind === "file" && parameter.multiple
+      });
+      if (!result.cancelled && result.paths.length) {
+        onChange?.(result.paths.join(","));
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "本地路径选择失败");
+    } finally {
+      setSelecting(false);
+    }
+  };
+
+  return (
+    <div className="path-parameter-control">
+      <Space.Compact style={{ width: "100%" }}>
+        <Input
+          value={value}
+          placeholder={placeholderFor(parameter)}
+          onChange={(event) => onChange?.(event.target.value)}
+        />
+        <Button
+          icon={kind === "folder" ? <FolderOpenOutlined /> : <FileSearchOutlined />}
+          loading={selecting}
+          onClick={selectPath}
+        >
+          {kind === "folder" ? "选择目录" : "选择文件"}
+        </Button>
+      </Space.Compact>
+    </div>
+  );
+}
+
 function renderTableParameter(
   parameter: TemplateParameter,
   commonProps: {
-    label: string;
+    label: ReactNode;
     rules?: Array<{ required: boolean; message: string }>;
     tooltip?: string;
   }
@@ -580,9 +712,10 @@ function renderTableParameter(
 }
 
 function placeholderFor(parameter: TemplateParameter): string {
-  if (parameter.type === "file") return "请输入或粘贴文件路径";
-  if (parameter.type === "folder") return "请输入或粘贴目录路径";
+  if (parameter.type === "file" || parameter.pathKind === "file") return "请输入或粘贴文件路径";
+  if (parameter.type === "folder" || parameter.pathKind === "folder") return "请输入或粘贴目录路径";
   if (parameter.type === "reprojection_file") return "请选择或粘贴坐标转换网格文件路径";
+  if (parameter.type === "source_dataset") return "请选择或粘贴源数据集路径";
   if (parameter.type === "path") return "请输入路径";
   if (parameter.type === "url") return "请输入 URL";
   if (parameter.type === "coordinate_system") return "例如 EPSG:4547";
@@ -590,14 +723,12 @@ function placeholderFor(parameter: TemplateParameter): string {
   if (parameter.type === "database_connection") return "请选择数据库连接";
   if (parameter.type === "web_connection") return "请选择 Web/API 连接";
   if (parameter.type === "scripted_selection") return "请选择脚本生成的选项";
-  if (parameter.type === "attribute_select" || parameter.type === "attribute_expose") return "输入或选择属性字段";
+  if (parameter.type === "attribute_name" || parameter.type === "attribute_select" || parameter.type === "attribute_expose") return "输入或选择属性字段";
+  if (parameter.type === "feature_type") return "输入或选择图层 / 表";
   return "请输入参数值";
 }
 
 function coerceDefaultValue(parameter: TemplateParameter): unknown {
-  if (isAutoOutputDirectoryParameter(parameter)) {
-    return undefined;
-  }
   if (parameter.type === "message") {
     return undefined;
   }
@@ -611,7 +742,7 @@ function coerceDefaultValue(parameter: TemplateParameter): unknown {
     const value = Number(parameter.defaultValue);
     return Number.isNaN(value) ? undefined : value;
   }
-  if (parameter.type === "datetime") {
+  if (parameter.type === "date" || parameter.type === "time" || parameter.type === "datetime") {
     const value = dayjs(parameter.defaultValue);
     return value.isValid() ? value : undefined;
   }
@@ -622,6 +753,24 @@ function coerceDefaultValue(parameter: TemplateParameter): unknown {
     return parseTableDefault(parameter.defaultValue);
   }
   return parameter.defaultValue;
+}
+
+function isPathParameter(parameter: TemplateParameter): boolean {
+  return Boolean(parameter.pathKind) || [
+    "file",
+    "folder",
+    "path",
+    "reprojection_file",
+    "source_dataset",
+    "destination_dataset"
+  ].includes(parameter.type);
+}
+
+function getPathKind(parameter: TemplateParameter): "file" | "folder" {
+  if (parameter.pathKind) {
+    return parameter.pathKind;
+  }
+  return parameter.type === "folder" ? "folder" : "file";
 }
 
 function normalizeParameters(parameters: Record<string, unknown>): Record<string, unknown> {

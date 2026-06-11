@@ -3,20 +3,24 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getDb, nowIso, runTransaction } from "../db/database";
 import type { ConversionTask, ResultFile, TaskStatus, TemplateParameter } from "../types";
-import { assertPathInside, directorySize, removeIfExists, resultOutputPath } from "./file.service";
+import { assertPathInside, removeIfExists, resultOutputPath } from "./file.service";
 import {
   cancelWorkspace,
   defaultLogPath,
   getWorkspaceOutputParameterNames,
   isOutputDirectoryParameter,
   runWorkspace,
-  scanOutputFiles
+  scanOutputFiles,
+  snapshotOutputFiles
 } from "./fme.service";
 import { getTemplate } from "./template.service";
 import { assertFound, HttpError } from "../utils/httpError";
 import { logStorageDir, outputStorageDir } from "../config/paths";
 
-type TaskRow = Omit<ConversionTask, "parameters"> & { parameters: string };
+type TaskRow = Omit<ConversionTask, "parameters" | "rerunnable"> & {
+  parameters: string;
+  rerunnable: number;
+};
 type ResultFileRow = Omit<ResultFile, "downloadable" | "previewable"> & {
   downloadable: number;
   previewable: number;
@@ -46,16 +50,25 @@ export function listTasks(options: { status?: TaskStatus; search?: string } = {}
   }
 
   const sql = `
-    SELECT * FROM conversion_tasks
+    SELECT tasks.*,
+           CASE WHEN templates.id IS NOT NULL AND templates.enabled = 1 THEN 1 ELSE 0 END AS rerunnable
+    FROM conversion_tasks tasks
+    LEFT JOIN templates ON templates.id = tasks.templateId
     ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-    ORDER BY createdAt DESC
+    ORDER BY tasks.createdAt DESC
   `;
   return (db.prepare(sql).all(params) as unknown as TaskRow[]).map(mapTaskRow);
 }
 
 export function getTask(id: string): ConversionTask {
   return mapTaskRow(assertFound(
-    getDb().prepare("SELECT * FROM conversion_tasks WHERE id = ?").get(id) as TaskRow | undefined,
+    getDb().prepare(
+      `SELECT tasks.*,
+              CASE WHEN templates.id IS NOT NULL AND templates.enabled = 1 THEN 1 ELSE 0 END AS rerunnable
+       FROM conversion_tasks tasks
+       LEFT JOIN templates ON templates.id = tasks.templateId
+       WHERE tasks.id = ?`
+    ).get(id) as TaskRow | undefined,
     "转换任务不存在"
   ));
 }
@@ -79,6 +92,7 @@ export function getResultFiles(taskId: string): ResultFile[] {
 }
 
 export function getResultFile(taskId: string, fileId: string): ResultFile {
+  getTask(taskId);
   const file = assertFound(
     getDb().prepare("SELECT * FROM result_files WHERE taskId = ? AND id = ?").get(taskId, fileId) as
       | ResultFileRow
@@ -86,7 +100,7 @@ export function getResultFile(taskId: string, fileId: string): ResultFile {
     "成果文件不存在"
   );
   const mapped = mapResultFileRow(file);
-  assertPathInside(path.join(outputStorageDir, taskId), mapped.filePath);
+  assertPathInside(resultOutputPath(taskId), mapped.filePath);
   return mapped;
 }
 
@@ -97,7 +111,11 @@ export function createAndRunTask(input: CreateTaskInput): ConversionTask {
   }
   const id = randomUUID();
   const createdAt = nowIso();
-  const outputPath = resultOutputPath(id);
+  const outputPath = resolveTaskOutputPath(
+    input.parameters || {},
+    template.parameters,
+    resultOutputPath(id)
+  );
   const logPath = defaultLogPath(id);
   const taskName = input.taskName?.trim() || `${template.name} 转换任务`;
   const parameters = buildRuntimeParameters(
@@ -110,6 +128,7 @@ export function createAndRunTask(input: CreateTaskInput): ConversionTask {
   );
 
   fs.mkdirSync(outputPath, { recursive: true });
+  fs.mkdirSync(resultOutputPath(id), { recursive: true });
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
 
   getDb()
@@ -198,26 +217,50 @@ export function deleteResults(taskId: string): void {
 
 export function deleteTask(taskId: string): void {
   const task = getTask(taskId);
-  
-  // 如果任务正在运行，先取消它
+
+  deleteTaskRecord(task);
+}
+
+export function deleteTasks(taskIds: string[]): number {
+  const uniqueIds = [...new Set(taskIds.map((id) => id.trim()).filter(Boolean))];
+  if (!uniqueIds.length) {
+    return 0;
+  }
+
+  const tasksById = new Map(listTasks().map((task) => [task.id, task]));
+  const tasks = uniqueIds
+    .map((id) => tasksById.get(id))
+    .filter((task): task is ConversionTask => Boolean(task));
+
+  tasks.forEach(deleteTaskRecord);
+  return tasks.length;
+}
+
+export function clearTasks(): number {
+  const tasks = listTasks();
+  tasks.forEach(deleteTaskRecord);
+  return tasks.length;
+}
+
+function deleteTaskRecord(task: ConversionTask): void {
+  const taskId = task.id;
+
   if (["pending", "running"].includes(task.status)) {
     cancelWorkspace(taskId);
   }
 
-  // 删除成果文件目录
   const outputPath = path.join(outputStorageDir, taskId);
   assertPathInside(outputStorageDir, outputPath);
   removeIfExists(outputPath);
 
-  // 删除日志文件
   const logPath = assertPathInside(logStorageDir, path.join(logStorageDir, `${taskId}.log`));
   removeIfExists(logPath);
 
   const db = getDb();
-  // 删除结果文件记录
-  db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
-  // 删除任务记录
-  db.prepare("DELETE FROM conversion_tasks WHERE id = ?").run(taskId);
+  runTransaction(() => {
+    db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
+    db.prepare("DELETE FROM conversion_tasks WHERE id = ?").run(taskId);
+  });
 }
 
 async function executeTask(
@@ -234,6 +277,7 @@ async function executeTask(
   });
 
   try {
+    const outputSnapshot = snapshotOutputFiles(task.outputPath);
     const result = await runWorkspace({
       taskId,
       workspacePath,
@@ -248,7 +292,8 @@ async function executeTask(
       return;
     }
 
-    const files = scanOutputFiles(taskId);
+    const generatedFiles = scanOutputFiles(taskId, task.outputPath, outputSnapshot);
+    const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
     replaceResultFiles(taskId, files);
     const persistedFiles = getResultFiles(taskId);
     const firstDownloadable = persistedFiles.find((file) => file.downloadable);
@@ -258,7 +303,7 @@ async function executeTask(
     updateTask(taskId, {
       status: success ? "success" : "failed",
       progress: success ? 100 : Math.max(current.progress, 5),
-      resultSize: directorySize(task.outputPath),
+      resultSize: files.reduce((total, file) => total + file.fileSize, 0),
       previewUrl: firstPreviewable ? `/api/results/${taskId}/preview` : null,
       downloadUrl: firstDownloadable ? `/api/results/${taskId}/download/${firstDownloadable.id}` : null,
       exitCode: result.exitCode,
@@ -279,6 +324,31 @@ async function executeTask(
       duration: current.startedAt ? Date.now() - new Date(current.startedAt).getTime() : null
     });
   }
+}
+
+function syncResultFilesToManagedStorage(
+  taskId: string,
+  files: Array<Omit<ResultFile, "id" | "createdAt">>
+): Array<Omit<ResultFile, "id" | "createdAt">> {
+  const managedRoot = resultOutputPath(taskId);
+  fs.mkdirSync(managedRoot, { recursive: true });
+
+  return files.map((file) => {
+    const relativeName = file.fileName.replace(/[\\/]+/g, path.sep);
+    const managedPath = assertPathInside(managedRoot, path.join(managedRoot, relativeName));
+    fs.mkdirSync(path.dirname(managedPath), { recursive: true });
+
+    if (path.resolve(file.filePath) !== path.resolve(managedPath)) {
+      fs.copyFileSync(file.filePath, managedPath);
+    }
+
+    const stat = fs.statSync(managedPath);
+    return {
+      ...file,
+      fileSize: stat.size,
+      filePath: managedPath
+    };
+  });
 }
 
 function replaceResultFiles(taskId: string, files: Array<Omit<ResultFile, "id" | "createdAt">>): void {
@@ -332,7 +402,10 @@ function buildRuntimeParameters(
   parameters: Record<string, unknown>,
   inputDataPath: string | null,
   outputFormat: string | null,
-  templateParameters: Array<Pick<TemplateParameter, "name" | "label" | "type" | "defaultValue" | "description">>,
+  templateParameters: Array<Pick<
+    TemplateParameter,
+    "name" | "label" | "type" | "defaultValue" | "description" | "direction" | "pathKind"
+  >>,
   outputPath: string,
   workspacePath: string
 ): Record<string, unknown> {
@@ -348,7 +421,10 @@ function buildRuntimeParameters(
     outputParameterNames.add(parameterName);
   }
   for (const parameterName of outputParameterNames) {
-    setCaseInsensitiveValue(merged, parameterName, outputPath);
+    const currentValue = getCaseInsensitiveValue(merged, parameterName);
+    if (!isAbsolutePathValue(currentValue)) {
+      setCaseInsensitiveValue(merged, parameterName, outputPath);
+    }
   }
 
   if (inputDataPath && !hasCaseInsensitiveKey(merged, "INPUT_DATA")) {
@@ -367,14 +443,54 @@ function hasCaseInsensitiveKey(target: Record<string, unknown>, key: string): bo
   return Object.keys(target).some((candidate) => candidate.toUpperCase() === key.toUpperCase());
 }
 
+function getCaseInsensitiveValue(target: Record<string, unknown>, key: string): unknown {
+  const existingKey = Object.keys(target).find((candidate) => candidate.toUpperCase() === key.toUpperCase());
+  return existingKey ? target[existingKey] : undefined;
+}
+
 function setCaseInsensitiveValue(target: Record<string, unknown>, key: string, value: unknown): void {
   const existingKey = Object.keys(target).find((candidate) => candidate.toUpperCase() === key.toUpperCase());
   target[existingKey || key] = value;
 }
 
+function resolveTaskOutputPath(
+  parameters: Record<string, unknown>,
+  templateParameters: Array<Pick<
+    TemplateParameter,
+    "name" | "label" | "type" | "defaultValue" | "description" | "direction" | "pathKind"
+  >>,
+  fallbackPath: string
+): string {
+  for (const parameter of templateParameters) {
+    if (!isOutputDirectoryParameter(parameter)) {
+      continue;
+    }
+    const selectedPath = firstAbsolutePath(getCaseInsensitiveValue(parameters, parameter.name));
+    if (!selectedPath) {
+      continue;
+    }
+    return parameter.pathKind === "file" ? path.dirname(selectedPath) : selectedPath;
+  }
+  return fallbackPath;
+}
+
+function isAbsolutePathValue(value: unknown): boolean {
+  return Boolean(firstAbsolutePath(value));
+}
+
+function firstAbsolutePath(value: unknown): string | null {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  if (typeof candidate !== "string") {
+    return null;
+  }
+  const normalized = candidate.trim().replace(/^["']|["']$/g, "");
+  return normalized && path.isAbsolute(normalized) ? path.resolve(normalized) : null;
+}
+
 function mapTaskRow(row: TaskRow): ConversionTask {
   return {
     ...row,
+    rerunnable: Boolean(row.rerunnable) && (!row.inputDataPath || fs.existsSync(row.inputDataPath)),
     parameters: safeJsonObject(row.parameters)
   };
 }

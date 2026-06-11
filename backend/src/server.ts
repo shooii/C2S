@@ -5,16 +5,19 @@ import templateRoutes from "./routes/template.routes";
 import templateGroupRoutes from "./routes/template-group.routes";
 import taskRoutes from "./routes/task.routes";
 import resultRoutes from "./routes/result.routes";
+import localPathRoutes from "./routes/local-path.routes";
 import { ensureStorageDirs } from "./config/paths";
 import { getDb } from "./db/database";
 import { checkFmeAvailable } from "./services/fme.service";
 import { HttpError } from "./utils/httpError";
+import { warmLocalPathSelector } from "./services/local-path.service";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
 
 ensureStorageDirs();
 getDb();
+warmLocalPathSelector();
 
 // 配置 CORS，确保支持 UTF-8
 app.use(cors({
@@ -61,6 +64,7 @@ app.use("/api/templates", templateRoutes);
 app.use("/api/template-groups", templateGroupRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/results", resultRoutes);
+app.use("/api/local-paths", localPathRoutes);
 
 app.use((req, _res, next) => {
   next(new HttpError(404, `接口不存在：${req.method} ${req.path}`));
