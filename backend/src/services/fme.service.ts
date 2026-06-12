@@ -932,8 +932,11 @@ function inferParameterMetadata(input: ParameterMetadataInput): {
   multiple: boolean;
 } {
   const direction = inferDirection(input);
-  const pathKind = inferPathKind(input);
-  const multiple = Boolean(input.selectMultiple) || /\b(multi|multiple)\b|多选|复选/i.test(input.declaredType || "");
+  const fileGeodatabase = isFileGeodatabaseParameter(input);
+  const pathKind = fileGeodatabase ? "folder" : inferPathKind(input);
+  const multiple = fileGeodatabase
+    ? false
+    : Boolean(input.selectMultiple) || /\b(multi|multiple)\b|多选|复选/i.test(input.declaredType || "");
   return {
     type: inferType(input, direction, pathKind, multiple),
     direction,
@@ -970,7 +973,10 @@ function inferType(
   if (/expose attributes|expose_attribute|暴露属性|暴露字段/.test(text)) return "attribute_expose";
   if (/attribute name|attribute_name|attr(?:ibute)?(?:name)?|属性名|字段名|选择属性|选择字段|字段选择/.test(text)) return "attribute_name";
   if (/feature type|feature_type|featuretype|要素类型|图层|表名/.test(text)) return "feature_type";
-  if (/geometry|geojson|bounding|extent|polygon|几何|范围/.test(text)) return "geometry";
+  if (
+    /geometry|geojson|bounding|bbox|extent|polygon|几何|空间范围|地理范围|边界范围|包围盒/.test(text) ||
+    looksLikeGeometryValue(defaultValue)
+  ) return "geometry";
   if (/reprojection file|grid file|datum.*grid|坐标转换网格|重投影文件/.test(text)) return "reprojection_file";
   if (/coord|coordinate system|coordsys|epsg|projection|坐标系/.test(text)) return "coordinate_system";
   if (/url|uri|endpoint|网址|链接/.test(text)) return "url";
@@ -1001,6 +1007,22 @@ function inferType(
     return direction === "output" ? "destination_dataset" : "source_dataset";
   }
   return "string";
+}
+
+function looksLikeGeometryValue(value: string | null): boolean {
+  if (!value) {
+    return false;
+  }
+  const text = value.trim();
+  return (
+    /^[{[]/.test(text) ||
+    /^(?:POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|GEOMETRYCOLLECTION)\s*\(/i.test(text)
+  );
+}
+
+function isFileGeodatabaseParameter(input: ParameterMetadataInput): boolean {
+  const text = `${input.declaredType || ""} ${input.name} ${input.label} ${input.defaultValue || ""}`;
+  return /file\s*geodatabase|filegdb|\.gdb(?:[\\/]|$)/i.test(text);
 }
 
 function stringifyFmeValue(value: unknown): string {

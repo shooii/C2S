@@ -372,19 +372,21 @@ export default function TemplateConfig() {
   );
 }
 
-function renderParameterItem(
+export function renderParameterItem(
   parameter: TemplateParameter,
   parameterLabel: string,
-  onParameterLabelChange: (label: string) => void
+  onParameterLabelChange?: (label: string) => void
 ) {
   const commonProps = {
     name: ["parameters", parameter.name],
-    label: (
+    label: onParameterLabelChange ? (
       <EditableParameterLabel
         value={parameterLabel}
         fallback={parameter.label || parameter.name}
         onChange={onParameterLabelChange}
       />
+    ) : (
+      <Typography.Text>{parameterLabel}</Typography.Text>
     ),
     rules: parameter.required ? [{ required: true, message: `请填写 ${parameterLabel}` }] : undefined,
     tooltip: parameter.description || parameter.name
@@ -740,31 +742,37 @@ function placeholderFor(parameter: TemplateParameter): string {
   return "请输入参数值";
 }
 
-function coerceDefaultValue(parameter: TemplateParameter): unknown {
+export function coerceDefaultValue(parameter: TemplateParameter): unknown {
+  return coerceParameterValue(parameter, parameter.defaultValue);
+}
+
+export function coerceParameterValue(parameter: TemplateParameter, rawValue: unknown): unknown {
   if (parameter.type === "message") {
     return undefined;
   }
-  if (parameter.defaultValue === null || parameter.defaultValue === undefined) {
+  if (rawValue === null || rawValue === undefined) {
     return parameter.type === "boolean" ? false : undefined;
   }
   if (parameter.type === "boolean") {
-    return /^(true|yes|1)$/i.test(parameter.defaultValue);
+    return typeof rawValue === "boolean"
+      ? rawValue
+      : /^(true|yes|1)$/i.test(String(rawValue));
   }
   if (parameter.type === "number") {
-    const value = Number(parameter.defaultValue);
+    const value = Number(rawValue);
     return Number.isNaN(value) ? undefined : value;
   }
   if (parameter.type === "date" || parameter.type === "time" || parameter.type === "datetime") {
-    const value = dayjs(parameter.defaultValue);
+    const value = dayjs(rawValue as string);
     return value.isValid() ? value : undefined;
   }
   if (parameter.type === "multi_choice" || parameter.type === "checkbox_group" || parameter.type === "attribute_select" || parameter.type === "attribute_expose") {
-    return splitDefaultList(parameter.defaultValue);
+    return Array.isArray(rawValue) ? rawValue : splitDefaultList(String(rawValue));
   }
   if (parameter.type === "table") {
-    return parseTableDefault(parameter.defaultValue);
+    return Array.isArray(rawValue) ? rawValue : parseTableDefault(String(rawValue));
   }
-  return parameter.defaultValue;
+  return rawValue;
 }
 
 function isPathParameter(parameter: TemplateParameter): boolean {
@@ -801,7 +809,7 @@ function formatSelectedPathValue(paths: string[], multiple: boolean): string {
   return multiple ? paths.join(",") : paths[0] || "";
 }
 
-function normalizeParameters(parameters: Record<string, unknown>): Record<string, unknown> {
+export function normalizeParameters(parameters: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(parameters)
       .map(([key, value]) => [key, normalizeParameterValue(value)] as const)

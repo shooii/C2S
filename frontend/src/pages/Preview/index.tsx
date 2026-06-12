@@ -1,58 +1,65 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
+  Descriptions,
   Empty,
+  Result,
   Space,
   Spin,
   Tree,
+  Tooltip,
   Typography
 } from "antd";
 import {
   ArrowLeftOutlined,
-  ApartmentOutlined,
-  BorderOutlined,
-  GatewayOutlined,
-  NodeIndexOutlined,
-  TagsOutlined
+  DownloadOutlined
 } from "@ant-design/icons";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../services/api";
+import { TaskStatusTag } from "../../components/StatusTag";
 import type { PreviewPayload } from "../../types";
-
-const semanticLayers = [
-  { key: "building", title: "建筑模型", icon: <ApartmentOutlined /> },
-  { key: "road", title: "道路", icon: <NodeIndexOutlined /> },
-  { key: "walkable", title: "可通行区域", icon: <BorderOutlined /> },
-  { key: "obstacle", title: "障碍物", icon: <BorderOutlined /> },
-  { key: "door", title: "门", icon: <GatewayOutlined /> },
-  { key: "elevator", title: "电梯", icon: <GatewayOutlined /> },
-  { key: "navmesh", title: "导航网格", icon: <NodeIndexOutlined /> },
-  { key: "collider", title: "碰撞体", icon: <BorderOutlined /> },
-  { key: "semantic", title: "语义标签", icon: <TagsOutlined /> }
-];
 
 export default function Preview() {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const fileId = searchParams.get("fileId") || undefined;
   const [loading, setLoading] = useState(true);
   const [payload, setPayload] = useState<PreviewPayload | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
     if (!taskId) return;
+    let disposed = false;
     const load = async () => {
       setLoading(true);
+      setLoadError("");
       try {
-        setPayload(await api.getPreview(taskId));
+        const nextPayload = await api.getPreview(taskId, fileId);
+        if (!disposed) {
+          setPayload(nextPayload);
+        }
+      } catch (error) {
+        if (!disposed) {
+          setLoadError(error instanceof Error ? error.message : "预览数据加载失败");
+        }
       } finally {
-        setLoading(false);
+        if (!disposed) {
+          setLoading(false);
+        }
       }
     };
     void load();
-  }, [taskId]);
+    return () => {
+      disposed = true;
+    };
+  }, [fileId, reloadToken, taskId]);
 
   const sceneStats = useMemo(() => ({
     files: payload?.files.length || 0,
@@ -70,6 +77,21 @@ export default function Preview() {
   }
 
   if (!payload) {
+    if (loadError) {
+      return (
+        <Result
+          status="error"
+          title="预览加载失败"
+          subTitle={loadError}
+          extra={[
+            <Button key="back" onClick={() => navigate(`/results/${taskId}`)}>返回任务详情</Button>,
+            <Button key="retry" type="primary" onClick={() => setReloadToken((value) => value + 1)}>
+              重试
+            </Button>
+          ]}
+        />
+      );
+    }
     return <Empty description="预览数据不存在" />;
   }
 
@@ -88,24 +110,42 @@ export default function Preview() {
       </div>
 
       <div className="preview-shell">
-        <div className="preview-panel preview-side">
-          <Typography.Title level={5}>成果文件树</Typography.Title>
-          <Tree
-            defaultExpandAll
-            treeData={payload.files.map((file) => ({
-              key: file.id,
-              title: `${file.fileName} (${formatSize(file.fileSize)})`
-            }))}
+        {loadError && (
+          <Alert
+            className="preview-load-alert"
+            type="error"
+            showIcon
+            message="切换预览文件失败"
+            description={loadError}
+            action={<Button size="small" onClick={() => setReloadToken((value) => value + 1)}>重试</Button>}
           />
-          <Typography.Title level={5} style={{ marginTop: 20 }}>图层列表</Typography.Title>
-          <Space direction="vertical" size={8}>
-            {semanticLayers.map((layer) => (
-              <Space key={layer.key}>
-                {layer.icon}
-                <Typography.Text>{layer.title}</Typography.Text>
-              </Space>
-            ))}
-          </Space>
+        )}
+        <div className="preview-panel preview-side">
+          <Typography.Title level={5}>成果文件</Typography.Title>
+          {payload.files.length ? (
+            <Tree
+              defaultExpandAll
+              selectedKeys={payload.file ? [payload.file.id] : []}
+              onSelect={(keys) => {
+                const selectedFileId = keys[0];
+                if (selectedFileId && String(selectedFileId) !== payload.file?.id) {
+                  setSearchParams({ fileId: String(selectedFileId) });
+                }
+              }}
+              treeData={payload.files.map((file) => ({
+                key: file.id,
+                title: (
+                  <Tooltip title={file.previewable ? file.fileName : `${file.fileName}（可查看信息并下载，暂不支持预览）`}>
+                    <span className={`preview-file-title${file.previewable ? "" : " is-unsupported"}`}>
+                      {file.fileName} ({formatSize(file.fileSize)})
+                    </span>
+                  </Tooltip>
+                )
+              }))}
+            />
+          ) : (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无成果文件" />
+          )}
         </div>
 
         <div className="preview-panel preview-stage">
@@ -113,31 +153,41 @@ export default function Preview() {
         </div>
 
         <div className="preview-panel preview-side">
-          <Typography.Title level={5}>对象属性</Typography.Title>
-          <Card size="small" title="当前成果">
-            <Space direction="vertical" size={6}>
-              <Typography.Text>类型：{payload.type}</Typography.Text>
-              <Typography.Text>文件：{payload.file?.fileName || "-"}</Typography.Text>
-              <Typography.Text>任务：{payload.task.status}</Typography.Text>
-            </Space>
+          <Typography.Title level={5}>文件信息</Typography.Title>
+          <Card
+            size="small"
+            title="当前成果"
+            extra={payload.file?.downloadable ? (
+              <Button
+                type="link"
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={() => window.open(api.downloadUrl(payload.task.id, payload.file!.id), "_blank")}
+              >
+                下载
+              </Button>
+            ) : null}
+          >
+            <Descriptions size="small" column={1}>
+              <Descriptions.Item label="文件名">{payload.file?.fileName || "-"}</Descriptions.Item>
+              <Descriptions.Item label="类型">{previewTypeLabel(payload.type)}</Descriptions.Item>
+              <Descriptions.Item label="大小">{payload.file ? formatSize(payload.file.fileSize) : "-"}</Descriptions.Item>
+              <Descriptions.Item label="任务状态">
+                <TaskStatusTag status={payload.task.status} />
+              </Descriptions.Item>
+            </Descriptions>
           </Card>
-          <Typography.Title level={5} style={{ marginTop: 20 }}>语义标签</Typography.Title>
-          <Space wrap>
-            {semanticLayers.map((layer) => (
-              <Button key={layer.key} size="small">{layer.title}</Button>
-            ))}
-          </Space>
-          <Typography.Title level={5} style={{ marginTop: 20 }}>坐标信息</Typography.Title>
+          <Typography.Title level={5} style={{ marginTop: 20 }}>操作提示</Typography.Title>
           <Typography.Paragraph type="secondary">
-            EPSG / 局部坐标系信息会随结果元数据展示。
+            {previewUsageTip(payload.type)}
           </Typography.Paragraph>
         </div>
 
         <div className="preview-panel preview-bottom">
           <div className="preview-stat"><strong>{sceneStats.files}</strong><span>成果文件</span></div>
           <div className="preview-stat"><strong>{formatSize(sceneStats.bytes)}</strong><span>数据体量</span></div>
-          <div className="preview-stat"><strong>{sceneStats.previewType}</strong><span>预览类型</span></div>
-          <div className="preview-stat"><strong>{sceneStats.taskStatus}</strong><span>任务状态</span></div>
+          <div className="preview-stat"><strong>{previewTypeLabel(sceneStats.previewType)}</strong><span>预览类型</span></div>
+          <div className="preview-stat"><strong>{taskStatusLabel(sceneStats.taskStatus)}</strong><span>任务状态</span></div>
         </div>
       </div>
     </div>
@@ -164,10 +214,14 @@ function PreviewStage({ payload }: { payload: PreviewPayload }) {
 
 function ThreeGltfPreview({ url }: { url: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [errorMessage, setErrorMessage] = useState("");
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    setStatus("loading");
+    setErrorMessage("");
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a1728);
@@ -200,6 +254,10 @@ function ThreeGltfPreview({ url }: { url: string }) {
       camera.position.set(size * 0.9, size * 0.65, size * 0.9);
       controls.target.set(0, 0, 0);
       controls.update();
+      setStatus("ready");
+    }, undefined, (error) => {
+      setStatus("error");
+      setErrorMessage(error instanceof Error ? error.message : "模型文件加载失败");
     });
 
     const resizeObserver = new ResizeObserver(() => {
@@ -224,21 +282,33 @@ function ThreeGltfPreview({ url }: { url: string }) {
       resizeObserver.disconnect();
       controls.dispose();
       renderer.dispose();
-      container.removeChild(renderer.domElement);
+      if (renderer.domElement.parentElement === container) {
+        container.removeChild(renderer.domElement);
+      }
     };
   }, [url]);
 
-  return <div ref={containerRef} className="full-height" />;
+  return (
+    <div className="preview-render-surface">
+      <div ref={containerRef} className="full-height" />
+      {status === "loading" && <div className="preview-stage-state"><Spin tip="正在加载模型" /></div>}
+      {status === "error" && <div className="preview-stage-state"><Empty description={errorMessage} /></div>}
+    </div>
+  );
 }
 
 function CesiumTilesPreview({ url }: { url: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [errorMessage, setErrorMessage] = useState("");
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
     let destroyed = false;
     let viewer: any = null;
+    setStatus("loading");
+    setErrorMessage("");
 
     import("cesium").then(async (Cesium) => {
       if (destroyed) return;
@@ -257,6 +327,14 @@ function CesiumTilesPreview({ url }: { url: string }) {
       const tileset = await Cesium.Cesium3DTileset.fromUrl(url);
       viewer.scene.primitives.add(tileset);
       await viewer.zoomTo(tileset);
+      if (!destroyed) {
+        setStatus("ready");
+      }
+    }).catch((error) => {
+      if (!destroyed) {
+        setStatus("error");
+        setErrorMessage(error instanceof Error ? error.message : "3D Tiles 加载失败");
+      }
     });
 
     return () => {
@@ -265,7 +343,39 @@ function CesiumTilesPreview({ url }: { url: string }) {
     };
   }, [url]);
 
-  return <div ref={containerRef} className="cesium-container" />;
+  return (
+    <div className="preview-render-surface">
+      <div ref={containerRef} className="cesium-container" />
+      {status === "loading" && <div className="preview-stage-state"><Spin tip="正在加载 3D Tiles" /></div>}
+      {status === "error" && <div className="preview-stage-state"><Empty description={errorMessage} /></div>}
+    </div>
+  );
+}
+
+function previewTypeLabel(type: string): string {
+  if (type === "gltf") return "glTF / GLB";
+  if (type === "3dtiles") return "3D Tiles";
+  if (type === "json") return "JSON";
+  if (type === "unsupported") return "暂不支持";
+  return type || "-";
+}
+
+function taskStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "排队中",
+    running: "运行中",
+    success: "成功",
+    failed: "失败",
+    cancelled: "已取消"
+  };
+  return labels[status] || status || "-";
+}
+
+function previewUsageTip(type: string): string {
+  if (type === "gltf") return "按住鼠标左键旋转，滚轮缩放，右键拖动平移视角。";
+  if (type === "3dtiles") return "拖动旋转场景，滚轮缩放；可从左侧切换其他可预览成果。";
+  if (type === "json") return "当前以格式化文本展示，可滚动查看完整 JSON 内容。";
+  return "该文件暂不支持在线预览，可使用上方下载入口在本地查看。";
 }
 
 function formatSize(value: number): string {

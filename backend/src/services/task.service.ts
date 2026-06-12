@@ -3,7 +3,13 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getDb, nowIso, runTransaction } from "../db/database";
 import type { ConversionTask, ResultFile, TaskStatus, TemplateParameter } from "../types";
-import { assertPathInside, removeIfExists, resultOutputPath } from "./file.service";
+import {
+  assertPathInside,
+  getResultFileType,
+  isPreviewable,
+  removeIfExists,
+  resultOutputPath
+} from "./file.service";
 import {
   cancelWorkspace,
   defaultLogPath,
@@ -34,6 +40,12 @@ export interface CreateTaskInput {
   outputFormat?: string | null;
   inputDataName?: string | null;
   inputDataPath?: string | null;
+}
+
+export interface RerunTaskInput {
+  taskName?: string;
+  parameters?: Record<string, unknown>;
+  outputFormat?: string | null;
 }
 
 export function listTasks(options: { status?: TaskStatus; search?: string } = {}): ConversionTask[] {
@@ -178,28 +190,47 @@ export function cancelTask(id: string): ConversionTask {
     throw new HttpError(400, "只有排队中或运行中的任务可以取消");
   }
 
+  const finishedAt = nowIso();
+  const duration = task.startedAt
+    ? new Date(finishedAt).getTime() - new Date(task.startedAt).getTime()
+    : null;
+  const result = getDb().prepare(
+    `UPDATE conversion_tasks
+     SET status = 'cancelled',
+         progress = ?,
+         finishedAt = ?,
+         duration = ?,
+         errorMessage = ?
+     WHERE id = ? AND status IN ('pending', 'running')`
+  ).run(
+    task.progress,
+    finishedAt,
+    duration,
+    "用户取消任务",
+    id
+  );
+
+  if (Number(result.changes) === 0) {
+    throw new HttpError(400, "任务已结束，无法取消");
+  }
+
   cancelWorkspace(id);
-  updateTask(id, {
-    status: "cancelled",
-    progress: task.progress,
-    finishedAt: nowIso(),
-    errorMessage: "用户取消任务"
-  });
 
   return getTask(id);
 }
 
-export function rerunTask(id: string): ConversionTask {
+export function rerunTask(id: string, input: RerunTaskInput = {}): ConversionTask {
   const task = getTask(id);
   if (task.inputDataPath && !fs.existsSync(task.inputDataPath)) {
     throw new HttpError(400, "原始输入数据文件不存在，无法重新运行");
   }
+  const baseTaskName = task.taskName.replace(/(?:\s*-\s*重新运行)+$/, "").trim();
 
   return createAndRunTask({
     templateId: task.templateId,
-    taskName: `${task.taskName} - 重新运行`,
-    parameters: task.parameters,
-    outputFormat: task.outputFormat,
+    taskName: input.taskName?.trim() || `${baseTaskName} - 重新运行`,
+    parameters: input.parameters ?? task.parameters,
+    outputFormat: input.outputFormat === undefined ? task.outputFormat : input.outputFormat,
     inputDataName: task.inputDataName,
     inputDataPath: task.inputDataPath
   });
@@ -269,12 +300,18 @@ async function executeTask(
   fmeParameters: Record<string, unknown>
 ): Promise<void> {
   const task = getTask(taskId);
-  updateTask(taskId, {
-    status: "running",
-    progress: 5,
-    startedAt: nowIso(),
-    errorMessage: null
-  });
+  const startedAt = nowIso();
+  const transition = getDb().prepare(
+    `UPDATE conversion_tasks
+     SET status = 'running',
+         progress = 5,
+         startedAt = ?,
+         errorMessage = NULL
+     WHERE id = ? AND status = 'pending'`
+  ).run(startedAt, taskId);
+  if (Number(transition.changes) === 0) {
+    return;
+  }
 
   const outputSnapshot = snapshotOutputFiles(task.outputPath);
 
@@ -553,18 +590,30 @@ function firstAbsolutePath(value: unknown): string | null {
 }
 
 function mapTaskRow(row: TaskRow): ConversionTask {
+  const derivedDuration = row.startedAt && row.finishedAt
+    ? Math.max(0, new Date(row.finishedAt).getTime() - new Date(row.startedAt).getTime())
+    : null;
   return {
     ...row,
     rerunnable: Boolean(row.rerunnable) && (!row.inputDataPath || fs.existsSync(row.inputDataPath)),
+    duration: row.duration ?? derivedDuration,
     parameters: safeJsonObject(row.parameters)
   };
 }
 
 function mapResultFileRow(row: ResultFileRow): ResultFile {
+  const fileType = getResultFileType(row.fileName);
+  const exceedsJsonPreviewLimit =
+    fileType === "json" &&
+    row.fileSize > 5 * 1024 * 1024;
   return {
     ...row,
+    fileType,
     downloadable: Boolean(row.downloadable),
-    previewable: Boolean(row.previewable)
+    previewable:
+      Boolean(row.previewable) &&
+      isPreviewable(row.fileName) &&
+      !exceedsJsonPreviewLimit
   };
 }
 

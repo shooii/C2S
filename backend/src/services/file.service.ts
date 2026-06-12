@@ -10,7 +10,7 @@ import {
 import { HttpError } from "../utils/httpError";
 
 const templateExtensions = new Set([".fmw", ".fmwt"]);
-const previewExtensions = new Set([".glb", ".gltf", ".json", ".b3dm", ".i3dm", ".pnts", ".cmpt", ".tileset"]);
+const previewExtensions = new Set([".glb", ".gltf", ".json"]);
 
 /**
  * 解码文件名，处理可能的中文编码问题
@@ -275,17 +275,15 @@ export function assertPathInside(root: string, targetPath: string): string {
 
 export function getResultFileType(fileName: string): string {
   const ext = path.extname(fileName).toLowerCase();
+  if (fileName.toLowerCase().endsWith("tileset.json")) return "3dtiles";
   if (ext === ".glb" || ext === ".gltf") return "gltf";
   if (ext === ".json") return "json";
-  if ([".b3dm", ".i3dm", ".pnts", ".cmpt"].includes(ext) || fileName.toLowerCase().endsWith("tileset.json")) {
-    return "3dtiles";
-  }
   return ext.replace(".", "") || "file";
 }
 
 export function isPreviewable(fileName: string): boolean {
   const lower = fileName.toLowerCase();
-  return previewExtensions.has(path.extname(lower)) || lower.endsWith("tileset.json");
+  return lower.endsWith("tileset.json") || previewExtensions.has(path.extname(lower));
 }
 
 export function listFilesRecursive(

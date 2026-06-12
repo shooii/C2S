@@ -186,11 +186,21 @@ export const api = {
 
   cancelTask: (id: string) => unwrap<ConversionTask>(http.post(`/api/tasks/${id}/cancel`)),
 
-  rerunTask: (id: string) => unwrap<ConversionTask>(http.post(`/api/tasks/${id}/rerun`)),
+  rerunTask: (
+    id: string,
+    payload?: {
+      taskName?: string;
+      parameters?: Record<string, unknown>;
+      outputFormat?: string | null;
+    }
+  ) => unwrap<ConversionTask>(http.post(`/api/tasks/${id}/rerun`, payload || {})),
 
   getResultFiles: (taskId: string) => unwrap<ResultFile[]>(http.get(`/api/results/${taskId}/files`)),
 
-  getPreview: (taskId: string) => unwrap<PreviewPayload>(http.get(`/api/results/${taskId}/preview`)),
+  getPreview: (taskId: string, fileId?: string) =>
+    unwrap<PreviewPayload>(http.get(`/api/results/${taskId}/preview`, {
+      params: fileId ? { fileId } : undefined
+    })),
 
   deleteResults: (taskId: string) => http.delete(`/api/results/${taskId}`),
 

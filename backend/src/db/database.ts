@@ -157,6 +157,7 @@ function migrateDatabase(database: SqliteDatabase): void {
   if (!parameterColumns.some((column) => column.name === "multiple")) {
     database.exec("ALTER TABLE template_parameters ADD COLUMN multiple INTEGER NOT NULL DEFAULT 0");
   }
+  migrateParameterMetadata(database);
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_enabled ON templates(enabled)");
   const duplicateTemplateName = database.prepare(
@@ -193,6 +194,62 @@ function migrateDatabase(database: SqliteDatabase): void {
     insert.run({ id, name, description, createdAt: timestamp, updatedAt: timestamp });
   });
   migrateStoragePaths(database);
+}
+
+function migrateParameterMetadata(database: SqliteDatabase): void {
+  const parameters = database.prepare(
+    `SELECT id, name, label, type, defaultValue, pathKind, multiple
+     FROM template_parameters`
+  ).all() as unknown as Array<{
+    id: string;
+    name: string;
+    label: string;
+    type: string;
+    defaultValue: string | null;
+    pathKind: string | null;
+    multiple: number;
+  }>;
+  const update = database.prepare(
+    `UPDATE template_parameters
+     SET type = ?, pathKind = ?, multiple = ?
+     WHERE id = ?`
+  );
+
+  parameters.forEach((parameter) => {
+    let nextType = parameter.type;
+    let nextPathKind = parameter.pathKind;
+    let nextMultiple = parameter.multiple;
+    const text = `${parameter.name} ${parameter.label} ${parameter.defaultValue || ""}`;
+
+    if (
+      parameter.type === "geometry" &&
+      isFiniteNumericText(parameter.defaultValue) &&
+      !/geometry|geojson|bounding|bbox|extent|polygon|几何|空间范围|地理范围|边界范围|包围盒/i.test(text)
+    ) {
+      nextType = "number";
+    }
+
+    if (/file\s*geodatabase|filegdb|\.gdb(?:[\\/]|$)/i.test(text)) {
+      nextPathKind = "folder";
+      nextMultiple = 0;
+    }
+
+    if (
+      nextType !== parameter.type ||
+      nextPathKind !== parameter.pathKind ||
+      nextMultiple !== parameter.multiple
+    ) {
+      update.run(nextType, nextPathKind, nextMultiple, parameter.id);
+    }
+  });
+}
+
+function isFiniteNumericText(value: string | null): boolean {
+  if (!value?.trim()) {
+    return false;
+  }
+  const number = Number(value);
+  return Number.isFinite(number);
 }
 
 function migrateStoragePaths(database: SqliteDatabase): void {

@@ -109,7 +109,15 @@ router.post(
 router.post(
   "/:id/rerun",
   asyncHandler(async (req, res) => {
-    res.status(201).json({ data: rerunTask(req.params.id) });
+    const hasParameters = Object.prototype.hasOwnProperty.call(req.body || {}, "parameters");
+    const hasOutputFormat = Object.prototype.hasOwnProperty.call(req.body || {}, "outputFormat");
+    res.status(201).json({
+      data: rerunTask(req.params.id, {
+        taskName: stringField(req.body?.taskName) ?? undefined,
+        parameters: hasParameters ? parseParameters(req.body.parameters) : undefined,
+        outputFormat: hasOutputFormat ? stringField(req.body.outputFormat) : undefined
+      })
+    });
   })
 );
 

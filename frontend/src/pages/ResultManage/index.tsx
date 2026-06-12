@@ -18,14 +18,13 @@ import {
   DeleteOutlined,
   DownloadOutlined,
   EyeOutlined,
-  FileTextOutlined,
-  PlayCircleOutlined,
   ReloadOutlined,
-  SearchOutlined
+  SearchOutlined,
+  StopOutlined
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useLocation, useNavigate } from "react-router-dom";
-import { LogDrawer } from "../../components/LogDrawer";
+import { RerunTaskModal } from "../../components/RerunTaskModal";
 import { TaskStatusTag } from "../../components/StatusTag";
 import { api } from "../../services/api";
 import type { ConversionTask, TaskStatus } from "../../types";
@@ -39,22 +38,25 @@ export default function ResultManage() {
   const [allTasks, setAllTasks] = useState<ConversionTask[]>([]);
   const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
+  const [rerunTask, setRerunTask] = useState<ConversionTask | null>(null);
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<TaskStatus | undefined>();
-  const [logTask, setLogTask] = useState<ConversionTask | null>(null);
 
   const filteredTasks = useMemo(() => {
     let list = allTasks;
     if (status) {
       list = list.filter((t) => t.status === status);
     }
-    if (search) {
-      const q = search.toLowerCase();
+    const q = search.trim().toLowerCase();
+    if (q) {
       list = list.filter(
         (t) =>
           t.taskName.toLowerCase().includes(q) ||
-          (t.templateName && t.templateName.toLowerCase().includes(q))
+          t.id.toLowerCase().includes(q) ||
+          (t.templateName && t.templateName.toLowerCase().includes(q)) ||
+          (t.inputDataName && t.inputDataName.toLowerCase().includes(q))
       );
     }
     return list;
@@ -156,14 +158,35 @@ export default function ResultManage() {
     window.open(api.downloadArchiveUrl(task.id), "_blank");
   };
 
-  const rerun = async (task: ConversionTask) => {
-    try {
-      const nextTask = await api.rerunTask(task.id);
-      message.success("已创建重新运行任务");
-      navigate(`/results/${nextTask.id}`);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "重新运行失败");
+  const cancelTask = async (task: ConversionTask) => {
+    if (cancellingTaskId) {
+      return;
     }
+    setCancellingTaskId(task.id);
+    try {
+      const nextTask = await api.cancelTask(task.id);
+      setAllTasks((current) => current.map((item) => (
+        item.id === nextTask.id ? nextTask : item
+      )));
+      message.success("任务已取消");
+      await loadTasks(true);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "任务取消失败");
+    } finally {
+      setCancellingTaskId(null);
+    }
+  };
+
+  const confirmCancelTask = (task: ConversionTask) => {
+    modal.confirm({
+      title: "取消任务",
+      content: `确定取消“${task.taskName}”吗？任务运行将停止，已经生成的日志会保留。`,
+      okText: "确认取消",
+      cancelText: "返回",
+      okButtonProps: { danger: true },
+      centered: true,
+      onOk: () => cancelTask(task)
+    });
   };
 
   const deleteTask = async (task: ConversionTask) => {
@@ -272,7 +295,12 @@ export default function ResultManage() {
       dataIndex: "progress",
       width: 130,
       render: (value, record) => (
-        <Progress percent={value} size="small" status={record.status === "failed" ? "exception" : undefined} />
+        <Progress
+          percent={value}
+          size="small"
+          status={progressStatus(record.status)}
+          strokeColor={record.status === "cancelled" ? "#8c8c8c" : undefined}
+        />
       )
     },
     {
@@ -295,31 +323,54 @@ export default function ResultManage() {
     },
     {
       title: "操作",
-      width: 220,
+      width: 184,
       fixed: "right",
       render: (_, record) => (
-        <Space>
+        <Space size={4}>
           <Tooltip title="详情">
-            <Button icon={<EyeOutlined />} onClick={() => navigate(`/results/${record.id}`)} />
-          </Tooltip>
-          <Tooltip title="预览">
-            <Button icon={<PlayCircleOutlined />} disabled={!record.previewUrl} onClick={() => navigate(`/preview/${record.id}`)} />
+            <Button
+              aria-label="查看详情"
+              size="small"
+              icon={<EyeOutlined />}
+              onClick={() => navigate(`/results/${record.id}`)}
+            />
           </Tooltip>
           <Tooltip title="下载">
-            <Button icon={<DownloadOutlined />} disabled={!record.downloadUrl && !record.resultSize} onClick={() => downloadArchive(record)} />
-          </Tooltip>
-          <Tooltip title="日志">
-            <Button icon={<FileTextOutlined />} onClick={() => setLogTask(record)} />
-          </Tooltip>
-          <Tooltip title={record.rerunnable ? "重新运行" : "关联模板不可用或原始输入文件已丢失"}>
             <Button
+              aria-label="下载成果"
+              size="small"
+              icon={<DownloadOutlined />}
+              disabled={!record.downloadUrl && !record.resultSize}
+              onClick={() => downloadArchive(record)}
+            />
+          </Tooltip>
+          <Tooltip title={["pending", "running"].includes(record.status) ? "取消任务" : "仅排队中或运行中的任务可取消"}>
+            <Button
+              aria-label="取消任务"
+              size="small"
+              icon={<StopOutlined />}
+              loading={cancellingTaskId === record.id}
+              disabled={!["pending", "running"].includes(record.status) || Boolean(cancellingTaskId)}
+              onClick={() => confirmCancelTask(record)}
+            />
+          </Tooltip>
+          <Tooltip title={record.rerunnable ? "基于原配置重新运行" : "关联模板不可用或原始输入文件已丢失"}>
+            <Button
+              aria-label="基于原配置重新运行"
+              size="small"
               icon={<ReloadOutlined />}
               disabled={!record.rerunnable}
-              onClick={() => rerun(record)}
+              onClick={() => setRerunTask(record)}
             />
           </Tooltip>
           <Tooltip title="删除">
-            <Button danger icon={<DeleteOutlined />} onClick={() => confirmDeleteTask(record)} />
+            <Button
+              danger
+              aria-label="删除任务"
+              size="small"
+              icon={<DeleteOutlined />}
+              onClick={() => confirmDeleteTask(record)}
+            />
           </Tooltip>
         </Space>
       )
@@ -339,7 +390,7 @@ export default function ResultManage() {
 
       <div className="stat-grid">
         <Card className="stat-card"><Statistic title="任务总数" value={stats.total} /></Card>
-        <Card className="stat-card"><Statistic title="运行中" value={stats.running} valueStyle={{ color: "#1765d8" }} /></Card>
+        <Card className="stat-card"><Statistic title="进行中" value={stats.running} valueStyle={{ color: "#1765d8" }} /></Card>
         <Card className="stat-card"><Statistic title="成功" value={stats.success} valueStyle={{ color: "#167d4c" }} /></Card>
         <Card className="stat-card"><Statistic title="失败" value={stats.failed} valueStyle={{ color: "#c73333" }} /></Card>
       </div>
@@ -349,7 +400,7 @@ export default function ResultManage() {
           <Input
             allowClear
             prefix={<SearchOutlined />}
-            placeholder="搜索任务或模板"
+            placeholder="搜索任务名称、ID 或模板"
             value={search}
             onChange={(event) => {
               setSearch(event.target.value);
@@ -414,7 +465,15 @@ export default function ResultManage() {
         />
       </Card>
 
-      <LogDrawer task={logTask} open={Boolean(logTask)} onClose={() => setLogTask(null)} />
+      <RerunTaskModal
+        open={Boolean(rerunTask)}
+        task={rerunTask}
+        onClose={() => setRerunTask(null)}
+        onCreated={(nextTask) => {
+          setRerunTask(null);
+          navigate(`/results/${nextTask.id}`);
+        }}
+      />
     </div>
   );
 }
@@ -432,4 +491,11 @@ function formatSize(value: number): string {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function progressStatus(status: TaskStatus): "normal" | "active" | "success" | "exception" {
+  if (status === "running") return "active";
+  if (status === "success") return "success";
+  if (status === "failed") return "exception";
+  return "normal";
 }

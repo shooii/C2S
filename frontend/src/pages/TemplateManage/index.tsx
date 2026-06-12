@@ -14,6 +14,7 @@ import {
   Progress,
   Select,
   Space,
+  Spin,
   Statistic,
   Table,
   Tag,
@@ -40,6 +41,7 @@ import {
 } from "@ant-design/icons";
 import dayjs from "dayjs";
 import { useNavigate } from "react-router-dom";
+import { ParseStatusTag } from "../../components/StatusTag";
 import { api } from "../../services/api";
 import type { TemplateDetail, TemplateGroup, TemplateRecord } from "../../types";
 
@@ -57,11 +59,14 @@ export default function TemplateManage() {
   const [keyword, setKeyword] = useState("");
   const [status, setStatus] = useState<EnabledFilter>("all");
   const [selected, setSelected] = useState<TemplateDetail | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailTemplateName, setDetailTemplateName] = useState("");
   const [detailLoading, setDetailLoading] = useState(false);
   const [groupInitialized, setGroupInitialized] = useState(false);
   const [editingGroup, setEditingGroup] = useState<GroupKey | null>(null);
   const [editingGroupName, setEditingGroupName] = useState("");
   const [groupModalMode, setGroupModalMode] = useState<"create" | "edit">("edit");
+  const [groupSaving, setGroupSaving] = useState(false);
   const [pendingUploadFile, setPendingUploadFile] = useState<File | null>(null);
   const [pendingUploadGroup, setPendingUploadGroup] = useState<GroupKey>("default");
   const [uploading, setUploading] = useState(false);
@@ -72,6 +77,7 @@ export default function TemplateManage() {
   const groupListRef = useRef<HTMLDivElement>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const uploadTokenRef = useRef<string | null>(null);
+  const detailRequestRef = useRef(0);
 
   const loadData = async () => {
     setLoading(true);
@@ -253,14 +259,35 @@ export default function TemplateManage() {
   };
 
   const openDetail = async (record: TemplateRecord) => {
+    const requestId = detailRequestRef.current + 1;
+    detailRequestRef.current = requestId;
+    setDetailOpen(true);
+    setDetailTemplateName(record.name);
+    setSelected(null);
     setDetailLoading(true);
     try {
-      setSelected(await api.getTemplate(record.id));
+      const detail = await api.getTemplate(record.id);
+      if (detailRequestRef.current === requestId) {
+        setSelected(detail);
+      }
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "模板详情加载失败");
+      if (detailRequestRef.current === requestId) {
+        message.error(error instanceof Error ? error.message : "模板详情加载失败");
+        setDetailOpen(false);
+      }
     } finally {
-      setDetailLoading(false);
+      if (detailRequestRef.current === requestId) {
+        setDetailLoading(false);
+      }
     }
+  };
+
+  const closeDetail = () => {
+    detailRequestRef.current += 1;
+    setDetailOpen(false);
+    setSelected(null);
+    setDetailTemplateName("");
+    setDetailLoading(false);
   };
 
   const remove = async (record: TemplateRecord) => {
@@ -286,6 +313,9 @@ export default function TemplateManage() {
   };
 
   const saveGroupName = async () => {
+    if (groupSaving) {
+      return;
+    }
     const nextName = editingGroupName.trim();
     if (!nextName) {
       message.warning("分组名称不能为空");
@@ -295,6 +325,7 @@ export default function TemplateManage() {
       message.warning("分组名称已存在");
       return;
     }
+    setGroupSaving(true);
     try {
       if (groupModalMode === "create") {
         const created = await api.createTemplateGroup(nextName);
@@ -311,6 +342,8 @@ export default function TemplateManage() {
       await loadData();
     } catch (error) {
       message.error(error instanceof Error ? error.message : "分组保存失败");
+    } finally {
+      setGroupSaving(false);
     }
   };
 
@@ -421,7 +454,7 @@ export default function TemplateManage() {
     {
       title: "模板名称",
       dataIndex: "name",
-      width: 260,
+      width: 220,
       render: (value, record) => (
         <Space size={12}>
           <span className={`template-table-icon ${getIconClass(record)}`}>{getTemplateIcon(record)}</span>
@@ -437,7 +470,7 @@ export default function TemplateManage() {
     {
       title: "版本",
       dataIndex: "version",
-      width: 84,
+      width: 68,
       render: (value) => value || "1.0.0"
     },
     {
@@ -449,7 +482,7 @@ export default function TemplateManage() {
     {
       title: "启用状态",
       dataIndex: "enabled",
-      width: 90,
+      width: 92,
       render: (value) => value
         ? <Tag color="success">启用中</Tag>
         : <Tag>待启用</Tag>
@@ -457,23 +490,37 @@ export default function TemplateManage() {
     {
       title: "更新时间",
       dataIndex: "updatedAt",
-      width: 136,
-      render: (value) => dayjs(value).format("YYYY-MM-DD HH:mm")
+      width: 120,
+      render: (value) => (
+        <Tooltip title={dayjs(value).format("YYYY-MM-DD HH:mm:ss")}>
+          <span>{dayjs(value).format("MM-DD HH:mm")}</span>
+        </Tooltip>
+      )
     },
     {
       title: "操作",
-      width: 136,
+      width: 112,
       fixed: "right",
       render: (_, record) => (
-        <Space>
+        <Space size={4}>
           <Tooltip title="详情">
-            <Button icon={<EyeOutlined />} onClick={() => openDetail(record)} />
+            <Button
+              aria-label="查看模板详情"
+              size="small"
+              icon={<EyeOutlined />}
+              onClick={() => openDetail(record)}
+            />
           </Tooltip>
           <Tooltip title="配置">
-            <Button icon={<EditOutlined />} onClick={() => navigate(`/templates/${record.id}/config`)} />
+            <Button
+              aria-label="配置模板"
+              size="small"
+              icon={<EditOutlined />}
+              onClick={() => navigate(`/templates/${record.id}/config`)}
+            />
           </Tooltip>
           <Popconfirm title="删除模板" description="模板文件和参数记录会被删除。" onConfirm={() => remove(record)}>
-            <Button danger icon={<DeleteOutlined />} />
+            <Button danger aria-label="删除模板" size="small" icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
       )
@@ -600,7 +647,7 @@ export default function TemplateManage() {
 
           <Table
             rowKey="id"
-            loading={loading || detailLoading}
+            loading={loading}
             columns={columns}
             dataSource={currentGroupTemplates}
             pagination={{
@@ -613,7 +660,7 @@ export default function TemplateManage() {
               onChange: setTablePage
             }}
             locale={{ emptyText: <Empty description="当前分组暂无模板" /> }}
-            scroll={{ x: 800 }}
+            scroll={{ x: 684 }}
           />
         </Card>
       </div>
@@ -637,8 +684,9 @@ export default function TemplateManage() {
             {pendingDuplicate ? "覆盖并重新解析" : "确认上传"}
           </Button>
         ]}
-        closable
-        maskClosable
+        maskClosable={!uploading}
+        closable={!uploading}
+        keyboard={!uploading}
       >
         <Space direction="vertical" size={16} style={{ width: "100%" }}>
           <div className="template-upload-step">
@@ -688,16 +736,27 @@ export default function TemplateManage() {
 
       <Modal
         width={900}
-        title="模板详情"
-        open={Boolean(selected)}
-        onCancel={() => setSelected(null)}
+        title={detailTemplateName ? `模板详情 · ${detailTemplateName}` : "模板详情"}
+        open={detailOpen}
+        onCancel={closeDetail}
         footer={selected ? (
           <Space>
-            <Button onClick={() => setSelected(null)}>关闭</Button>
+            <Button onClick={closeDetail}>关闭</Button>
+            <Button
+              type="primary"
+              icon={<EditOutlined />}
+              onClick={() => navigate(`/templates/${selected.id}/config`)}
+            >
+              配置模板
+            </Button>
           </Space>
         ) : null}
       >
-        {selected && (
+        {detailLoading ? (
+          <div className="center-state">
+            <Spin />
+          </div>
+        ) : selected ? (
           <Descriptions bordered size="small" column={2}>
             <Descriptions.Item label="模板说明" span={2}>
               {selected.description || "暂无模板说明"}
@@ -709,22 +768,32 @@ export default function TemplateManage() {
             <Descriptions.Item label="启用状态">
               {selected.enabled ? <Tag color="success">启用中</Tag> : <Tag>待启用</Tag>}
             </Descriptions.Item>
+            <Descriptions.Item label="解析状态">
+              <ParseStatusTag status={selected.parseStatus} />
+            </Descriptions.Item>
             <Descriptions.Item label="模板路径" span={2}>{selected.filePath}</Descriptions.Item>
           </Descriptions>
-        )}
+        ) : null}
       </Modal>
 
       <Modal
         title={groupModalMode === "create" ? "新建分组" : "编辑分组"}
         open={groupModalMode === "create" || Boolean(editingGroup)}
         onOk={saveGroupName}
+        confirmLoading={groupSaving}
         onCancel={() => {
+          if (groupSaving) {
+            return;
+          }
           setEditingGroup(null);
           setEditingGroupName("");
           setGroupModalMode("edit");
         }}
         okText={groupModalMode === "create" ? "创建" : "保存"}
         cancelText="取消"
+        cancelButtonProps={{ disabled: groupSaving }}
+        closable={!groupSaving}
+        maskClosable={!groupSaving}
       >
         <Input
           autoFocus

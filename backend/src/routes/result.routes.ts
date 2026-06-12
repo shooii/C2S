@@ -74,25 +74,54 @@ router.get(
 );
 
 router.get(
+  "/:taskId/content/*",
+  asyncHandler(async (req, res) => {
+    const requestedName = normalizeContentFileName(req.params[0] || "");
+    const file = getResultFiles(req.params.taskId).find(
+      (item) => normalizeContentFileName(item.fileName) === requestedName
+    );
+    if (!file || !fs.existsSync(file.filePath)) {
+      throw new HttpError(404, "预览资源不存在或已被删除");
+    }
+
+    assertPathInside(resultOutputPath(req.params.taskId), file.filePath);
+    res.type(file.fileName);
+    res.sendFile(file.filePath);
+  })
+);
+
+router.get(
   "/:taskId/preview",
   asyncHandler(async (req, res) => {
     const task = getTask(req.params.taskId);
     const files = getResultFiles(req.params.taskId);
-    const previewFile = files.find((file) => file.previewable);
+    const requestedFileId = typeof req.query.fileId === "string" ? req.query.fileId : null;
+    const requestedFile = requestedFileId
+      ? files.find((file) => file.id === requestedFileId)
+      : undefined;
 
-    if (!previewFile) {
+    if (requestedFileId && !requestedFile) {
+      throw new HttpError(404, "成果文件不存在");
+    }
+
+    const previewFile = requestedFile || files.find((file) => file.previewable);
+
+    if (!previewFile || !previewFile.previewable) {
       res.json({
         data: {
           task,
           type: "unsupported",
-          message: "该成果类型暂不支持在线预览，可下载后查看",
+          file: previewFile,
+          message: previewFile
+            ? "该文件类型暂不支持在线预览，可下载后查看"
+            : "该成果类型暂不支持在线预览，可下载后查看",
           files
         }
       });
       return;
     }
 
-    const downloadUrl = `/api/results/${req.params.taskId}/download/${previewFile.id}`;
+    const contentUrl = previewContentUrl(req.params.taskId, previewFile.fileName);
     if (previewFile.fileType === "json" && previewFile.fileSize <= 5 * 1024 * 1024) {
       const raw = fs.readFileSync(previewFile.filePath, "utf8");
       let json: unknown = raw;
@@ -106,8 +135,21 @@ router.get(
           task,
           type: "json",
           file: previewFile,
-          url: downloadUrl,
+          url: contentUrl,
           json,
+          files
+        }
+      });
+      return;
+    }
+
+    if (previewFile.fileType === "json") {
+      res.json({
+        data: {
+          task,
+          type: "unsupported",
+          file: previewFile,
+          message: "JSON 文件超过 5 MB，暂不支持在线预览，可下载后查看",
           files
         }
       });
@@ -119,12 +161,31 @@ router.get(
         task,
         type: previewFile.fileType,
         file: previewFile,
-        url: downloadUrl,
+        url: contentUrl,
         files
       }
     });
   })
 );
+
+function normalizeContentFileName(fileName: string): string {
+  const segments = fileName
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean);
+  if (!segments.length || segments.some((segment) => segment === "." || segment === "..")) {
+    throw new HttpError(400, "非法预览资源路径");
+  }
+  return segments.join("/");
+}
+
+function previewContentUrl(taskId: string, fileName: string): string {
+  const encodedName = normalizeContentFileName(fileName)
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  return `/api/results/${encodeURIComponent(taskId)}/content/${encodedName}`;
+}
 
 function normalizeArchiveEntryName(fileName: string): string {
   const normalized = fileName
