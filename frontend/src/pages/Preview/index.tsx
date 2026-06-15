@@ -121,7 +121,7 @@ export default function Preview() {
             action={<Button size="small" onClick={() => setReloadToken((value) => value + 1)}>重试</Button>}
           />
         )}
-        <div className="preview-panel preview-side">
+        <div className="preview-panel preview-side preview-files-panel">
           <Typography.Title level={5}>成果文件</Typography.Title>
           {payload.files.length ? (
             <Tree
@@ -153,7 +153,7 @@ export default function Preview() {
           <PreviewStage payload={payload} />
         </div>
 
-        <div className="preview-panel preview-side">
+        <div className="preview-panel preview-side preview-info-panel">
           <Typography.Title level={5}>文件信息</Typography.Title>
           <Card
             size="small"

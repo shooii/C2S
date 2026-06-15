@@ -38,7 +38,12 @@ export function LogDrawer({ task, open, onClose }: LogDrawerProps) {
   }, [open, task]);
 
   return (
-    <Drawer width={760} title={task ? `${task.taskName} 运行日志` : "运行日志"} open={open} onClose={onClose}>
+    <Drawer
+      width="min(760px, calc(100vw - 24px))"
+      title={task ? `${task.taskName} 运行日志` : "运行日志"}
+      open={open}
+      onClose={onClose}
+    >
       {loading && !log ? (
         <div className="center-state">
           <Spin />
@@ -51,4 +56,3 @@ export function LogDrawer({ task, open, onClose }: LogDrawerProps) {
     </Drawer>
   );
 }
-

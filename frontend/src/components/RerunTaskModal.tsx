@@ -136,7 +136,7 @@ export function RerunTaskModal({
     <Modal
       title="重新运行任务"
       open={open}
-      width={760}
+      width="min(760px, calc(100vw - 32px))"
       okText="创建并运行"
       cancelText="取消"
       confirmLoading={submitting}

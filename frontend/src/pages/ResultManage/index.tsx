@@ -352,7 +352,7 @@ export default function ResultManage() {
     {
       title: "任务名称",
       dataIndex: "taskName",
-      width: 260,
+      width: 230,
       render: (value, record) => (
         <Space direction="vertical" size={0}>
           <Typography.Text strong>{value}</Typography.Text>
@@ -363,7 +363,7 @@ export default function ResultManage() {
     {
       title: "来源模板",
       dataIndex: "templateName",
-      width: 150,
+      width: 140,
       ellipsis: true
     },
     {
@@ -375,7 +375,7 @@ export default function ResultManage() {
     {
       title: "进度",
       dataIndex: "progress",
-      width: 130,
+      width: 120,
       render: (value, record) => (
         <Tooltip title={progressDescription(record)}>
           <Progress
@@ -391,7 +391,7 @@ export default function ResultManage() {
     {
       title: "开始时间",
       dataIndex: "startedAt",
-      width: 150,
+      width: 140,
       render: (value) => value ? dayjs(value).format("YYYY-MM-DD HH:mm") : "-"
     },
     {
@@ -403,12 +403,12 @@ export default function ResultManage() {
     {
       title: "成果大小",
       dataIndex: "resultSize",
-      width: 100,
+      width: 90,
       render: formatSize
     },
     {
       title: "操作",
-      width: 184,
+      width: 180,
       fixed: "right",
       render: (_, record) => (
         <Space size={4}>
@@ -549,7 +549,7 @@ export default function ResultManage() {
             hideOnSinglePage: false,
             showTotal: (total) => `共 ${total} 条任务`
           }}
-          scroll={{ x: 1180 }}
+          scroll={{ x: 1100 }}
           locale={{ emptyText: <Empty description="暂无转换任务" /> }}
         />
       </Card>

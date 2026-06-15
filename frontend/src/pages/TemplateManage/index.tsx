@@ -781,7 +781,7 @@ export default function TemplateManage() {
       </Modal>
 
       <Modal
-        width={900}
+        width="min(900px, calc(100vw - 32px))"
         title={detailTemplateName ? `模板详情 · ${detailTemplateName}` : "模板详情"}
         open={detailOpen}
         onCancel={closeDetail}
