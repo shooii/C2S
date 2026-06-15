@@ -48,13 +48,21 @@ import type { TemplateDetail, TemplateGroup, TemplateRecord } from "../../types"
 type GroupKey = string;
 type EnabledFilter = "all" | "enabled" | "disabled";
 const MANAGEMENT_PAGE_SIZE = 10;
+type StateUpdater<T> = T | ((current: T) => T);
+
+let templateManageTemplateCache: TemplateRecord[] | null = null;
+let templateManageGroupCache: TemplateGroup[] | null = null;
+
+function hasTemplateManageCache() {
+  return templateManageTemplateCache !== null && templateManageGroupCache !== null;
+}
 
 export default function TemplateManage() {
   const { message, modal } = App.useApp();
   const navigate = useNavigate();
-  const [templates, setTemplates] = useState<TemplateRecord[]>([]);
-  const [groups, setGroups] = useState<TemplateGroup[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [templates, setTemplates] = useState<TemplateRecord[]>(() => templateManageTemplateCache ?? []);
+  const [groups, setGroups] = useState<TemplateGroup[]>(() => templateManageGroupCache ?? []);
+  const [loading, setLoading] = useState(() => !hasTemplateManageCache());
   const [activeGroup, setActiveGroup] = useState<GroupKey>("default");
   const [keyword, setKeyword] = useState("");
   const [status, setStatus] = useState<EnabledFilter>("all");
@@ -79,24 +87,45 @@ export default function TemplateManage() {
   const uploadTokenRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
 
-  const loadData = async () => {
-    setLoading(true);
+  const setTemplatesCached = (updater: StateUpdater<TemplateRecord[]>) => {
+    setTemplates((current) => {
+      const next = typeof updater === "function" ? updater(current) : updater;
+      templateManageTemplateCache = next;
+      return next;
+    });
+  };
+
+  const setGroupsCached = (updater: StateUpdater<TemplateGroup[]>) => {
+    setGroups((current) => {
+      const next = typeof updater === "function" ? updater(current) : updater;
+      templateManageGroupCache = next;
+      return next;
+    });
+  };
+
+  const loadData = async (background = false) => {
+    const hasCache = hasTemplateManageCache();
+    if (!background && !hasCache) {
+      setLoading(true);
+    }
     try {
       const [templateRecords, templateGroups] = await Promise.all([
         api.listTemplates({}),
         api.listTemplateGroups()
       ]);
-      setTemplates(templateRecords);
-      setGroups(templateGroups);
+      setTemplatesCached(templateRecords);
+      setGroupsCached(templateGroups);
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "模板管理数据加载失败");
+      if (!background || !hasCache) {
+        message.error(error instanceof Error ? error.message : "模板管理数据加载失败");
+      }
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    void loadData();
+    void loadData(hasTemplateManageCache());
   }, []);
 
   const visibleGroupKeys = useMemo(() => groups.map((group) => group.id), [groups]);
@@ -293,8 +322,9 @@ export default function TemplateManage() {
   const remove = async (record: TemplateRecord) => {
     try {
       await api.deleteTemplate(record.id);
+      setTemplatesCached((current) => current.filter((template) => template.id !== record.id));
       message.success("模板已删除");
-      await loadData();
+      await loadData(true);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "模板删除失败");
     }
@@ -329,17 +359,21 @@ export default function TemplateManage() {
     try {
       if (groupModalMode === "create") {
         const created = await api.createTemplateGroup(nextName);
+        setGroupsCached((current) => [...current, created]);
         setActiveGroup(created.id);
         setGroupPage(Math.ceil((visibleGroupKeys.length + 1) / groupPageSize));
         message.success("分组已创建");
       } else if (editingGroup) {
-        await api.updateTemplateGroup(editingGroup, nextName);
+        const updated = await api.updateTemplateGroup(editingGroup, nextName);
+        setGroupsCached((current) => current.map((group) => (
+          group.id === updated.id ? updated : group
+        )));
         message.success("分组已更新");
       }
       setEditingGroup(null);
       setEditingGroupName("");
       setGroupModalMode("edit");
-      await loadData();
+      await loadData(true);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "分组保存失败");
     } finally {
@@ -354,11 +388,13 @@ export default function TemplateManage() {
     }
     try {
       await api.deleteTemplateGroup(key);
+      setGroupsCached((current) => current.filter((group) => group.id !== key));
+      setTemplatesCached((current) => current.filter((template) => template.groupId !== key));
       if (activeGroup === key) {
         setActiveGroup("default");
       }
       message.success("分组及其模板已删除");
-      await loadData();
+      await loadData(true);
     } catch (error) {
       message.error(error instanceof Error ? error.message : "分组删除失败");
     }
@@ -409,8 +445,9 @@ export default function TemplateManage() {
     setUploadProgress(0);
 
     try {
+      let savedTemplate: TemplateDetail | null = null;
       if (pendingDuplicate) {
-        await api.replaceTemplate(
+        savedTemplate = await api.replaceTemplate(
           pendingDuplicate.id,
           pendingUploadFile,
           uploadToken,
@@ -418,7 +455,7 @@ export default function TemplateManage() {
           controller.signal
         );
       } else {
-        await api.uploadTemplate(
+        savedTemplate = await api.uploadTemplate(
           pendingUploadFile,
           pendingUploadGroup,
           uploadToken,
@@ -426,6 +463,15 @@ export default function TemplateManage() {
           controller.signal
         );
       }
+      setTemplatesCached((current) => {
+        const nextTemplate = savedTemplate as TemplateRecord;
+        if (pendingDuplicate) {
+          return current.map((template) => (
+            template.id === nextTemplate.id ? nextTemplate : template
+          ));
+        }
+        return [nextTemplate, ...current.filter((template) => template.id !== nextTemplate.id)];
+      });
       setActiveGroup(pendingUploadGroup);
       const groupName = getGroupLabel(pendingUploadGroup, groups);
       message.success(
@@ -434,7 +480,7 @@ export default function TemplateManage() {
           : `模板已上传到「${groupName}」`
       );
       closeUploadDialog(false);
-      await loadData();
+      await loadData(true);
     } catch (error) {
       if (controller.signal.aborted) {
         message.info("已取消模板上传");

@@ -36,6 +36,10 @@ import {
 import dayjs from "dayjs";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../../services/api";
+import {
+  notifyTaskSubmissionSettled,
+  publishCreatedTask
+} from "../../services/taskSubmission";
 import type { TemplateDetail, TemplateParameter } from "../../types";
 
 const outputFormatOptions = [
@@ -224,13 +228,13 @@ export default function TemplateConfig() {
     });
 
     taskPromise
-      .then(() => {
+      .then((createdTask) => {
+        publishCreatedTask(createdTask);
         message.success("转换任务已创建");
-        window.dispatchEvent(new Event("c2s:task-submission-settled"));
       })
       .catch((error) => {
         message.error(error instanceof Error ? error.message : "任务创建失败");
-        window.dispatchEvent(new Event("c2s:task-submission-settled"));
+        notifyTaskSubmissionSettled();
       })
       .finally(() => {
         setRunning(false);

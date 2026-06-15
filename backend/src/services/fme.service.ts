@@ -234,6 +234,7 @@ export async function runWorkspace(input: RunWorkspaceInput): Promise<RunWorkspa
     env: { ...process.env, PYTHONIOENCODING: "utf8" }
   });
   runningProcesses.set(input.taskId, child);
+  input.onProgress?.(8);
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1304,9 +1305,17 @@ function createProgressTracker(): (chunk: string) => number | null {
 
     let latestProgress: number | null = null;
     for (const line of lines) {
+      const phaseProgress = extractPhaseProgress(line);
+      if (phaseProgress !== null) {
+        latestProgress = Math.max(latestProgress ?? 0, phaseProgress);
+      }
+
       const explicitPercent = extractPercentProgress(line);
       if (explicitPercent !== null) {
-        latestProgress = explicitPercent;
+        latestProgress = Math.max(
+          latestProgress ?? 0,
+          scaleFmeExecutionProgress(explicitPercent)
+        );
         continue;
       }
 
@@ -1325,7 +1334,10 @@ function createProgressTracker(): (chunk: string) => number | null {
       const active = activeKey ? streams.get(activeKey) ?? null : null;
       if (shouldUseProgressStream(stream, active)) {
         activeKey = stream.key;
-        latestProgress = stream.percent;
+        latestProgress = Math.max(
+          latestProgress ?? 0,
+          scaleFmeExecutionProgress(stream.percent)
+        );
       }
     }
 
@@ -1342,13 +1354,11 @@ function extractPercentProgress(line: string): number | null {
   if (Number.isNaN(value)) {
     return null;
   }
-  return normalizeRunningProgress(value);
+  return normalizePercentValue(value);
 }
 
 function extractMeasuredProgress(line: string): Omit<ProgressStream, "samples"> | null {
-  const match = line.match(
-    /^(?<source>[^:\r\n]+):\s*Processed(?:\s+'(?<label>[^']+)')?\s+(?<current>[\d,]+)\s*(?:\/|of)\s*(?<total>[\d,]+)(?:\s+(?<unit>[A-Za-z]+))?/i
-  );
+  const match = findMeasuredProgressMatch(line);
   if (!match?.groups) {
     return null;
   }
@@ -1359,10 +1369,10 @@ function extractMeasuredProgress(line: string): Omit<ProgressStream, "samples"> 
     return null;
   }
 
-  const percent = normalizeRunningProgress((current / total) * 100);
+  const percent = normalizePercentValue((current / total) * 100);
   return {
     key: [
-      match.groups.source.trim().toLowerCase(),
+      (match.groups.source || "").trim().toLowerCase(),
       (match.groups.label || "").trim().toLowerCase(),
       (match.groups.unit || "").trim().toLowerCase(),
       total
@@ -1371,6 +1381,41 @@ function extractMeasuredProgress(line: string): Omit<ProgressStream, "samples"> 
     total,
     percent
   };
+}
+
+function findMeasuredProgressMatch(line: string): RegExpMatchArray | null {
+  const strictMatch = line.match(
+    /^(?<source>[^:\r\n]+):\s*Processed(?:\s+'(?<label>[^']+)')?\s+(?<current>[\d,]+)\s*(?:\/|of)\s*(?<total>[\d,]+)(?:\s+(?<unit>[A-Za-z]+))?/i
+  );
+  if (strictMatch?.groups) {
+    return strictMatch;
+  }
+
+  if (!/(processed|reading|read|writing|wrote|converted|loaded|features?|records?|rows?|objects?)/i.test(line)) {
+    return null;
+  }
+  return line.match(
+    /^(?<source>[^:\r\n]{0,100})[:\s-]*(?:Processed|Reading|Read|Writing|Wrote|Converted|Loaded|Completed)?[^\r\n]*?(?<current>[\d,]+)\s*(?:\/|of)\s*(?<total>[\d,]+)(?:\s+(?<unit>[A-Za-z]+))?/i
+  );
+}
+
+function extractPhaseProgress(line: string): number | null {
+  if (/^\s*FME\s+\d/i.test(line) || /Safe Software/i.test(line)) {
+    return 10;
+  }
+  if (/Reading\.\.\.|Start(?:ed|ing)? translation|Begin(?:ning)? translation/i.test(line)) {
+    return 15;
+  }
+  if (/Emptying factory pipeline|factory pipeline|Writing\.\.\.|writer/i.test(line)) {
+    return 30;
+  }
+  if (/Translation was SUCCESSFUL|Translation finished|Translation complete/i.test(line)) {
+    return 94;
+  }
+  if (/Translation was FAILED|Translation FAILED|Translation terminated|FME Session Duration/i.test(line)) {
+    return 92;
+  }
+  return null;
 }
 
 function shouldUseProgressStream(stream: ProgressStream, active: ProgressStream | null): boolean {
@@ -1390,11 +1435,16 @@ function parseProgressNumber(value: string): number {
   return Number(value.replace(/,/g, ""));
 }
 
-function normalizeRunningProgress(value: number): number {
+function normalizePercentValue(value: number): number {
   if (!Number.isFinite(value)) {
-    return 5;
+    return 0;
   }
-  return Math.max(5, Math.min(99, Math.round(value)));
+  return Math.max(0, Math.min(100, value));
+}
+
+function scaleFmeExecutionProgress(value: number): number {
+  const percent = normalizePercentValue(value);
+  return Math.max(15, Math.min(90, Math.round(15 + percent * 0.75)));
 }
 
 function firstNonEmptyLine(text: string): string | undefined {

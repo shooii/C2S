@@ -9,7 +9,7 @@ import {
   getResultFiles,
   getTask
 } from "../services/task.service";
-import { assertPathInside, listFilesRecursive, resultOutputPath } from "../services/file.service";
+import { assertPathInside, resultOutputPath } from "../services/file.service";
 import { asyncHandler } from "../utils/asyncHandler";
 import { HttpError } from "../utils/httpError";
 
@@ -19,6 +19,21 @@ interface ArchiveFile {
   fileName: string;
   filePath: string;
 }
+
+const previewDependencyExtensions = new Set([
+  ".bin",
+  ".b3dm",
+  ".cmpt",
+  ".i3dm",
+  ".json",
+  ".jpeg",
+  ".jpg",
+  ".ktx2",
+  ".png",
+  ".pnts",
+  ".subtree",
+  ".webp"
+]);
 
 router.get(
   "/:taskId/files",
@@ -31,6 +46,10 @@ router.get(
   "/:taskId/download",
   asyncHandler(async (req, res, next) => {
     const task = getTask(req.params.taskId);
+    if (!task.downloadUrl && task.resultSize <= 0) {
+      throw new HttpError(404, "暂无可下载成果文件");
+    }
+
     const files = getArchiveFiles(req.params.taskId);
     if (!files.length) {
       throw new HttpError(404, "暂无可下载成果文件");
@@ -66,6 +85,9 @@ router.get(
   "/:taskId/download/:fileId",
   asyncHandler(async (req, res) => {
     const file = getResultFile(req.params.taskId, req.params.fileId);
+    if (!file.downloadable) {
+      throw new HttpError(404, "该成果文件不可下载");
+    }
     if (!fs.existsSync(file.filePath)) {
       throw new HttpError(404, "成果文件不存在或已被删除");
     }
@@ -77,10 +99,11 @@ router.get(
   "/:taskId/content/*",
   asyncHandler(async (req, res) => {
     const requestedName = normalizeContentFileName(req.params[0] || "");
-    const file = getResultFiles(req.params.taskId).find(
+    const files = getResultFiles(req.params.taskId);
+    const file = files.find(
       (item) => normalizeContentFileName(item.fileName) === requestedName
     );
-    if (!file || !fs.existsSync(file.filePath)) {
+    if (!file || !isPreviewContentResource(file, files) || !fs.existsSync(file.filePath)) {
       throw new HttpError(404, "预览资源不存在或已被删除");
     }
 
@@ -112,9 +135,7 @@ router.get(
           task,
           type: "unsupported",
           file: previewFile,
-          message: previewFile
-            ? "该文件类型暂不支持在线预览，可下载后查看"
-            : "该成果类型暂不支持在线预览，可下载后查看",
+          message: unsupportedPreviewMessage(previewFile),
           files
         }
       });
@@ -149,7 +170,7 @@ router.get(
           task,
           type: "unsupported",
           file: previewFile,
-          message: "JSON 文件超过 5 MB，暂不支持在线预览，可下载后查看",
+          message: unsupportedPreviewMessage(previewFile, "JSON 文件超过 5 MB，暂不支持在线预览"),
           files
         }
       });
@@ -185,6 +206,42 @@ function previewContentUrl(taskId: string, fileName: string): string {
     .map(encodeURIComponent)
     .join("/");
   return `/api/results/${encodeURIComponent(taskId)}/content/${encodedName}`;
+}
+
+function unsupportedPreviewMessage(
+  file?: ReturnType<typeof getResultFiles>[number],
+  reason = "该文件类型暂不支持在线预览"
+): string {
+  if (!file) {
+    return "暂无可预览成果文件";
+  }
+  if (file.downloadable) {
+    return `${reason}，可下载后查看`;
+  }
+  return `${reason}，且当前文件不可下载`;
+}
+
+function isPreviewContentResource(
+  file: ReturnType<typeof getResultFiles>[number],
+  files: ReturnType<typeof getResultFiles>
+): boolean {
+  if (file.previewable) {
+    return true;
+  }
+
+  const normalizedName = normalizeContentFileName(file.fileName);
+  const extension = path.posix.extname(normalizedName).toLowerCase();
+  if (!previewDependencyExtensions.has(extension)) {
+    return false;
+  }
+
+  return files.some((candidate) => {
+    if (!candidate.previewable || !["gltf", "3dtiles"].includes(candidate.fileType)) {
+      return false;
+    }
+    const previewRoot = path.posix.dirname(normalizeContentFileName(candidate.fileName));
+    return previewRoot === "." || normalizedName.startsWith(`${previewRoot}/`);
+  });
 }
 
 function normalizeArchiveEntryName(fileName: string): string {
@@ -226,10 +283,6 @@ function getArchiveFiles(taskId: string): ArchiveFile[] {
       addArchiveFile(filesByPath, managedRoot, file.filePath, file.fileName);
     });
 
-  listFilesRecursive(managedRoot).forEach((file) => {
-    addArchiveFile(filesByPath, managedRoot, file.filePath, file.fileName);
-  });
-
   return [...filesByPath.values()];
 }
 
@@ -249,7 +302,7 @@ function addArchiveFile(
       filesByPath.set(key, { fileName, filePath: safePath });
     }
   } catch {
-    // Ignore stale or invalid result-file records; actual managed outputs are scanned separately.
+    // Ignore stale or invalid result-file records.
   }
 }
 

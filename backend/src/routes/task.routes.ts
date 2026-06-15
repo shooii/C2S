@@ -22,6 +22,7 @@ import type { TaskStatus } from "../types";
 
 const router = Router();
 const upload = createInputUpload();
+const TASK_STATUSES = new Set<TaskStatus>(["pending", "running", "success", "failed", "cancelled"]);
 
 router.post(
   "/run",
@@ -79,7 +80,7 @@ router.post(
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const status = typeof req.query.status === "string" ? req.query.status as TaskStatus : undefined;
+    const status = taskStatusField(req.query.status);
     const search = typeof req.query.search === "string" ? req.query.search : undefined;
     res.json({ data: listTasks({ status, search }) });
   })
@@ -171,6 +172,23 @@ function parseParameters(value: unknown): Record<string, unknown> {
   } catch {
     throw new HttpError(400, "parameters 必须是合法 JSON 对象");
   }
+}
+
+function taskStatusField(value: unknown): TaskStatus | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new HttpError(400, "status 必须是字符串");
+  }
+  const status = value.trim() as TaskStatus;
+  if (!status) {
+    return undefined;
+  }
+  if (!TASK_STATUSES.has(status)) {
+    throw new HttpError(400, "不支持的任务状态");
+  }
+  return status;
 }
 
 function parseParameterUploadManifest(value: unknown): ParameterUploadManifestEntry[] {

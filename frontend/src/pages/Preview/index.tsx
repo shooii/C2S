@@ -22,7 +22,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../services/api";
 import { TaskStatusTag } from "../../components/StatusTag";
-import type { PreviewPayload } from "../../types";
+import type { PreviewPayload, ResultFile } from "../../types";
 
 export default function Preview() {
   const { taskId } = useParams<{ taskId: string }>();
@@ -47,6 +47,7 @@ export default function Preview() {
         }
       } catch (error) {
         if (!disposed) {
+          setPayload(null);
           setLoadError(error instanceof Error ? error.message : "预览数据加载失败");
         }
       } finally {
@@ -135,7 +136,7 @@ export default function Preview() {
               treeData={payload.files.map((file) => ({
                 key: file.id,
                 title: (
-                  <Tooltip title={file.previewable ? file.fileName : `${file.fileName}（可查看信息并下载，暂不支持预览）`}>
+                  <Tooltip title={previewFileTooltip(file)}>
                     <span className={`preview-file-title${file.previewable ? "" : " is-unsupported"}`}>
                       {file.fileName} ({formatSize(file.fileSize)})
                     </span>
@@ -179,7 +180,7 @@ export default function Preview() {
           </Card>
           <Typography.Title level={5} style={{ marginTop: 20 }}>操作提示</Typography.Title>
           <Typography.Paragraph type="secondary">
-            {previewUsageTip(payload.type)}
+            {previewUsageTip(payload.type, payload.file)}
           </Typography.Paragraph>
         </div>
 
@@ -207,7 +208,7 @@ function PreviewStage({ payload }: { payload: PreviewPayload }) {
   }
   return (
     <div className="center-state">
-      <Empty description={payload.message || "该成果类型暂不支持在线预览，可下载后查看"} />
+      <Empty description={payload.message || unsupportedPreviewMessage(payload.file)} />
     </div>
   );
 }
@@ -371,10 +372,24 @@ function taskStatusLabel(status: string): string {
   return labels[status] || status || "-";
 }
 
-function previewUsageTip(type: string): string {
+function previewFileTooltip(file: ResultFile): string {
+  if (file.previewable) return file.fileName;
+  if (file.downloadable) return `${file.fileName}（可查看信息并下载，暂不支持预览）`;
+  return `${file.fileName}（暂不支持预览或下载）`;
+}
+
+function unsupportedPreviewMessage(file?: ResultFile): string {
+  if (!file) return "暂无可预览成果文件";
+  if (file.downloadable) return "该成果类型暂不支持在线预览，可下载后查看";
+  return "该成果类型暂不支持在线预览，且当前文件不可下载";
+}
+
+function previewUsageTip(type: string, file?: ResultFile): string {
   if (type === "gltf") return "按住鼠标左键旋转，滚轮缩放，右键拖动平移视角。";
   if (type === "3dtiles") return "拖动旋转场景，滚轮缩放；可从左侧切换其他可预览成果。";
   if (type === "json") return "当前以格式化文本展示，可滚动查看完整 JSON 内容。";
+  if (!file) return "暂无可预览成果文件，可返回任务详情检查成果输出。";
+  if (!file.downloadable) return "该文件暂不支持在线预览，也没有可下载文件，可返回任务详情检查成果状态。";
   return "该文件暂不支持在线预览，可使用上方下载入口在本地查看。";
 }
 

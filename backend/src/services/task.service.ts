@@ -32,6 +32,16 @@ type ResultFileRow = Omit<ResultFile, "downloadable" | "previewable"> & {
   downloadable: number;
   previewable: number;
 };
+type GeneratedResultFile = Omit<ResultFile, "id" | "createdAt">;
+interface GeneratedResultSummary {
+  files: GeneratedResultFile[];
+  resultSize: number;
+  hasPreviewableFiles: boolean;
+  hasDownloadableFiles: boolean;
+}
+class TaskFinalizeStateError extends Error {}
+
+const TASK_EXECUTION_START_DELAY_MS = 200;
 
 export interface CreateTaskInput {
   templateId: string;
@@ -52,14 +62,15 @@ export function listTasks(options: { status?: TaskStatus; search?: string } = {}
   const db = getDb();
   const where: string[] = [];
   const params: Record<string, string> = {};
+  const search = options.search?.trim();
 
   if (options.status) {
-    where.push("status = @status");
+    where.push("tasks.status = @status");
     params.status = options.status;
   }
-  if (options.search) {
-    where.push("(taskName LIKE @search OR templateName LIKE @search OR inputDataName LIKE @search)");
-    params.search = `%${options.search}%`;
+  if (search) {
+    where.push("(tasks.id LIKE @search OR tasks.taskName LIKE @search OR tasks.templateName LIKE @search OR tasks.inputDataName LIKE @search)");
+    params.search = `%${search}%`;
   }
 
   const sql = `
@@ -224,12 +235,19 @@ export function rerunTask(id: string, input: RerunTaskInput = {}): ConversionTas
   if (task.inputDataPath && !fs.existsSync(task.inputDataPath)) {
     throw new HttpError(400, "原始输入数据文件不存在，无法重新运行");
   }
+  const template = getTemplate(task.templateId);
   const baseTaskName = task.taskName.replace(/(?:\s*-\s*重新运行)+$/, "").trim();
+  const parameters = resetRerunOutputParameters(
+    input.parameters ?? task.parameters,
+    task,
+    template.parameters,
+    input.parameters !== undefined
+  );
 
   return createAndRunTask({
-    templateId: task.templateId,
+    templateId: template.id,
     taskName: input.taskName?.trim() || `${baseTaskName} - 重新运行`,
-    parameters: input.parameters ?? task.parameters,
+    parameters,
     outputFormat: input.outputFormat === undefined ? task.outputFormat : input.outputFormat,
     inputDataName: task.inputDataName,
     inputDataPath: task.inputDataPath
@@ -237,13 +255,18 @@ export function rerunTask(id: string, input: RerunTaskInput = {}): ConversionTas
 }
 
 export function deleteResults(taskId: string): void {
-  getTask(taskId);
+  const task = getTask(taskId);
+  if (["pending", "running"].includes(task.status)) {
+    throw new HttpError(400, "任务仍在运行，无法删除成果文件");
+  }
   const outputPath = path.join(outputStorageDir, taskId);
   assertPathInside(outputStorageDir, outputPath);
-  removeIfExists(outputPath);
   const db = getDb();
-  db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
-  db.prepare("UPDATE conversion_tasks SET resultSize = 0, previewUrl = NULL, downloadUrl = NULL WHERE id = ?").run(taskId);
+  runTransaction(() => {
+    db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
+    db.prepare("UPDATE conversion_tasks SET resultSize = 0, previewUrl = NULL, downloadUrl = NULL WHERE id = ?").run(taskId);
+  });
+  removeTaskArtifact(outputPath);
 }
 
 export function deleteTask(taskId: string): void {
@@ -282,10 +305,10 @@ function deleteTaskRecord(task: ConversionTask): void {
 
   const outputPath = path.join(outputStorageDir, taskId);
   assertPathInside(outputStorageDir, outputPath);
-  removeIfExists(outputPath);
+  removeTaskArtifact(outputPath);
 
   const logPath = assertPathInside(logStorageDir, path.join(logStorageDir, `${taskId}.log`));
-  removeIfExists(logPath);
+  removeTaskArtifact(logPath);
 
   const db = getDb();
   runTransaction(() => {
@@ -330,41 +353,55 @@ async function executeTask(
       onProgress: (progress) => updateProgressIfRunning(taskId, progress)
     });
 
-    const current = getTask(taskId);
-    if (current.status === "cancelled") {
+    const current = findTask(taskId);
+    if (!current || current.status === "cancelled") {
       return;
     }
 
-    const resultFiles = persistGeneratedFiles(taskId, task.outputPath, outputSnapshot);
+    updateProgressIfRunning(taskId, 95);
+    const resultFiles = collectGeneratedFiles(taskId, task.outputPath, outputSnapshot);
+    updateProgressIfRunning(taskId, 98);
     const success = result.exitCode === 0;
+    const latestTask = findTask(taskId) ?? current;
 
-    updateTask(taskId, {
+    const finalized = finalizeTaskWithResultFiles(taskId, resultFiles.files, {
       status: success ? "success" : "failed",
-      progress: success ? 100 : Math.max(current.progress, 5),
+      progress: success ? 100 : Math.max(latestTask.progress, 5),
       resultSize: resultFiles.resultSize,
-      previewUrl: resultFiles.firstPreviewable ? `/api/results/${taskId}/preview` : null,
+      previewUrl: resultFiles.hasPreviewableFiles ? `/api/results/${taskId}/preview` : null,
       downloadUrl: resultFiles.hasDownloadableFiles ? `/api/results/${taskId}/download` : null,
       exitCode: result.exitCode,
       errorMessage: success ? null : `FME 进程退出码：${result.exitCode ?? "null"}`,
       finishedAt: nowIso(),
       duration: result.duration
-    });
+    }, ["running"]);
+    if (!finalized) {
+      cleanupManagedResultCopies(taskId);
+    }
   } catch (error) {
-    const current = getTask(taskId);
-    if (current.status === "cancelled") {
+    const current = findTask(taskId);
+    if (!current || current.status === "cancelled") {
       return;
     }
-    const resultFiles = tryPersistGeneratedFiles(taskId, task.outputPath, outputSnapshot);
-    updateTask(taskId, {
+    const resultFiles = tryCollectGeneratedFiles(taskId, task.outputPath, outputSnapshot);
+    const failurePatch: Partial<ConversionTask> = {
       status: "failed",
       progress: Math.max(current.progress, 5),
       resultSize: resultFiles?.resultSize ?? current.resultSize,
-      previewUrl: resultFiles?.firstPreviewable ? `/api/results/${taskId}/preview` : current.previewUrl,
+      previewUrl: resultFiles?.hasPreviewableFiles ? `/api/results/${taskId}/preview` : current.previewUrl,
       downloadUrl: resultFiles?.hasDownloadableFiles ? `/api/results/${taskId}/download` : current.downloadUrl,
       errorMessage: error instanceof Error ? error.message : "FME 执行失败",
       finishedAt: nowIso(),
       duration: current.startedAt ? Date.now() - new Date(current.startedAt).getTime() : null
-    });
+    };
+    if (resultFiles) {
+      const finalized = finalizeTaskWithResultFiles(taskId, resultFiles.files, failurePatch, ["running"]);
+      if (!finalized) {
+        cleanupManagedResultCopies(taskId);
+      }
+    } else {
+      updateTaskIfStatus(taskId, failurePatch, ["running"]);
+    }
   }
 }
 
@@ -373,54 +410,50 @@ function scheduleTaskExecution(
   workspacePath: string,
   fmeParameters: Record<string, unknown>
 ): void {
-  setImmediate(() => {
+  setTimeout(() => {
     void executeTask(taskId, workspacePath, fmeParameters).catch((error) => {
-      updateTask(taskId, {
+      const current = findTask(taskId);
+      if (!current || current.status === "cancelled") {
+        return;
+      }
+      updateTaskIfStatus(taskId, {
         status: "failed",
         progress: 0,
         errorMessage: error instanceof Error ? error.message : "FME 执行调度失败",
         finishedAt: nowIso()
-      });
+      }, ["pending", "running"]);
     });
-  });
+  }, TASK_EXECUTION_START_DELAY_MS);
 }
 
-function persistGeneratedFiles(
+function collectGeneratedFiles(
   taskId: string,
   outputPath: string,
   outputSnapshot: OutputFileSnapshot
-): {
-  resultSize: number;
-  firstPreviewable: ResultFile | undefined;
-  hasDownloadableFiles: boolean;
-} {
+): GeneratedResultSummary {
   const generatedFiles = scanOutputFiles(taskId, outputPath, outputSnapshot);
   const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
-  replaceResultFiles(taskId, files);
-  const persistedFiles = getResultFiles(taskId);
   return {
+    files,
     resultSize: files.reduce((total, file) => total + file.fileSize, 0),
-    firstPreviewable: persistedFiles.find((file) => file.previewable),
-    hasDownloadableFiles: persistedFiles.some((file) => file.downloadable)
+    hasPreviewableFiles: files.some((file) => isResultFilePreviewable(file)),
+    hasDownloadableFiles: files.some((file) => file.downloadable)
   };
 }
 
-function tryPersistGeneratedFiles(
+function tryCollectGeneratedFiles(
   taskId: string,
   outputPath: string,
   outputSnapshot: OutputFileSnapshot
-): ReturnType<typeof persistGeneratedFiles> | null {
+): GeneratedResultSummary | null {
   try {
-    return persistGeneratedFiles(taskId, outputPath, outputSnapshot);
+    return collectGeneratedFiles(taskId, outputPath, outputSnapshot);
   } catch {
     return null;
   }
 }
 
-function syncResultFilesToManagedStorage(
-  taskId: string,
-  files: Array<Omit<ResultFile, "id" | "createdAt">>
-): Array<Omit<ResultFile, "id" | "createdAt">> {
+function syncResultFilesToManagedStorage(taskId: string, files: GeneratedResultFile[]): GeneratedResultFile[] {
   const managedRoot = resultOutputPath(taskId);
   fs.mkdirSync(managedRoot, { recursive: true });
 
@@ -442,7 +475,12 @@ function syncResultFilesToManagedStorage(
   });
 }
 
-function replaceResultFiles(taskId: string, files: Array<Omit<ResultFile, "id" | "createdAt">>): void {
+function finalizeTaskWithResultFiles(
+  taskId: string,
+  files: GeneratedResultFile[],
+  patch: Partial<ConversionTask>,
+  statuses: TaskStatus[]
+): boolean {
   const db = getDb();
   const insert = db.prepare(
     `INSERT INTO result_files (
@@ -452,41 +490,113 @@ function replaceResultFiles(taskId: string, files: Array<Omit<ResultFile, "id" |
     )`
   );
 
-  runTransaction(() => {
-    db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
-    files.forEach((file) => {
-      insert.run({
-        ...file,
-        id: randomUUID(),
-        downloadable: file.downloadable ? 1 : 0,
-        previewable: file.previewable ? 1 : 0,
-        createdAt: nowIso()
+  try {
+    return runTransaction(() => {
+      if (!isTaskInStatus(taskId, statuses)) {
+        return false;
+      }
+      db.prepare("DELETE FROM result_files WHERE taskId = ?").run(taskId);
+      files.forEach((file) => {
+        insert.run({
+          ...file,
+          id: randomUUID(),
+          downloadable: file.downloadable ? 1 : 0,
+          previewable: isResultFilePreviewable(file) ? 1 : 0,
+          createdAt: nowIso()
+        });
       });
+      if (!updateTaskIfStatus(taskId, patch, statuses)) {
+        throw new TaskFinalizeStateError();
+      }
+      return true;
     });
-  });
+  } catch (error) {
+    if (error instanceof TaskFinalizeStateError) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function cleanupManagedResultCopies(taskId: string): void {
+  removeTaskArtifact(resultOutputPath(taskId));
+}
+
+function removeTaskArtifact(targetPath: string, retries = 8): void {
+  try {
+    removeIfExists(targetPath);
+  } catch {
+    if (retries <= 0) {
+      return;
+    }
+    const timer = setTimeout(() => removeTaskArtifact(targetPath, retries - 1), 1000);
+    timer.unref?.();
+  }
 }
 
 function updateProgressIfRunning(taskId: string, progress: number): void {
-  const task = getTask(taskId);
-  if (task.status !== "running") {
+  const task = findTask(taskId);
+  if (!task || task.status !== "running") {
     return;
   }
   const next = Math.max(task.progress, Math.min(progress, 99));
-  getDb().prepare("UPDATE conversion_tasks SET progress = ? WHERE id = ?").run(next, taskId);
+  updateTaskIfStatus(taskId, { progress: next }, ["running"]);
+}
+
+function findTask(id: string): ConversionTask | null {
+  try {
+    return getTask(id);
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function isTaskInStatus(id: string, statuses: TaskStatus[]): boolean {
+  const row = getDb().prepare("SELECT status FROM conversion_tasks WHERE id = ?").get(id) as
+    | { status: TaskStatus }
+    | undefined;
+  return Boolean(row && statuses.includes(row.status));
 }
 
 function updateTask(id: string, patch: Partial<ConversionTask>): void {
+  updateTaskWhere(id, patch);
+}
+
+function updateTaskIfStatus(
+  id: string,
+  patch: Partial<ConversionTask>,
+  statuses: TaskStatus[]
+): boolean {
+  return updateTaskWhere(id, patch, statuses);
+}
+
+function updateTaskWhere(
+  id: string,
+  patch: Partial<ConversionTask>,
+  statuses?: TaskStatus[]
+): boolean {
   const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
   if (!entries.length) {
-    return;
+    return false;
   }
 
   const fields = entries.map(([key]) => `${key} = @${key}`).join(", ");
   const values = Object.fromEntries(entries);
-  getDb().prepare(`UPDATE conversion_tasks SET ${fields} WHERE id = @id`).run({
+  const statusClause = statuses?.length
+    ? ` AND status IN (${statuses.map((_, index) => `@status${index}`).join(", ")})`
+    : "";
+  const statusParams = Object.fromEntries(
+    (statuses || []).map((status, index) => [`status${index}`, status])
+  );
+  const result = getDb().prepare(`UPDATE conversion_tasks SET ${fields} WHERE id = @id${statusClause}`).run({
     ...values,
-    id
+    id,
+    ...statusParams
   });
+  return Number(result.changes) > 0;
 }
 
 function buildRuntimeParameters(
@@ -555,6 +665,55 @@ function setCaseInsensitiveValue(target: Record<string, unknown>, key: string, v
   target[existingKey || key] = value;
 }
 
+function deleteCaseInsensitiveValue(target: Record<string, unknown>, key: string): void {
+  const existingKey = Object.keys(target).find((candidate) => candidate.toUpperCase() === key.toUpperCase());
+  if (existingKey) {
+    delete target[existingKey];
+  }
+}
+
+function resetRerunOutputParameters(
+  parameters: Record<string, unknown>,
+  task: ConversionTask,
+  templateParameters: Array<Pick<
+    TemplateParameter,
+    "name" | "label" | "type" | "defaultValue" | "description" | "direction" | "pathKind"
+  >>,
+  preserveExplicitCustomPaths: boolean
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...parameters };
+  const outputParameterNames = new Set(["OUTPUT_DIR", "OUTPUT_DIRECTORY", "OUTPUT_PATH"]);
+  for (const parameter of templateParameters) {
+    if (isOutputDirectoryParameter(parameter)) {
+      outputParameterNames.add(parameter.name);
+    }
+  }
+
+  for (const parameterName of outputParameterNames) {
+    const currentValue = getCaseInsensitiveValue(merged, parameterName);
+    if (currentValue === undefined) {
+      continue;
+    }
+    if (!preserveExplicitCustomPaths || pathValueInsideTaskOutput(currentValue, task.outputPath)) {
+      deleteCaseInsensitiveValue(merged, parameterName);
+    }
+  }
+  return merged;
+}
+
+function pathValueInsideTaskOutput(value: unknown, outputPath: string): boolean {
+  const selectedPath = firstAbsolutePath(value);
+  if (!selectedPath) {
+    return false;
+  }
+  const normalizedOutputPath = path.resolve(outputPath).toLowerCase();
+  const normalizedSelectedPath = path.resolve(selectedPath).toLowerCase();
+  return (
+    normalizedSelectedPath === normalizedOutputPath ||
+    normalizedSelectedPath.startsWith(`${normalizedOutputPath}${path.sep}`)
+  );
+}
+
 function resolveTaskOutputPath(
   parameters: Record<string, unknown>,
   templateParameters: Array<Pick<
@@ -589,6 +748,16 @@ function firstAbsolutePath(value: unknown): string | null {
   return normalized && path.isAbsolute(normalized) ? path.resolve(normalized) : null;
 }
 
+function isResultFilePreviewable(
+  file: Pick<ResultFile, "fileName" | "fileSize" | "previewable">
+): boolean {
+  const fileType = getResultFileType(file.fileName);
+  const exceedsJsonPreviewLimit =
+    fileType === "json" &&
+    file.fileSize > 5 * 1024 * 1024;
+  return Boolean(file.previewable) && isPreviewable(file.fileName) && !exceedsJsonPreviewLimit;
+}
+
 function mapTaskRow(row: TaskRow): ConversionTask {
   const derivedDuration = row.startedAt && row.finishedAt
     ? Math.max(0, new Date(row.finishedAt).getTime() - new Date(row.startedAt).getTime())
@@ -603,17 +772,15 @@ function mapTaskRow(row: TaskRow): ConversionTask {
 
 function mapResultFileRow(row: ResultFileRow): ResultFile {
   const fileType = getResultFileType(row.fileName);
-  const exceedsJsonPreviewLimit =
-    fileType === "json" &&
-    row.fileSize > 5 * 1024 * 1024;
   return {
     ...row,
     fileType,
     downloadable: Boolean(row.downloadable),
-    previewable:
-      Boolean(row.previewable) &&
-      isPreviewable(row.fileName) &&
-      !exceedsJsonPreviewLimit
+    previewable: isResultFilePreviewable({
+      fileName: row.fileName,
+      fileSize: row.fileSize,
+      previewable: Boolean(row.previewable)
+    })
   };
 }
 
