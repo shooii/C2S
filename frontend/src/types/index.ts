@@ -46,6 +46,8 @@ export interface ParameterOption {
   value: string;
 }
 
+export type ParameterVisibilityRule = Record<string, unknown>;
+
 export interface TemplateParameter {
   id: string;
   templateId: string;
@@ -58,6 +60,7 @@ export interface TemplateParameter {
   direction: ParameterDirection;
   pathKind: ParameterPathKind;
   multiple: boolean;
+  visibility: ParameterVisibilityRule | null;
   description: string | null;
   sortOrder: number;
 }

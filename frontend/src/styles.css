@@ -213,13 +213,15 @@ body {
 }
 
 .detail-log-view {
-  width: max-content;
+  width: 100%;
   min-width: 100%;
   min-height: 100%;
   height: auto;
   max-height: none;
   overflow: visible;
-  white-space: pre;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .parameter-log-view {

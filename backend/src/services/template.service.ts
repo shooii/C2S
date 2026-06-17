@@ -5,6 +5,7 @@ import type {
   ParameterDirection,
   ParameterOption,
   ParameterPathKind,
+  ParameterVisibilityRule,
   ParseStatus,
   TemplateDetail,
   TemplateParameter,
@@ -19,10 +20,11 @@ type TemplateRow = Omit<TemplateRecord, "tags" | "enabled"> & {
   tags: string;
   enabled: number;
 };
-type ParameterRow = Omit<TemplateParameter, "required" | "options" | "multiple"> & {
+type ParameterRow = Omit<TemplateParameter, "required" | "options" | "multiple" | "visibility"> & {
   required: number;
   options: string;
   multiple: number;
+  visibility: string | null;
 };
 
 export interface UpdateTemplateConfigurationInput {
@@ -204,10 +206,10 @@ export async function parseTemplate(id: string): Promise<TemplateDetail> {
     const insertParameter = db.prepare(
       `INSERT INTO template_parameters (
         id, templateId, name, label, type, defaultValue, required, options,
-        direction, pathKind, multiple, description, sortOrder
+        direction, pathKind, multiple, visibility, description, sortOrder
       ) VALUES (
         @id, @templateId, @name, @label, @type, @defaultValue, @required, @options,
-        @direction, @pathKind, @multiple, @description, @sortOrder
+        @direction, @pathKind, @multiple, @visibility, @description, @sortOrder
       )`
     );
 
@@ -236,6 +238,7 @@ export async function parseTemplate(id: string): Promise<TemplateDetail> {
           direction: parameter.direction,
           pathKind: parameter.pathKind,
           multiple: parameter.multiple ? 1 : 0,
+          visibility: parameter.visibility ? JSON.stringify(parameter.visibility) : null,
           description: parameter.description,
           sortOrder: index
         });
@@ -366,7 +369,8 @@ function mapParameterRow(row: ParameterRow): TemplateParameter {
     multiple: Boolean(row.multiple),
     direction: normalizeDirection(row.direction),
     pathKind: normalizePathKind(row.pathKind),
-    options: safeParameterOptions(row.options)
+    options: safeParameterOptions(row.options),
+    visibility: safeVisibilityRule(row.visibility)
   };
 }
 
@@ -407,6 +411,20 @@ function safeParameterOptions(value: string | null): ParameterOption[] {
       .filter((option): option is ParameterOption => Boolean(option));
   } catch {
     return [];
+  }
+}
+
+function safeVisibilityRule(value: string | null): ParameterVisibilityRule | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as ParameterVisibilityRule
+      : null;
+  } catch {
+    return null;
   }
 }
 

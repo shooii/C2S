@@ -77,6 +77,8 @@ export default function TemplateConfig() {
   const [parameterLabels, setParameterLabels] = useState<Record<string, string>>({});
   const [savingConfiguration, setSavingConfiguration] = useState(false);
   const [parsing, setParsing] = useState(false);
+  const watchedParameterValues = Form.useWatch("parameters", form);
+  const parameterValues = (watchedParameterValues || form.getFieldValue("parameters") || {}) as Record<string, unknown>;
 
   const applyTemplateDetail = (detail: TemplateDetail) => {
     setTemplate(detail);
@@ -115,7 +117,14 @@ export default function TemplateConfig() {
     void load();
   }, [id, form, message]);
 
-  const requiredCount = useMemo(() => template?.parameters.filter((item) => item.required).length || 0, [template]);
+  const visibleParameters = useMemo(
+    () => getVisibleParameters(template?.parameters || [], parameterValues),
+    [parameterValues, template]
+  );
+  const requiredCount = useMemo(
+    () => visibleParameters.filter((item) => item.required).length,
+    [visibleParameters]
+  );
   const configurationChanged = useMemo(() => {
     if (!template) {
       return false;
@@ -218,7 +227,12 @@ export default function TemplateConfig() {
     const taskPromise = api.runTask({
       templateId: template.id,
       taskName: `${template.name} 转换任务`,
-      parameters: normalizeParameters(values.parameters || {})
+      parameters: normalizeParameters(
+        pickVisibleParameterValues(
+          values.parameters || {},
+          getVisibleParameters(template.parameters, values.parameters || {})
+        )
+      )
     });
 
     navigate("/results", {
@@ -298,8 +312,8 @@ export default function TemplateConfig() {
       <div className="config-grid">
         <Card className="form-card" title="运行参数">
           <Form form={form} layout="vertical" onFinish={submit}>
-            {template.parameters.length ? (
-              template.parameters.map((parameter) => renderParameterItem(
+            {visibleParameters.length ? (
+              visibleParameters.map((parameter) => renderParameterItem(
                 parameter,
                 parameterLabels[parameter.id] || parameter.label || parameter.name,
                 (label) => setParameterLabels((current) => ({
@@ -374,6 +388,152 @@ export default function TemplateConfig() {
       </div>
     </div>
   );
+}
+
+function getVisibleParameters(
+  parameters: TemplateParameter[],
+  values: Record<string, unknown>
+): TemplateParameter[] {
+  return parameters.filter((parameter) => isParameterVisible(parameter, values));
+}
+
+function pickVisibleParameterValues(
+  values: Record<string, unknown>,
+  visibleParameters: TemplateParameter[]
+): Record<string, unknown> {
+  const visibleNames = new Set(visibleParameters.map((parameter) => parameter.name));
+  return Object.fromEntries(
+    Object.entries(values).filter(([name]) => visibleNames.has(name))
+  );
+}
+
+function isParameterVisible(
+  parameter: TemplateParameter,
+  values: Record<string, unknown>
+): boolean {
+  const visibilityResult = evaluateVisibilityRule(parameter.visibility, values);
+  if (visibilityResult !== null) {
+    return visibilityResult;
+  }
+
+  if (isDatasmithOnlyParameter(parameter)) {
+    return isDatasmithOutputValue(getOutputFormatValue(values));
+  }
+
+  return true;
+}
+
+function evaluateVisibilityRule(
+  rule: TemplateParameter["visibility"],
+  values: Record<string, unknown>
+): boolean | null {
+  if (!isRecord(rule)) {
+    return null;
+  }
+
+  const branches = Array.isArray(rule.if)
+    ? rule.if
+    : isRecord(rule.if)
+      ? [rule.if]
+      : null;
+  if (!branches) {
+    return null;
+  }
+
+  for (const branch of branches) {
+    if (!isRecord(branch)) {
+      continue;
+    }
+    const action = typeof branch.then === "string" ? branch.then : null;
+    const hasCondition = Object.keys(branch).some((key) => key !== "then");
+    if ((!hasCondition || evaluateVisibilityCondition(branch, values)) && action) {
+      return /^visible/i.test(action);
+    }
+  }
+
+  return null;
+}
+
+function evaluateVisibilityCondition(condition: unknown, values: Record<string, unknown>): boolean {
+  if (!isRecord(condition)) {
+    return Boolean(condition);
+  }
+
+  if (Array.isArray(condition.$allOf)) {
+    return condition.$allOf.every((item) => evaluateVisibilityCondition(item, values));
+  }
+  if (Array.isArray(condition.$anyOf)) {
+    return condition.$anyOf.some((item) => evaluateVisibilityCondition(item, values));
+  }
+  if (Array.isArray(condition.$or)) {
+    return condition.$or.some((item) => evaluateVisibilityCondition(item, values));
+  }
+  if (Array.isArray(condition.$and)) {
+    return condition.$and.every((item) => evaluateVisibilityCondition(item, values));
+  }
+  if ("$not" in condition) {
+    return !evaluateVisibilityCondition(condition.$not, values);
+  }
+  if (isRecord(condition.$equals)) {
+    const parameterName = stringValue(condition.$equals.parameter);
+    if (!parameterName) {
+      return false;
+    }
+    return parameterValueEquals(
+      getParameterValue(values, parameterName),
+      condition.$equals.value
+    );
+  }
+  if (isRecord(condition.$isEnabled)) {
+    return Boolean(stringValue(condition.$isEnabled.parameter));
+  }
+
+  const nestedConditions = Object.entries(condition).filter(([key]) => key !== "then");
+  return nestedConditions.length
+    ? nestedConditions.every(([, value]) => evaluateVisibilityCondition(value, values))
+    : true;
+}
+
+function parameterValueEquals(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(actual)) {
+    return actual.some((item) => parameterValueEquals(item, expected));
+  }
+  if (Array.isArray(expected)) {
+    return expected.some((item) => parameterValueEquals(actual, item));
+  }
+  return stringValue(actual).toUpperCase() === stringValue(expected).toUpperCase();
+}
+
+function getParameterValue(values: Record<string, unknown>, parameterName: string): unknown {
+  if (Object.prototype.hasOwnProperty.call(values, parameterName)) {
+    return values[parameterName];
+  }
+  const normalizedName = parameterName.toLowerCase();
+  const matchingKey = Object.keys(values).find((key) => key.toLowerCase() === normalizedName);
+  return matchingKey ? values[matchingKey] : undefined;
+}
+
+function getOutputFormatValue(values: Record<string, unknown>): unknown {
+  const matchingKey = Object.keys(values).find((key) => /output[_\s-]*format|输出文件格式|输出格式/i.test(key));
+  return matchingKey ? values[matchingKey] : undefined;
+}
+
+function isDatasmithOnlyParameter(parameter: TemplateParameter): boolean {
+  const text = `${parameter.name} ${parameter.label}`.toLowerCase();
+  return /datasmith|unreal|ue工程|工程坐标原点/i.test(text)
+    && /wgs84|经度|纬度|坐标原点/i.test(text);
+}
+
+function isDatasmithOutputValue(value: unknown): boolean {
+  return /UDATASMITH|DATASMITH|Epic Games Unreal Datasmith/i.test(stringValue(value));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringValue(value: unknown): string {
+  return value === undefined || value === null ? "" : String(value).trim();
 }
 
 export function renderParameterItem(

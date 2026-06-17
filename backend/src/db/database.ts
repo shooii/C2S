@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS template_parameters (
   direction TEXT NOT NULL DEFAULT 'none',
   pathKind TEXT,
   multiple INTEGER NOT NULL DEFAULT 0,
+  visibility TEXT,
   description TEXT,
   sortOrder INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (templateId) REFERENCES templates(id) ON DELETE CASCADE
@@ -156,6 +157,9 @@ function migrateDatabase(database: SqliteDatabase): void {
   }
   if (!parameterColumns.some((column) => column.name === "multiple")) {
     database.exec("ALTER TABLE template_parameters ADD COLUMN multiple INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!parameterColumns.some((column) => column.name === "visibility")) {
+    database.exec("ALTER TABLE template_parameters ADD COLUMN visibility TEXT");
   }
   migrateParameterMetadata(database);
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");

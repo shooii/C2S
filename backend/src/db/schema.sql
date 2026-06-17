@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS template_parameters (
   direction TEXT NOT NULL DEFAULT 'none',
   pathKind TEXT,
   multiple INTEGER NOT NULL DEFAULT 0,
+  visibility TEXT,
   description TEXT,
   sortOrder INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (templateId) REFERENCES templates(id) ON DELETE CASCADE

@@ -8,6 +8,7 @@ import type {
   ParameterDirection,
   ParameterOption,
   ParameterPathKind,
+  ParameterVisibilityRule,
   ParameterType,
   ResultFile
 } from "../types";
@@ -23,6 +24,7 @@ export interface ParsedWorkspaceParameter {
   direction: ParameterDirection;
   pathKind: ParameterPathKind;
   multiple: boolean;
+  visibility: ParameterVisibilityRule | null;
   description: string | null;
   sortOrder: number;
 }
@@ -60,6 +62,11 @@ interface ProgressStream {
   total: number;
   samples: number;
   percent: number;
+}
+
+interface PercentProgressState {
+  phaseIndex: number;
+  lastPercent: number | null;
 }
 
 const runningProcesses = new Map<string, ChildProcessWithoutNullStreams>();
@@ -649,8 +656,9 @@ function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
         options: parseOptions(parsedGui?.choices || null)
       }),
       defaultValue,
-      required: /required|mandatory/i.test(guiLine),
+      required: inferGuiLineRequired(guiLine),
       options: parseOptions(parsedGui?.choices || null),
+      visibility: null,
       description: attrs.DESCRIPTION || attrs.HELP || null,
       sortOrder: parameters.length
     });
@@ -722,6 +730,7 @@ function parseTextBlocks(text: string): ParsedWorkspaceParameter[] {
       defaultValue: defaultValue || null,
       required,
       options,
+      visibility: null,
       description,
       sortOrder: parameters.length
     });
@@ -756,6 +765,7 @@ function parseCommandLineParameters(text: string): ParsedWorkspaceParameter[] {
       defaultValue,
       required: false,
       options: [],
+      visibility: null,
       description: null,
       sortOrder: parameters.length
     });
@@ -794,6 +804,7 @@ function parsePackagedPathParameters(text: string): ParsedWorkspaceParameter[] {
       defaultValue,
       required: false,
       options: [],
+      visibility: null,
       description: "FMWT 模板包内置数据路径",
       sortOrder: parameters.length
     });
@@ -851,11 +862,40 @@ function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspacePar
     label,
     ...metadata,
     defaultValue,
-    required: Boolean(raw.required ?? raw.mandatory ?? false),
+    required: inferRawParameterRequired(raw),
     options: rawOptions,
+    visibility: normalizeVisibilityRule(raw.visibility),
     description: stringValue(raw.description ?? raw.help ?? raw.tooltip),
     sortOrder: 0
   };
+}
+
+function normalizeVisibilityRule(value: unknown): ParameterVisibilityRule | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as ParameterVisibilityRule;
+}
+
+function inferRawParameterRequired(raw: Record<string, unknown>): boolean {
+  const required = raw.required ?? raw.mandatory;
+  if (typeof required === "boolean") {
+    return required;
+  }
+  if (required !== undefined && required !== null) {
+    return /^(true|yes|1|required|mandatory)$/i.test(String(required).trim());
+  }
+  return true;
+}
+
+function inferGuiLineRequired(guiLine: string): boolean {
+  if (/\bOPTIONAL\b/i.test(guiLine)) {
+    return false;
+  }
+  if (/\b(required|mandatory)\b/i.test(guiLine)) {
+    return true;
+  }
+  return true;
 }
 
 function normalizeParameters(parameters: ParsedWorkspaceParameter[]): ParsedWorkspaceParameter[] {
@@ -1295,6 +1335,10 @@ function prettifyName(name: string): string {
 
 function createProgressTracker(): (chunk: string) => number | null {
   const streams = new Map<string, ProgressStream>();
+  const percentProgressState: PercentProgressState = {
+    phaseIndex: 0,
+    lastPercent: null
+  };
   let pendingLine = "";
   let activeKey: string | null = null;
 
@@ -1314,7 +1358,7 @@ function createProgressTracker(): (chunk: string) => number | null {
       if (explicitPercent !== null) {
         latestProgress = Math.max(
           latestProgress ?? 0,
-          scaleFmeExecutionProgress(explicitPercent)
+          scalePercentProgress(explicitPercent, percentProgressState)
         );
         continue;
       }
@@ -1336,7 +1380,7 @@ function createProgressTracker(): (chunk: string) => number | null {
         activeKey = stream.key;
         latestProgress = Math.max(
           latestProgress ?? 0,
-          scaleFmeExecutionProgress(stream.percent)
+          scaleMeasuredProgress(stream.percent)
         );
       }
     }
@@ -1404,16 +1448,16 @@ function extractPhaseProgress(line: string): number | null {
     return 10;
   }
   if (/Reading\.\.\.|Start(?:ed|ing)? translation|Begin(?:ning)? translation/i.test(line)) {
-    return 15;
+    return 12;
   }
-  if (/Emptying factory pipeline|factory pipeline|Writing\.\.\.|writer/i.test(line)) {
-    return 30;
+  if (/Emptying factory pipeline|factory pipeline/i.test(line)) {
+    return 14;
+  }
+  if (/Writing\.\.\./i.test(line)) {
+    return 72;
   }
   if (/Translation was SUCCESSFUL|Translation finished|Translation complete/i.test(line)) {
     return 94;
-  }
-  if (/Translation was FAILED|Translation FAILED|Translation terminated|FME Session Duration/i.test(line)) {
-    return 92;
   }
   return null;
 }
@@ -1442,9 +1486,30 @@ function normalizePercentValue(value: number): number {
   return Math.max(0, Math.min(100, value));
 }
 
-function scaleFmeExecutionProgress(value: number): number {
+function scalePercentProgress(value: number, state: PercentProgressState): number {
   const percent = normalizePercentValue(value);
-  return Math.max(15, Math.min(90, Math.round(15 + percent * 0.75)));
+  if (state.lastPercent !== null && percent + 8 < state.lastPercent) {
+    state.phaseIndex += 1;
+  }
+  state.lastPercent = percent;
+
+  const phase = progressPhaseRange(state.phaseIndex);
+  return Math.round(phase.start + (phase.end - phase.start) * (percent / 100));
+}
+
+function scaleMeasuredProgress(value: number): number {
+  const percent = normalizePercentValue(value);
+  return Math.round(18 + percent * 0.62);
+}
+
+function progressPhaseRange(phaseIndex: number): { start: number; end: number } {
+  const cappedIndex = Math.max(0, phaseIndex);
+  const start = 18 + 52 * (1 - Math.exp(-cappedIndex / 3));
+  const width = Math.max(4, 14 * Math.exp(-cappedIndex / 4));
+  return {
+    start,
+    end: Math.min(88, start + width)
+  };
 }
 
 function firstNonEmptyLine(text: string): string | undefined {
