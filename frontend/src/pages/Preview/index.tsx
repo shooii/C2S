@@ -226,7 +226,7 @@ function ThreeGltfPreview({ url }: { url: string }) {
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a1728);
-    const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 10000);
+    const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 1000);
     camera.position.set(8, 6, 8);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -241,7 +241,8 @@ function ThreeGltfPreview({ url }: { url: string }) {
     const directional = new THREE.DirectionalLight(0xffffff, 2.2);
     directional.position.set(5, 8, 5);
     scene.add(directional);
-    scene.add(new THREE.GridHelper(24, 24, 0x2a6ecb, 0x27425f));
+    const grid = new THREE.GridHelper(24, 24, 0x2a6ecb, 0x27425f);
+    scene.add(grid);
 
     const loader = new GLTFLoader();
     let model: THREE.Object3D | null = null;
@@ -249,12 +250,20 @@ function ThreeGltfPreview({ url }: { url: string }) {
       model = gltf.scene;
       scene.add(model);
       const box = new THREE.Box3().setFromObject(model);
-      const size = box.getSize(new THREE.Vector3()).length();
       const center = box.getCenter(new THREE.Vector3());
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const radius = Number.isFinite(sphere.radius) && sphere.radius > 0 ? sphere.radius : 1;
+      const distance = Math.max(radius / Math.sin(THREE.MathUtils.degToRad(camera.fov) / 2), 1);
       model.position.sub(center);
-      camera.position.set(size * 0.9, size * 0.65, size * 0.9);
+      camera.near = Math.max(distance / 5000, 0.01);
+      camera.far = Math.max(distance + radius * 4, 1000);
+      camera.updateProjectionMatrix();
+      camera.position.copy(new THREE.Vector3(0.9, 0.65, 0.9).normalize().multiplyScalar(distance));
+      controls.minDistance = Math.max(radius / 1000, 0.1);
+      controls.maxDistance = camera.far * 0.8;
       controls.target.set(0, 0, 0);
       controls.update();
+      grid.scale.setScalar(Math.max(radius / 12, 1));
       setStatus("ready");
     }, undefined, (error) => {
       setStatus("error");
