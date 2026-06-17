@@ -7,6 +7,7 @@ import {
   assertPathInside,
   getResultFileType,
   isPreviewable,
+  listFilesRecursive,
   removeIfExists,
   resultOutputPath
 } from "./file.service";
@@ -126,6 +127,15 @@ export function getResultFile(taskId: string, fileId: string): ResultFile {
   const mapped = mapResultFileRow(file);
   assertPathInside(resultOutputPath(taskId), mapped.filePath);
   return mapped;
+}
+
+export function recoverInterruptedTasks(): number {
+  const interruptedTasks = listTasks().filter((task) => (
+    task.status === "pending" || task.status === "running"
+  ));
+
+  interruptedTasks.forEach(recoverInterruptedTask);
+  return interruptedTasks.length;
 }
 
 export function createAndRunTask(input: CreateTaskInput): ConversionTask {
@@ -453,6 +463,32 @@ function tryCollectGeneratedFiles(
   }
 }
 
+function collectGeneratedFilesSince(
+  taskId: string,
+  outputPath: string,
+  sinceMs: number
+): GeneratedResultSummary {
+  const generatedFiles: GeneratedResultFile[] = listFilesRecursive(outputPath)
+    .filter((file) => file.modifiedAt >= sinceMs)
+    .map((file) => ({
+      taskId,
+      fileName: file.fileName,
+      fileType: getResultFileType(file.fileName),
+      fileSize: file.fileSize,
+      filePath: file.filePath,
+      downloadable: true,
+      previewable: isPreviewable(file.fileName)
+    }));
+  const files = syncResultFilesToManagedStorage(taskId, generatedFiles);
+
+  return {
+    files,
+    resultSize: files.reduce((total, file) => total + file.fileSize, 0),
+    hasPreviewableFiles: files.some((file) => isResultFilePreviewable(file)),
+    hasDownloadableFiles: files.some((file) => file.downloadable)
+  };
+}
+
 function syncResultFilesToManagedStorage(taskId: string, files: GeneratedResultFile[]): GeneratedResultFile[] {
   const managedRoot = resultOutputPath(taskId);
   fs.mkdirSync(managedRoot, { recursive: true });
@@ -473,6 +509,57 @@ function syncResultFilesToManagedStorage(taskId: string, files: GeneratedResultF
       filePath: managedPath
     };
   });
+}
+
+function recoverInterruptedTask(task: ConversionTask): void {
+  const finishedAt = nowIso();
+  const startedAt = task.startedAt || task.createdAt;
+  const startedTime = new Date(startedAt).getTime();
+  const resultFiles = collectGeneratedFilesSince(
+    task.id,
+    task.outputPath,
+    Number.isFinite(startedTime) ? startedTime - 1000 : 0
+  );
+  const loggedExitCode = readLoggedExitCode(task.logPath);
+  const recoveredSuccess = loggedExitCode === 0;
+  const duration = task.startedAt
+    ? Math.max(0, new Date(finishedAt).getTime() - new Date(task.startedAt).getTime())
+    : null;
+
+  const finalized = finalizeTaskWithResultFiles(task.id, resultFiles.files, {
+    status: recoveredSuccess ? "success" : "failed",
+    progress: recoveredSuccess ? 100 : Math.max(task.progress, resultFiles.files.length ? 95 : 0),
+    resultSize: resultFiles.resultSize,
+    previewUrl: resultFiles.hasPreviewableFiles ? `/api/results/${task.id}/preview` : null,
+    downloadUrl: resultFiles.hasDownloadableFiles ? `/api/results/${task.id}/download` : null,
+    exitCode: loggedExitCode,
+    errorMessage: recoveredSuccess
+      ? null
+      : task.status === "pending"
+        ? "后端服务重启前任务尚未开始，请重新运行。"
+        : "后端服务在任务运行期间重启，任务已中断；请重新运行。",
+    finishedAt,
+    duration
+  }, ["pending", "running"]);
+
+  if (!finalized) {
+    cleanupManagedResultCopies(task.id);
+  }
+}
+
+function readLoggedExitCode(logPath: string): number | null {
+  if (!fs.existsSync(logPath)) {
+    return null;
+  }
+
+  const logText = fs.readFileSync(logPath, "utf8");
+  const matches = [...logText.matchAll(/\[C2S\]\s+Exit code:\s*(-?\d+|null)/gi)];
+  const latest = matches.at(-1)?.[1];
+  if (!latest || latest.toLowerCase() === "null") {
+    return null;
+  }
+  const exitCode = Number(latest);
+  return Number.isFinite(exitCode) ? exitCode : null;
 }
 
 function finalizeTaskWithResultFiles(

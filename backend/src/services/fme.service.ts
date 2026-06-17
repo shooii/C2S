@@ -1344,7 +1344,7 @@ function createProgressTracker(): (chunk: string) => number | null {
 
   return (chunk: string) => {
     const text = pendingLine + chunk;
-    const lines = text.split(/\r?\n/);
+    const lines = splitProgressLines(text);
     pendingLine = text.endsWith("\n") || text.endsWith("\r") ? "" : lines.pop() ?? "";
 
     let latestProgress: number | null = null;
@@ -1387,6 +1387,10 @@ function createProgressTracker(): (chunk: string) => number | null {
 
     return latestProgress;
   };
+}
+
+function splitProgressLines(text: string): string[] {
+  return text.split(/\r\n|\n|\r/);
 }
 
 function extractPercentProgress(line: string): number | null {

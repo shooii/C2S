@@ -9,6 +9,7 @@ import localPathRoutes from "./routes/local-path.routes";
 import { ensureStorageDirs } from "./config/paths";
 import { getDb } from "./db/database";
 import { checkFmeAvailable } from "./services/fme.service";
+import { recoverInterruptedTasks } from "./services/task.service";
 import { HttpError } from "./utils/httpError";
 import { warmLocalPathSelector } from "./services/local-path.service";
 
@@ -17,6 +18,10 @@ const port = Number(process.env.PORT || 4000);
 
 ensureStorageDirs();
 getDb();
+const recoveredTaskCount = recoverInterruptedTasks();
+if (recoveredTaskCount > 0) {
+  console.warn(`Recovered ${recoveredTaskCount} interrupted task(s).`);
+}
 warmLocalPathSelector();
 
 // 配置 CORS，确保支持 UTF-8
