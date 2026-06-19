@@ -4,6 +4,7 @@ import type {
   FmeStatus,
   PreviewPayload,
   ResultFile,
+  ResultFileBrowserPage,
   TaskStatus,
   TemplateDetail,
   TemplateGroup,
@@ -179,8 +180,11 @@ export const api = {
 
   getTask: (id: string) => unwrap<ConversionTask>(http.get(`/api/tasks/${id}`)),
 
-  getTaskLogs: async (id: string) => {
-    const response = await http.get<string>(`/api/tasks/${id}/logs`, { responseType: "text" });
+  getTaskLogs: async (id: string, options?: { tailBytes?: number }) => {
+    const response = await http.get<string>(`/api/tasks/${id}/logs`, {
+      params: options?.tailBytes ? { tailBytes: options.tailBytes } : undefined,
+      responseType: "text"
+    });
     return response.data;
   },
 
@@ -196,6 +200,11 @@ export const api = {
   ) => unwrap<ConversionTask>(http.post(`/api/tasks/${id}/rerun`, payload || {})),
 
   getResultFiles: (taskId: string) => unwrap<ResultFile[]>(http.get(`/api/results/${taskId}/files`)),
+
+  browseResultFiles: (
+    taskId: string,
+    params?: { folder?: string; search?: string; page?: number; pageSize?: number }
+  ) => unwrap<ResultFileBrowserPage>(http.get(`/api/results/${taskId}/files`, { params })),
 
   getPreview: (taskId: string, fileId?: string) =>
     unwrap<PreviewPayload>(http.get(`/api/results/${taskId}/preview`, {

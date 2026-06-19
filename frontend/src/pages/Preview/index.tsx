@@ -21,6 +21,7 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../services/api";
+import { startDownload } from "../../services/download";
 import { TaskStatusTag } from "../../components/StatusTag";
 import type { PreviewPayload, ResultFile } from "../../types";
 
@@ -163,7 +164,7 @@ export default function Preview() {
                 type="link"
                 size="small"
                 icon={<DownloadOutlined />}
-                onClick={() => window.open(api.downloadUrl(payload.task.id, payload.file!.id), "_blank")}
+                onClick={() => startDownload(api.downloadUrl(payload.task.id, payload.file!.id))}
               >
                 下载
               </Button>

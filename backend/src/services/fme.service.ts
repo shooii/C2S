@@ -71,6 +71,8 @@ interface PercentProgressState {
 
 const runningProcesses = new Map<string, ChildProcessWithoutNullStreams>();
 let cachedFmeCommand: string | null = null;
+const PROGRESS_PARSE_INTERVAL_MS = 750;
+const PROGRESS_PARSE_BUFFER_LIMIT = 64 * 1024;
 
 export async function checkFmeAvailable(): Promise<FmeStatus> {
   const errors: string[] = [];
@@ -222,13 +224,11 @@ export async function runWorkspace(input: RunWorkspaceInput): Promise<RunWorkspa
 
   const logStream = fs.createWriteStream(input.logPath, { flags: "a" });
   const progressTracker = createProgressTracker();
+  const progressSampler = createProgressSampler(progressTracker, input.onProgress);
   const writeLog = (chunk: string) => {
     logStream.write(chunk);
     input.onLog?.(chunk);
-    const progress = progressTracker(chunk);
-    if (progress !== null) {
-      input.onProgress?.(progress);
-    }
+    progressSampler.push(chunk);
   };
 
   writeLog(`\n[C2S] Task ${input.taskId} started at ${new Date().toISOString()}\n`);
@@ -254,6 +254,8 @@ export async function runWorkspace(input: RunWorkspaceInput): Promise<RunWorkspa
       runningProcesses.delete(input.taskId);
       writeLog(`\n[C2S] Task ${input.taskId} finished at ${new Date().toISOString()}\n`);
       writeLog(`[C2S] Exit code: ${result.exitCode ?? "null"}; signal: ${result.signal ?? "none"}\n`);
+      progressSampler.flush();
+      progressSampler.dispose();
       logStream.end();
       resolve(result);
     };
@@ -273,6 +275,8 @@ export async function runWorkspace(input: RunWorkspaceInput): Promise<RunWorkspa
       settled = true;
       runningProcesses.delete(input.taskId);
       writeLog(`\n[C2S] Failed to start FME: ${error.message}\n`);
+      progressSampler.flush();
+      progressSampler.dispose();
       logStream.end();
       reject(error);
     });
@@ -1331,6 +1335,74 @@ function prettifyName(name: string): string {
     .replace(/^-+/, "")
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function createProgressSampler(
+  tracker: (chunk: string) => number | null,
+  onProgress?: (progress: number) => void
+): { push: (chunk: string) => void; flush: () => void; dispose: () => void } {
+  let buffer = "";
+  let lastParseAt = 0;
+  let timer: NodeJS.Timeout | null = null;
+
+  const clearTimer = () => {
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  const flush = () => {
+    clearTimer();
+    if (!buffer || !onProgress) {
+      buffer = "";
+      return;
+    }
+    const chunk = buffer;
+    buffer = "";
+    lastParseAt = Date.now();
+    const progress = tracker(chunk);
+    if (progress !== null) {
+      onProgress(progress);
+    }
+  };
+
+  const schedule = () => {
+    if (timer || !onProgress) {
+      return;
+    }
+    const delay = Math.max(0, PROGRESS_PARSE_INTERVAL_MS - (Date.now() - lastParseAt));
+    timer = setTimeout(flush, delay);
+    timer.unref?.();
+  };
+
+  const push = (chunk: string) => {
+    if (!onProgress) {
+      return;
+    }
+    buffer += chunk;
+    if (buffer.length > PROGRESS_PARSE_BUFFER_LIMIT) {
+      buffer = trimProgressBuffer(buffer);
+    }
+    if (Date.now() - lastParseAt >= PROGRESS_PARSE_INTERVAL_MS) {
+      flush();
+    } else {
+      schedule();
+    }
+  };
+
+  return {
+    push,
+    flush,
+    dispose: clearTimer
+  };
+}
+
+function trimProgressBuffer(value: string): string {
+  const tail = value.slice(-PROGRESS_PARSE_BUFFER_LIMIT);
+  const lineStart = tail.search(/[\r\n]/);
+  return lineStart >= 0 ? tail.slice(lineStart + 1) : tail;
 }
 
 function createProgressTracker(): (chunk: string) => number | null {

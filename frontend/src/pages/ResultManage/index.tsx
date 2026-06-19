@@ -27,6 +27,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { RerunTaskModal } from "../../components/RerunTaskModal";
 import { TaskStatusTag } from "../../components/StatusTag";
 import { api } from "../../services/api";
+import { startDownload } from "../../services/download";
 import {
   consumeCreatedTasks,
   TASK_SUBMISSION_SETTLED_EVENT
@@ -215,7 +216,7 @@ export default function ResultManage() {
     if (!task.downloadUrl) {
       return;
     }
-    window.open(api.downloadArchiveUrl(task.id), "_blank");
+    startDownload(api.downloadArchiveUrl(task.id));
   };
 
   const cancelTask = async (task: ConversionTask) => {

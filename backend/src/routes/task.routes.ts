@@ -96,7 +96,9 @@ router.get(
 router.get(
   "/:id/logs",
   asyncHandler(async (req, res) => {
-    res.type("text/plain").send(getTaskLogs(req.params.id));
+    res.type("text/plain").send(getTaskLogs(req.params.id, {
+      tailBytes: positiveIntegerQuery(req.query.tailBytes)
+    }));
   })
 );
 
@@ -189,6 +191,20 @@ function taskStatusField(value: unknown): TaskStatus | undefined {
     throw new HttpError(400, "不支持的任务状态");
   }
   return status;
+}
+
+function positiveIntegerQuery(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new HttpError(400, "query value must be a positive integer");
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new HttpError(400, "query value must be a positive integer");
+  }
+  return parsed;
 }
 
 function parseParameterUploadManifest(value: unknown): ParameterUploadManifestEntry[] {

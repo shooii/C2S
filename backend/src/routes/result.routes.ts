@@ -6,6 +6,7 @@ import AdmZip from "adm-zip";
 import {
   deleteResults,
   getResultFile,
+  getResultFileBrowserPage,
   getResultFiles,
   getTask
 } from "../services/task.service";
@@ -38,6 +39,18 @@ const previewDependencyExtensions = new Set([
 router.get(
   "/:taskId/files",
   asyncHandler(async (req, res) => {
+    if (hasBrowserPageQuery(req.query)) {
+      res.json({
+        data: getResultFileBrowserPage(req.params.taskId, {
+          folder: stringQuery(req.query.folder),
+          search: stringQuery(req.query.search),
+          page: positiveIntegerQuery(req.query.page),
+          pageSize: positiveIntegerQuery(req.query.pageSize)
+        })
+      });
+      return;
+    }
+
     res.json({ data: getResultFiles(req.params.taskId) });
   })
 );
@@ -271,6 +284,28 @@ function uniqueArchiveEntryName(entryName: string, usedNames: Set<string>): stri
   }
   usedNames.add(candidate);
   return candidate;
+}
+
+function hasBrowserPageQuery(query: Record<string, unknown>): boolean {
+  return ["folder", "search", "page", "pageSize"].some((key) => query[key] !== undefined);
+}
+
+function stringQuery(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function positiveIntegerQuery(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new HttpError(400, "query value must be a positive integer");
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new HttpError(400, "query value must be a positive integer");
+  }
+  return parsed;
 }
 
 function getArchiveFiles(taskId: string): ArchiveFile[] {

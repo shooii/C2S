@@ -136,6 +136,30 @@ export interface ResultFile {
   createdAt: string;
 }
 
+export interface ResultFileBrowserItem {
+  id: string;
+  name: string;
+  path: string;
+  type: "folder" | "file";
+  fileType: string;
+  fileSize: number;
+  fileCount: number;
+  latestCreatedAt: string | null;
+  file?: ResultFile;
+}
+
+export interface ResultFileBrowserPage {
+  items: ResultFileBrowserItem[];
+  total: number;
+  totalFiles: number;
+  page: number;
+  pageSize: number;
+  folder: string;
+  search: string;
+  hasPreviewableFiles: boolean;
+  hasDownloadableFiles: boolean;
+}
+
 export interface FmeStatus {
   available: boolean;
   command?: string;

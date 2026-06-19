@@ -2,7 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getDb, nowIso, runTransaction } from "../db/database";
-import type { ConversionTask, ResultFile, TaskStatus, TemplateParameter } from "../types";
+import type {
+  ConversionTask,
+  ResultFile,
+  ResultFileBrowserItem,
+  ResultFileBrowserPage,
+  TaskStatus,
+  TemplateParameter
+} from "../types";
 import {
   assertPathInside,
   getResultFileType,
@@ -40,9 +47,28 @@ interface GeneratedResultSummary {
   hasPreviewableFiles: boolean;
   hasDownloadableFiles: boolean;
 }
+interface TaskLogOptions {
+  tailBytes?: number;
+}
+interface ResultFileBrowserOptions {
+  folder?: string | null;
+  search?: string | null;
+  page?: number;
+  pageSize?: number;
+}
+interface TaskProgressReporter {
+  report: (progress: number) => void;
+  flush: (progress?: number) => number;
+  current: () => number;
+  dispose: () => void;
+}
 class TaskFinalizeStateError extends Error {}
 
 const TASK_EXECUTION_START_DELAY_MS = 200;
+const TASK_PROGRESS_UPDATE_INTERVAL_MS = 1000;
+const TASK_LOG_TAIL_PREFIX = "[C2S] 日志较长，仅显示最近内容。\n\n";
+const DEFAULT_RESULT_FILE_PAGE_SIZE = 20;
+const MAX_RESULT_FILE_PAGE_SIZE = 100;
 
 export interface CreateTaskInput {
   templateId: string;
@@ -98,13 +124,39 @@ export function getTask(id: string): ConversionTask {
   ));
 }
 
-export function getTaskLogs(id: string): string {
+export function getTaskLogs(id: string, options: TaskLogOptions = {}): string {
   getTask(id);
   const logPath = assertPathInside(logStorageDir, path.join(logStorageDir, `${id}.log`));
   if (!fs.existsSync(logPath)) {
     return "";
   }
-  return fs.readFileSync(logPath, "utf8");
+  const tailBytes = normalizeTailBytes(options.tailBytes);
+  if (!tailBytes) {
+    return fs.readFileSync(logPath, "utf8");
+  }
+
+  const stat = fs.statSync(logPath);
+  if (stat.size <= tailBytes) {
+    return fs.readFileSync(logPath, "utf8");
+  }
+
+  const bufferSize = Math.min(tailBytes, stat.size);
+  const buffer = Buffer.alloc(bufferSize);
+  const fd = fs.openSync(logPath, "r");
+  try {
+    fs.readSync(fd, buffer, 0, bufferSize, stat.size - bufferSize);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return `${TASK_LOG_TAIL_PREFIX}${buffer.toString("utf8")}`;
+}
+
+function normalizeTailBytes(value: number | undefined): number | null {
+  if (!value || !Number.isFinite(value)) {
+    return null;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : null;
 }
 
 export function getResultFiles(taskId: string): ResultFile[] {
@@ -114,6 +166,258 @@ export function getResultFiles(taskId: string): ResultFile[] {
       .prepare("SELECT * FROM result_files WHERE taskId = ? ORDER BY createdAt ASC")
       .all(taskId) as unknown as ResultFileRow[]
   ).map(mapResultFileRow);
+}
+
+export function getResultFileBrowserPage(
+  taskId: string,
+  options: ResultFileBrowserOptions = {}
+): ResultFileBrowserPage {
+  getTask(taskId);
+
+  const page = normalizePositiveInteger(options.page, 1);
+  const pageSize = Math.min(
+    normalizePositiveInteger(options.pageSize, DEFAULT_RESULT_FILE_PAGE_SIZE),
+    MAX_RESULT_FILE_PAGE_SIZE
+  );
+  const folder = normalizeResultFolderPath(options.folder);
+  const search = options.search?.trim() || "";
+  const db = getDb();
+  const totalFiles = numberFromRow(
+    db.prepare("SELECT COUNT(*) AS count FROM result_files WHERE taskId = ?").get(taskId)
+  );
+  const hasPreviewableFiles = Boolean(
+    db.prepare("SELECT 1 FROM result_files WHERE taskId = ? AND previewable = 1 LIMIT 1").get(taskId)
+  );
+  const hasDownloadableFiles = Boolean(
+    db.prepare("SELECT 1 FROM result_files WHERE taskId = ? AND downloadable = 1 LIMIT 1").get(taskId)
+  );
+
+  if (search) {
+    const searchPage = getSearchedResultFilePage(taskId, search, page, pageSize);
+    return {
+      ...searchPage,
+      totalFiles,
+      folder,
+      hasPreviewableFiles,
+      hasDownloadableFiles
+    };
+  }
+
+  const folderPage = getFolderResultFilePage(taskId, folder, page, pageSize);
+  return {
+    ...folderPage,
+    totalFiles,
+    search,
+    hasPreviewableFiles,
+    hasDownloadableFiles
+  };
+}
+
+function getSearchedResultFilePage(
+  taskId: string,
+  search: string,
+  page: number,
+  pageSize: number
+): Omit<ResultFileBrowserPage, "totalFiles" | "hasPreviewableFiles" | "hasDownloadableFiles"> {
+  const db = getDb();
+  const searchPattern = `%${escapeLikePattern(search.toLowerCase())}%`;
+  const params = {
+    taskId,
+    search: searchPattern
+  };
+  const pageParams = {
+    ...params,
+    limit: pageSize,
+    offset: (page - 1) * pageSize
+  };
+  const where = `
+    taskId = @taskId
+    AND (
+      lower(replace(fileName, '\\', '/')) LIKE @search ESCAPE '\\'
+      OR lower(fileType) LIKE @search ESCAPE '\\'
+    )
+  `;
+  const total = numberFromRow(
+    db.prepare(`SELECT COUNT(*) AS count FROM result_files WHERE ${where}`).get(params)
+  );
+  const rows = db.prepare(
+    `SELECT *
+     FROM result_files
+     WHERE ${where}
+     ORDER BY replace(fileName, '\\', '/') COLLATE NOCASE ASC, createdAt ASC
+     LIMIT @limit OFFSET @offset`
+  ).all(pageParams) as unknown as ResultFileRow[];
+
+  return {
+    items: rows.map((row) => resultFileToBrowserItem(mapResultFileRow(row))),
+    total,
+    page,
+    pageSize,
+    folder: "",
+    search
+  };
+}
+
+function getFolderResultFilePage(
+  taskId: string,
+  folder: string,
+  page: number,
+  pageSize: number
+): Omit<ResultFileBrowserPage, "totalFiles" | "search" | "hasPreviewableFiles" | "hasDownloadableFiles"> {
+  const db = getDb();
+  const scopedWhere = folder
+    ? "normalizedName LIKE @prefix ESCAPE '\\'"
+    : "normalizedName <> ''";
+  const baseParams = {
+    taskId,
+    folder,
+    restStart: folder.length + 2
+  };
+  const scopedParams = folder
+    ? {
+        ...baseParams,
+        prefix: `${escapeLikePattern(folder)}/%`
+      }
+    : baseParams;
+  const pageParams = {
+    ...scopedParams,
+    limit: pageSize,
+    offset: (page - 1) * pageSize
+  };
+  const cte = `
+    WITH normalized AS (
+      SELECT *, replace(fileName, '\\', '/') AS normalizedName
+      FROM result_files
+      WHERE taskId = @taskId
+    ),
+    scoped AS (
+      SELECT *,
+             CASE
+               WHEN @folder = '' THEN normalizedName
+               ELSE substr(normalizedName, @restStart)
+             END AS rest
+      FROM normalized
+      WHERE ${scopedWhere}
+    ),
+    children AS (
+      SELECT *,
+             CASE WHEN instr(rest, '/') > 0 THEN 'folder' ELSE 'file' END AS itemType,
+             CASE WHEN instr(rest, '/') > 0 THEN substr(rest, 1, instr(rest, '/') - 1) ELSE rest END AS childName
+      FROM scoped
+      WHERE rest <> ''
+    ),
+    grouped AS (
+      SELECT
+        CASE
+          WHEN itemType = 'folder' THEN 'folder:' || CASE WHEN @folder = '' THEN childName ELSE @folder || '/' || childName END
+          ELSE MIN(id)
+        END AS id,
+        childName AS name,
+        CASE WHEN @folder = '' THEN childName ELSE @folder || '/' || childName END AS path,
+        itemType AS type,
+        CASE WHEN itemType = 'folder' THEN 'folder' ELSE MIN(fileType) END AS fileType,
+        SUM(fileSize) AS fileSize,
+        COUNT(*) AS fileCount,
+        MAX(createdAt) AS latestCreatedAt,
+        MIN(taskId) AS taskId,
+        MIN(fileName) AS fileName,
+        MIN(filePath) AS filePath,
+        MAX(downloadable) AS downloadable,
+        MAX(previewable) AS previewable,
+        MIN(createdAt) AS createdAt
+      FROM children
+      GROUP BY itemType, childName
+    )
+  `;
+  const total = numberFromRow(
+    db.prepare(`${cte} SELECT COUNT(*) AS count FROM grouped`).get(scopedParams)
+  );
+  const rows = db.prepare(
+    `${cte}
+     SELECT *
+     FROM grouped
+     ORDER BY CASE type WHEN 'folder' THEN 0 ELSE 1 END, name COLLATE NOCASE ASC
+     LIMIT @limit OFFSET @offset`
+  ).all(pageParams) as unknown as Array<ResultFileBrowserItem & ResultFileRow>;
+
+  return {
+    items: rows.map(mapResultFileBrowserRow),
+    total,
+    page,
+    pageSize,
+    folder
+  };
+}
+
+function mapResultFileBrowserRow(row: ResultFileBrowserItem & ResultFileRow): ResultFileBrowserItem {
+  if (row.type === "folder") {
+    return {
+      id: row.id,
+      name: row.name,
+      path: row.path,
+      type: "folder",
+      fileType: "folder",
+      fileSize: Number(row.fileSize) || 0,
+      fileCount: Number(row.fileCount) || 0,
+      latestCreatedAt: row.latestCreatedAt
+    };
+  }
+
+  const file = mapResultFileRow(row);
+  return resultFileToBrowserItem(file);
+}
+
+function resultFileToBrowserItem(file: ResultFile): ResultFileBrowserItem {
+  const normalizedName = normalizeResultFileName(file.fileName);
+  const segments = normalizedName.split("/").filter(Boolean);
+  return {
+    id: file.id,
+    name: segments.at(-1) || file.fileName || "result-file",
+    path: normalizedName,
+    type: "file",
+    fileType: file.fileType,
+    fileSize: file.fileSize,
+    fileCount: 1,
+    latestCreatedAt: file.createdAt,
+    file
+  };
+}
+
+function normalizeResultFileName(fileName: string): string {
+  const normalized = fileName
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .join("/");
+  return normalized || fileName || "result-file";
+}
+
+function normalizeResultFolderPath(value: string | null | undefined): string {
+  if (!value) {
+    return "";
+  }
+  return value
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .join("/");
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (!value || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : fallback;
+}
+
+function numberFromRow(row: unknown): number {
+  const value = (row as { count?: number | bigint } | undefined)?.count;
+  return Number(value || 0);
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
 export function getResultFile(taskId: string, fileId: string): ResultFile {
@@ -347,6 +651,7 @@ async function executeTask(
   }
 
   const outputSnapshot = snapshotOutputFiles(task.outputPath);
+  const progressReporter = createTaskProgressReporter(taskId, 5);
 
   try {
     const runtimeParameters = enrichWorkspaceOutputParameters(
@@ -360,23 +665,25 @@ async function executeTask(
       parameters: runtimeParameters,
       outputPath: task.outputPath,
       logPath: task.logPath,
-      onProgress: (progress) => updateProgressIfRunning(taskId, progress)
+      onProgress: progressReporter.report
     });
+    progressReporter.flush();
 
     const current = findTask(taskId);
     if (!current || current.status === "cancelled") {
       return;
     }
 
-    updateProgressIfRunning(taskId, 95);
+    progressReporter.flush(95);
     const resultFiles = collectGeneratedFiles(taskId, task.outputPath, outputSnapshot);
-    updateProgressIfRunning(taskId, 98);
+    progressReporter.flush(98);
     const success = result.exitCode === 0;
     const latestTask = findTask(taskId) ?? current;
+    const latestProgress = Math.max(latestTask.progress, progressReporter.current(), 5);
 
     const finalized = finalizeTaskWithResultFiles(taskId, resultFiles.files, {
       status: success ? "success" : "failed",
-      progress: success ? 100 : Math.max(latestTask.progress, 5),
+      progress: success ? 100 : latestProgress,
       resultSize: resultFiles.resultSize,
       previewUrl: resultFiles.hasPreviewableFiles ? `/api/results/${taskId}/preview` : null,
       downloadUrl: resultFiles.hasDownloadableFiles ? `/api/results/${taskId}/download` : null,
@@ -389,6 +696,7 @@ async function executeTask(
       cleanupManagedResultCopies(taskId);
     }
   } catch (error) {
+    progressReporter.flush();
     const current = findTask(taskId);
     if (!current || current.status === "cancelled") {
       return;
@@ -412,6 +720,8 @@ async function executeTask(
     } else {
       updateTaskIfStatus(taskId, failurePatch, ["running"]);
     }
+  } finally {
+    progressReporter.dispose();
   }
 }
 
@@ -621,13 +931,76 @@ function removeTaskArtifact(targetPath: string, retries = 8): void {
   }
 }
 
-function updateProgressIfRunning(taskId: string, progress: number): void {
-  const task = findTask(taskId);
-  if (!task || task.status !== "running") {
-    return;
+function createTaskProgressReporter(taskId: string, initialProgress = 0): TaskProgressReporter {
+  let latestProgress = normalizeTaskProgress(initialProgress);
+  let persistedProgress = latestProgress;
+  let lastWriteAt = 0;
+  let timer: NodeJS.Timeout | null = null;
+
+  const clearTimer = () => {
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  const write = () => {
+    clearTimer();
+    const next = latestProgress;
+    if (next <= persistedProgress) {
+      return;
+    }
+    const result = getDb()
+      .prepare("UPDATE conversion_tasks SET progress = ? WHERE id = ? AND status = 'running' AND progress < ?")
+      .run(next, taskId, next);
+    if (Number(result.changes) > 0) {
+      persistedProgress = next;
+    }
+    lastWriteAt = Date.now();
+  };
+
+  const schedule = () => {
+    if (timer) {
+      return;
+    }
+    const delay = Math.max(0, TASK_PROGRESS_UPDATE_INTERVAL_MS - (Date.now() - lastWriteAt));
+    timer = setTimeout(write, delay);
+    timer.unref?.();
+  };
+
+  const report = (progress: number) => {
+    const next = normalizeTaskProgress(progress);
+    if (next <= latestProgress) {
+      return;
+    }
+    latestProgress = next;
+    if (Date.now() - lastWriteAt >= TASK_PROGRESS_UPDATE_INTERVAL_MS || next >= 95) {
+      write();
+    } else {
+      schedule();
+    }
+  };
+
+  return {
+    report,
+    flush: (progress?: number) => {
+      if (progress !== undefined) {
+        latestProgress = Math.max(latestProgress, normalizeTaskProgress(progress));
+      }
+      write();
+      return latestProgress;
+    },
+    current: () => latestProgress,
+    dispose: clearTimer
+  };
+}
+
+function normalizeTaskProgress(progress: number): number {
+  if (!Number.isFinite(progress)) {
+    return 0;
   }
-  const next = Math.max(task.progress, Math.min(progress, 99));
-  updateTaskIfStatus(taskId, { progress: next }, ["running"]);
+  return Math.max(0, Math.min(99, Math.round(progress)));
 }
 
 function findTask(id: string): ConversionTask | null {

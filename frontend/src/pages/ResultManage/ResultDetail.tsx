@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   App,
   Button,
@@ -33,27 +33,20 @@ import { useNavigate, useParams } from "react-router-dom";
 import { RerunTaskModal } from "../../components/RerunTaskModal";
 import { TaskStatusTag } from "../../components/StatusTag";
 import { api } from "../../services/api";
-import type { ConversionTask, ResultFile } from "../../types";
+import { startDownload } from "../../services/download";
+import type { ConversionTask, ResultFileBrowserItem, ResultFileBrowserPage } from "../../types";
 
-type ResultFileTreeNode = {
-  id: string;
-  name: string;
-  path: string;
-  type: "folder" | "file";
-  fileType: string;
-  fileSize: number;
-  fileCount: number;
-  latestCreatedAt: string | null;
-  file?: ResultFile;
-  children?: ResultFileTreeNode[];
-};
+const DETAIL_LOG_TAIL_BYTES = 256 * 1024;
+const LOG_REFRESH_INTERVAL_MS = 2500;
+const RESULT_FILE_PAGE_SIZE = 20;
+const FILE_SEARCH_DEBOUNCE_MS = 250;
 
 export default function ResultDetail() {
   const { id } = useParams<{ id: string }>();
   const { message, modal } = App.useApp();
   const navigate = useNavigate();
   const [task, setTask] = useState<ConversionTask | null>(null);
-  const [files, setFiles] = useState<ResultFile[]>([]);
+  const [filePage, setFilePage] = useState<ResultFileBrowserPage>(() => createEmptyFilePage());
   const [logs, setLogs] = useState("");
   const [loading, setLoading] = useState(true);
   const [filesLoading, setFilesLoading] = useState(false);
@@ -63,14 +56,19 @@ export default function ResultDetail() {
   const [filesExpanded, setFilesExpanded] = useState(false);
   const [currentResultFolder, setCurrentResultFolder] = useState("");
   const [fileSearch, setFileSearch] = useState("");
+  const [debouncedFileSearch, setDebouncedFileSearch] = useState("");
+  const [filePageNumber, setFilePageNumber] = useState(1);
   const logRef = useRef<HTMLDivElement | null>(null);
   const logRequestBusyRef = useRef(false);
+  const logsLoadedRef = useRef(false);
   const followLatestLogRef = useRef(true);
   const requestSeqRef = useRef(0);
   const appliedSeqRef = useRef(0);
   const foregroundLoadSeqRef = useRef(0);
+  const fileRequestSeqRef = useRef(0);
   const actionBusyRef = useRef(false);
   const mountedRef = useRef(true);
+  const normalizedFileSearch = debouncedFileSearch.trim();
 
   const load = useCallback(async (background = false) => {
     if (!id) {
@@ -90,63 +88,72 @@ export default function ResultDetail() {
       setTask(nextTask);
       if (foregroundSeq !== null && foregroundSeq === foregroundLoadSeqRef.current) {
         setLoading(false);
-        setFilesLoading(true);
-        setLogsLoading(true);
-      }
-
-      const [filesResult, logsResult] = await Promise.allSettled([
-        api.getResultFiles(id),
-        background ? Promise.resolve<string | null>(null) : api.getTaskLogs(id)
-      ]);
-      if (!mountedRef.current || seq < appliedSeqRef.current) {
-        return;
-      }
-      appliedSeqRef.current = seq;
-
-      const failedParts: string[] = [];
-      if (filesResult.status === "fulfilled") {
-        setFiles(filesResult.value);
-      } else {
-        failedParts.push("成果文件");
-        if (!background) {
-          setFiles([]);
-        }
-      }
-
-      if (logsResult.status === "fulfilled" && logsResult.value !== null) {
-        setLogs(logsResult.value);
-      } else {
-        if (logsResult.status === "rejected") {
-          failedParts.push("运行日志");
-          if (!background) {
-            setLogs("");
-          }
-        }
-      }
-
-      if (failedParts.length && !background) {
-        message.warning(`任务基础信息已加载，${failedParts.join("、")}暂时不可用`);
       }
     } catch (error) {
       if (mountedRef.current && seq >= appliedSeqRef.current && !background) {
         appliedSeqRef.current = seq;
         setTask(null);
-        setFiles([]);
+        setFilePage(createEmptyFilePage());
         setLogs("");
         message.error(error instanceof Error ? error.message : "任务详情加载失败");
       }
     } finally {
       if (mountedRef.current && foregroundSeq !== null && foregroundSeq === foregroundLoadSeqRef.current) {
         setLoading(false);
-        setFilesLoading(false);
-        setLogsLoading(false);
       }
     }
   }, [id, message]);
 
+  const loadFiles = useCallback(async () => {
+    if (!id) {
+      return;
+    }
+    const seq = ++fileRequestSeqRef.current;
+    setFilesLoading(true);
+    try {
+      const nextFilePage = await api.browseResultFiles(id, {
+        folder: currentResultFolder || undefined,
+        search: normalizedFileSearch || undefined,
+        page: filePageNumber,
+        pageSize: RESULT_FILE_PAGE_SIZE
+      });
+      if (!mountedRef.current || seq !== fileRequestSeqRef.current) {
+        return;
+      }
+      setFilePage(nextFilePage);
+      if (nextFilePage.page !== filePageNumber) {
+        setFilePageNumber(nextFilePage.page);
+      }
+    } catch (error) {
+      if (mountedRef.current && seq === fileRequestSeqRef.current) {
+        setFilePage(createEmptyFilePage({
+          folder: currentResultFolder,
+          search: normalizedFileSearch,
+          page: filePageNumber
+        }));
+        message.warning(error instanceof Error ? error.message : "成果文件暂时不可用");
+      }
+    } finally {
+      if (mountedRef.current && seq === fileRequestSeqRef.current) {
+        setFilesLoading(false);
+      }
+    }
+  }, [currentResultFolder, filePageNumber, id, message, normalizedFileSearch]);
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedFileSearch(fileSearch);
+    }, FILE_SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [fileSearch]);
+
+  useEffect(() => {
+    void loadFiles();
+  }, [loadFiles]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -155,6 +162,7 @@ export default function ResultDetail() {
       const cancelledSeq = ++requestSeqRef.current;
       appliedSeqRef.current = Math.max(appliedSeqRef.current, cancelledSeq);
       foregroundLoadSeqRef.current += 1;
+      fileRequestSeqRef.current += 1;
     };
   }, []);
 
@@ -168,21 +176,35 @@ export default function ResultDetail() {
     return () => window.clearInterval(timer);
   }, [load, task?.status]);
 
-  const refreshLogs = useCallback(async () => {
+  useEffect(() => {
+    if (!task || ["pending", "running"].includes(task.status)) {
+      return;
+    }
+    void loadFiles();
+  }, [task?.id, task?.status]);
+
+  const refreshLogs = useCallback(async (showLoading = false) => {
     if (!id || logRequestBusyRef.current) {
       return;
     }
     logRequestBusyRef.current = true;
+    if (showLoading) {
+      setLogsLoading(true);
+    }
     try {
-      const nextLogs = await api.getTaskLogs(id);
+      const nextLogs = await api.getTaskLogs(id, { tailBytes: DETAIL_LOG_TAIL_BYTES });
       if (!mountedRef.current) {
         return;
       }
+      logsLoadedRef.current = true;
       setLogs((currentLogs) => currentLogs === nextLogs ? currentLogs : nextLogs);
     } catch {
       // Keep the latest visible log and retry on the next polling cycle.
     } finally {
       logRequestBusyRef.current = false;
+      if (showLoading && mountedRef.current) {
+        setLogsLoading(false);
+      }
     }
   }, [id]);
 
@@ -190,15 +212,15 @@ export default function ResultDetail() {
     if (!task) {
       return;
     }
-    void refreshLogs();
+    void refreshLogs(!logsLoadedRef.current);
     if (!["pending", "running"].includes(task.status)) {
       return;
     }
     const timer = window.setInterval(() => {
       void refreshLogs();
-    }, 1000);
+    }, LOG_REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [refreshLogs, task?.status]);
+  }, [refreshLogs, task?.id, task?.status]);
 
   useLayoutEffect(() => {
     if (!["pending", "running"].includes(task?.status || "") || !followLatestLogRef.current) {
@@ -210,25 +232,7 @@ export default function ResultDetail() {
     }
   }, [logs, task?.status]);
 
-  const normalizedFileSearch = fileSearch.trim().toLowerCase();
-  const fileTree = useMemo(() => buildResultFileTree(files), [files]);
-  const currentFolderNodes = useMemo(
-    () => getFolderNodes(fileTree, currentResultFolder),
-    [currentResultFolder, fileTree]
-  );
-  const searchedFileNodes = useMemo(() => {
-    if (!normalizedFileSearch) {
-      return [];
-    }
-    return files
-      .filter((file) => {
-        const text = `${file.fileName} ${file.fileType}`.toLowerCase();
-        return text.includes(normalizedFileSearch);
-      })
-      .map(resultFileToNode)
-      .sort((a, b) => a.path.localeCompare(b.path, "zh-CN", { numeric: true, sensitivity: "base" }));
-  }, [files, normalizedFileSearch]);
-  const displayedFileNodes = normalizedFileSearch ? searchedFileNodes : currentFolderNodes;
+  const displayedFileNodes = filePage.items;
   const currentFolderSegments = currentResultFolder
     ? currentResultFolder.split("/").filter(Boolean)
     : [];
@@ -236,7 +240,14 @@ export default function ResultDetail() {
   useEffect(() => {
     setCurrentResultFolder("");
     setFileSearch("");
+    setDebouncedFileSearch("");
+    setFilePageNumber(1);
+    setFilePage(createEmptyFilePage());
     setFilesExpanded(false);
+    setLogs("");
+    setLogsLoading(false);
+    logsLoadedRef.current = false;
+    followLatestLogRef.current = true;
   }, [id]);
 
   useEffect(() => {
@@ -251,12 +262,6 @@ export default function ResultDetail() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [filesExpanded]);
-
-  useEffect(() => {
-    if (currentResultFolder && !findFolderNode(fileTree, currentResultFolder)) {
-      setCurrentResultFolder("");
-    }
-  }, [currentResultFolder, fileTree]);
 
   const cancel = async () => {
     if (!task || actionBusyRef.current) return;
@@ -347,8 +352,8 @@ export default function ResultDetail() {
     return <Empty description="任务不存在" />;
   }
 
-  const hasPreviewableFiles = files.some((file) => file.previewable);
-  const hasDownloadableFiles = files.some((file) => file.downloadable);
+  const hasPreviewableFiles = filePage.hasPreviewableFiles || Boolean(task.previewUrl);
+  const hasDownloadableFiles = filePage.hasDownloadableFiles || Boolean(task.downloadUrl);
   const canDownloadArchive = Boolean(task.downloadUrl) && hasDownloadableFiles;
   const actionBusy = cancelling;
   const isActiveTask = ["pending", "running"].includes(task.status);
@@ -357,15 +362,17 @@ export default function ResultDetail() {
 
   const openResultFolder = (path: string) => {
     setFileSearch("");
+    setFilePageNumber(1);
     setCurrentResultFolder(path);
   };
 
   const goToParentFolder = () => {
     setFileSearch("");
+    setFilePageNumber(1);
     setCurrentResultFolder(parentResultPath(currentResultFolder));
   };
 
-  const columns: ColumnsType<ResultFileTreeNode> = [
+  const columns: ColumnsType<ResultFileBrowserItem> = [
     {
       title: "文件名",
       dataIndex: "name",
@@ -446,7 +453,7 @@ export default function ResultDetail() {
                 size="small"
                 icon={<DownloadOutlined />}
                 disabled={!record.file?.downloadable || actionBusy}
-                onClick={() => record.file && window.open(api.downloadUrl(task.id, record.file.id), "_blank")}
+                onClick={() => record.file && startDownload(api.downloadUrl(task.id, record.file.id))}
               />
             </Tooltip>
           </Space>
@@ -557,7 +564,7 @@ export default function ResultDetail() {
             title={(
               <Space size={8}>
                 <span>成果文件</span>
-                <Typography.Text type="secondary">共 {files.length} 个文件</Typography.Text>
+                <Typography.Text type="secondary">共 {filePage.totalFiles} 个文件</Typography.Text>
               </Space>
             )}
             extra={(
@@ -573,7 +580,7 @@ export default function ResultDetail() {
                   <Button
                     icon={<DownloadOutlined />}
                     disabled={!canDownloadArchive || actionBusy}
-                    onClick={() => window.open(api.downloadArchiveUrl(task.id), "_blank")}
+                    onClick={() => startDownload(api.downloadArchiveUrl(task.id))}
                   >
                     下载压缩包
                   </Button>
@@ -598,6 +605,7 @@ export default function ResultDetail() {
                       size="small"
                       onClick={() => {
                         setFileSearch("");
+                        setFilePageNumber(1);
                         setCurrentResultFolder("");
                       }}
                     >
@@ -613,6 +621,7 @@ export default function ResultDetail() {
                             size="small"
                             onClick={() => {
                               setFileSearch("");
+                              setFilePageNumber(1);
                               setCurrentResultFolder(segmentPath);
                             }}
                           >
@@ -629,13 +638,16 @@ export default function ResultDetail() {
                   prefix={<SearchOutlined />}
                   placeholder="搜索全部成果文件"
                   value={fileSearch}
-                  onChange={(event) => setFileSearch(event.target.value)}
+                  onChange={(event) => {
+                    setFileSearch(event.target.value);
+                    setFilePageNumber(1);
+                  }}
                 />
               </div>
               <Typography.Text type="secondary" className="result-file-browser-summary">
                 {normalizedFileSearch
-                  ? `搜索到 ${displayedFileNodes.length} 项，全部成果 ${files.length} 个文件`
-                  : `当前层级 ${displayedFileNodes.length} 项，全部成果 ${files.length} 个文件`}
+                  ? `搜索到 ${filePage.total} 项，全部成果 ${filePage.totalFiles} 个文件`
+                  : `当前层级 ${filePage.total} 项，全部成果 ${filePage.totalFiles} 个文件`}
               </Typography.Text>
               <Table
                 size="small"
@@ -649,12 +661,15 @@ export default function ResultDetail() {
                   onClick: record.type === "folder" ? () => openResultFolder(record.path) : undefined
                 })}
                 pagination={{
-                  pageSize: 20,
+                  current: filePageNumber,
+                  pageSize: RESULT_FILE_PAGE_SIZE,
+                  total: filePage.total,
                   showSizeChanger: false,
-                  hideOnSinglePage: true,
+                  hideOnSinglePage: filePage.total <= RESULT_FILE_PAGE_SIZE,
+                  onChange: (page) => setFilePageNumber(page),
                   showTotal: (total) => normalizedFileSearch
-                    ? `匹配 ${total} 项 / 共 ${files.length} 个文件`
-                    : `当前层级 ${total} 项 / 共 ${files.length} 个文件`
+                    ? `匹配 ${total} 项 / 共 ${filePage.totalFiles} 个文件`
+                    : `当前层级 ${total} 项 / 共 ${filePage.totalFiles} 个文件`
                 }}
                 locale={{
                   emptyText: (
@@ -733,7 +748,7 @@ export default function ResultDetail() {
               </div>
               <div>
                 <Typography.Text type="secondary">成果文件</Typography.Text>
-                <strong>{files.length}</strong>
+                <strong>{filePage.totalFiles}</strong>
               </div>
               <div>
                 <Typography.Text type="secondary">成果大小</Typography.Text>
@@ -832,131 +847,26 @@ function formatParameterValue(value: unknown): string {
   }
 }
 
-function buildResultFileTree(files: ResultFile[]): ResultFileTreeNode[] {
-  const root: ResultFileTreeNode[] = [];
-
-  files.forEach((file) => {
-    const segments = splitResultPath(file.fileName);
-    addResultFileNode(root, file, segments, "");
-  });
-
-  return sortResultFileNodes(root);
-}
-
-function resultFileToNode(file: ResultFile): ResultFileTreeNode {
-  const segments = splitResultPath(file.fileName);
+function createEmptyFilePage(
+  patch: Partial<Pick<ResultFileBrowserPage, "folder" | "search" | "page">> = {}
+): ResultFileBrowserPage {
   return {
-    id: file.id,
-    name: segments[segments.length - 1],
-    path: file.fileName,
-    type: "file",
-    fileType: file.fileType,
-    fileSize: file.fileSize,
-    fileCount: 1,
-    latestCreatedAt: file.createdAt,
-    file
+    items: [],
+    total: 0,
+    totalFiles: 0,
+    page: patch.page ?? 1,
+    pageSize: RESULT_FILE_PAGE_SIZE,
+    folder: patch.folder ?? "",
+    search: patch.search ?? "",
+    hasPreviewableFiles: false,
+    hasDownloadableFiles: false
   };
-}
-
-function getFolderNodes(nodes: ResultFileTreeNode[], path: string): ResultFileTreeNode[] {
-  if (!path) {
-    return nodes;
-  }
-  return findFolderNode(nodes, path)?.children ?? [];
-}
-
-function findFolderNode(nodes: ResultFileTreeNode[], path: string): ResultFileTreeNode | null {
-  for (const node of nodes) {
-    if (node.type !== "folder") {
-      continue;
-    }
-    if (node.path === path) {
-      return node;
-    }
-    const match = findFolderNode(node.children ?? [], path);
-    if (match) {
-      return match;
-    }
-  }
-  return null;
 }
 
 function parentResultPath(path: string): string {
   const segments = path.split("/").filter(Boolean);
   segments.pop();
   return segments.join("/");
-}
-
-function addResultFileNode(
-  siblings: ResultFileTreeNode[],
-  file: ResultFile,
-  segments: string[],
-  parentPath: string
-): void {
-  const [segment, ...rest] = segments;
-  const currentPath = parentPath ? `${parentPath}/${segment}` : segment;
-  if (!rest.length) {
-    siblings.push({
-      id: file.id,
-      name: segment,
-      path: file.fileName,
-      type: "file",
-      fileType: file.fileType,
-      fileSize: file.fileSize,
-      fileCount: 1,
-      latestCreatedAt: file.createdAt,
-      file
-    });
-    return;
-  }
-
-  let folder = siblings.find((node) => node.type === "folder" && node.path === currentPath);
-  if (!folder) {
-    folder = {
-      id: `folder:${currentPath}`,
-      name: segment,
-      path: currentPath,
-      type: "folder",
-      fileType: "folder",
-      fileSize: 0,
-      fileCount: 0,
-      latestCreatedAt: null,
-      children: []
-    };
-    siblings.push(folder);
-  }
-
-  folder.fileSize += file.fileSize;
-  folder.fileCount += 1;
-  folder.latestCreatedAt = latestDate(folder.latestCreatedAt, file.createdAt);
-  if (!folder.children) {
-    folder.children = [];
-  }
-  addResultFileNode(folder.children, file, rest, currentPath);
-}
-
-function splitResultPath(fileName: string): string[] {
-  const segments = fileName.replace(/\\/g, "/").split("/").filter(Boolean);
-  return segments.length ? segments : [fileName || "result-file"];
-}
-
-function latestDate(current: string | null, next: string): string {
-  if (!current) return next;
-  return new Date(next).getTime() > new Date(current).getTime() ? next : current;
-}
-
-function sortResultFileNodes(nodes: ResultFileTreeNode[]): ResultFileTreeNode[] {
-  return nodes
-    .map((node) => ({
-      ...node,
-      children: node.children ? sortResultFileNodes(node.children) : undefined
-    }))
-    .sort((a, b) => {
-      if (a.type !== b.type) {
-        return a.type === "folder" ? -1 : 1;
-      }
-      return a.name.localeCompare(b.name, "zh-CN", { numeric: true, sensitivity: "base" });
-    });
 }
 
 function progressStatus(
