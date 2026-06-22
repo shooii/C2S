@@ -133,7 +133,31 @@ export interface ResultFile {
   filePath: string;
   downloadable: boolean;
   previewable: boolean;
+  previewState: PreviewState | null;
   createdAt: string;
+}
+
+export type PreviewSceneMode = "flat" | "sphere";
+
+export interface PreviewGeoPlacement {
+  longitude: number;
+  latitude: number;
+  height: number;
+}
+
+export interface PreviewTransform {
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
+  geo?: PreviewGeoPlacement;
+  updatedAt?: string;
+}
+
+export interface PreviewState {
+  sceneMode?: PreviewSceneMode;
+  transform?: Partial<PreviewTransform>;
+  selectedLayerKey?: string | null;
+  hiddenLayerKeys?: string[];
 }
 
 export interface FmeStatus {
@@ -145,7 +169,7 @@ export interface FmeStatus {
 
 export interface PreviewPayload {
   task: ConversionTask;
-  type: "gltf" | "json" | "3dtiles" | "unsupported" | string;
+  type: "fbx" | "gltf" | "usd" | "json" | "3dtiles" | "unsupported" | string;
   file?: ResultFile;
   url?: string;
   json?: unknown;

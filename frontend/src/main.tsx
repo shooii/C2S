@@ -4,7 +4,6 @@ import ReactDOM from "react-dom/client";
 import { App as AntApp, ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import "antd/dist/reset.css";
-import "cesium/Build/Cesium/Widgets/widgets.css";
 import "./styles.css";
 import App from "./App";
 

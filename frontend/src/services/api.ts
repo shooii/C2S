@@ -3,6 +3,7 @@ import type {
   ConversionTask,
   FmeStatus,
   PreviewPayload,
+  PreviewState,
   ResultFile,
   TaskStatus,
   TemplateDetail,
@@ -202,6 +203,11 @@ export const api = {
       params: fileId ? { fileId } : undefined
     })),
 
+  updatePreviewState: (taskId: string, fileId: string, previewState: PreviewState | null) =>
+    unwrap<ResultFile>(http.patch(`/api/results/${taskId}/files/${fileId}/preview-state`, {
+      previewState
+    })),
+
   deleteResults: (taskId: string) => http.delete(`/api/results/${taskId}`),
 
   deleteTask: (taskId: string) => http.delete(`/api/tasks/${taskId}`),
@@ -216,9 +222,19 @@ export const api = {
 
   downloadUrl: (taskId: string, fileId: string) => `${API_BASE_URL}/api/results/${taskId}/download/${fileId}`,
 
+  previewContentUrl: (taskId: string, fileName: string) => {
+    const encodedName = fileName
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join("/");
+    return `/api/results/${encodeURIComponent(taskId)}/content/${encodedName}`;
+  },
+
   absoluteUrl: (url?: string) => {
     if (!url) return "";
-    if (/^https?:\/\//i.test(url)) return url;
+    if (/^[a-z][a-z\d+.-]*:\/\//i.test(url)) return url;
     return `${API_BASE_URL}${url.startsWith("/") ? "" : "/"}${url}`;
   }
 };

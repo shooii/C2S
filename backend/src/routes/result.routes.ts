@@ -7,7 +7,8 @@ import {
   deleteResults,
   getResultFile,
   getResultFiles,
-  getTask
+  getTask,
+  updateResultFilePreviewState
 } from "../services/task.service";
 import { assertPathInside, resultOutputPath } from "../services/file.service";
 import { asyncHandler } from "../utils/asyncHandler";
@@ -15,25 +16,52 @@ import { HttpError } from "../utils/httpError";
 
 const router = Router();
 
+type ResultFilePayload = ReturnType<typeof getResultFiles>[number];
+type TilesetResourceCache = Map<string, Set<string>>;
+
 interface ArchiveFile {
   fileName: string;
   filePath: string;
 }
 
 const previewDependencyExtensions = new Set([
+  ".avif",
   ".bin",
   ".b3dm",
+  ".basis",
+  ".bmp",
   ".cmpt",
+  ".dds",
+  ".dae",
+  ".exr",
+  ".fbx",
+  ".gif",
+  ".glb",
+  ".gltf",
+  ".hdr",
   ".i3dm",
   ".json",
   ".jpeg",
   ".jpg",
   ".ktx2",
+  ".mtl",
+  ".obj",
+  ".ply",
   ".png",
   ".pnts",
+  ".stl",
   ".subtree",
+  ".tga",
+  ".tif",
+  ".tiff",
+  ".usd",
+  ".usda",
+  ".usdc",
+  ".usdz",
   ".webp"
 ]);
+
+const previewModelTypes = new Set(["fbx", "gltf", "obj", "dae", "stl", "ply", "usd", "3dtiles"]);
 
 router.get(
   "/:taskId/files",
@@ -113,6 +141,15 @@ router.get(
   })
 );
 
+router.patch(
+  "/:taskId/files/:fileId/preview-state",
+  asyncHandler(async (req, res) => {
+    const state = normalizePreviewState(req.body?.previewState ?? null);
+    const file = updateResultFilePreviewState(req.params.taskId, req.params.fileId, state);
+    res.json({ data: file });
+  })
+);
+
 router.get(
   "/:taskId/preview",
   asyncHandler(async (req, res) => {
@@ -127,7 +164,9 @@ router.get(
       throw new HttpError(404, "成果文件不存在");
     }
 
-    const previewFile = requestedFile || files.find((file) => file.previewable);
+    const tilesetResourceCache: TilesetResourceCache = new Map();
+    const previewFile = resolvePreviewEntryFile(requestedFile, files, tilesetResourceCache);
+    const responseFiles = previewVisibleFiles(previewFile, files, tilesetResourceCache);
 
     if (!previewFile || !previewFile.previewable) {
       res.json({
@@ -136,7 +175,7 @@ router.get(
           type: "unsupported",
           file: previewFile,
           message: unsupportedPreviewMessage(previewFile),
-          files
+          files: responseFiles
         }
       });
       return;
@@ -158,7 +197,7 @@ router.get(
           file: previewFile,
           url: contentUrl,
           json,
-          files
+          files: responseFiles
         }
       });
       return;
@@ -171,7 +210,7 @@ router.get(
           type: "unsupported",
           file: previewFile,
           message: unsupportedPreviewMessage(previewFile, "JSON 文件超过 5 MB，暂不支持在线预览"),
-          files
+          files: responseFiles
         }
       });
       return;
@@ -183,7 +222,7 @@ router.get(
         type: previewFile.fileType,
         file: previewFile,
         url: contentUrl,
-        files
+        files: responseFiles
       }
     });
   })
@@ -222,8 +261,8 @@ function unsupportedPreviewMessage(
 }
 
 function isPreviewContentResource(
-  file: ReturnType<typeof getResultFiles>[number],
-  files: ReturnType<typeof getResultFiles>
+  file: ResultFilePayload,
+  files: ResultFilePayload[]
 ): boolean {
   if (file.previewable) {
     return true;
@@ -236,12 +275,259 @@ function isPreviewContentResource(
   }
 
   return files.some((candidate) => {
-    if (!candidate.previewable || !["gltf", "3dtiles"].includes(candidate.fileType)) {
+    if (!candidate.previewable || !previewModelTypes.has(candidate.fileType)) {
       return false;
     }
     const previewRoot = path.posix.dirname(normalizeContentFileName(candidate.fileName));
     return previewRoot === "." || normalizedName.startsWith(`${previewRoot}/`);
   });
+}
+
+function selectDefaultPreviewFile(
+  files: ResultFilePayload[]
+): ResultFilePayload | undefined {
+  const priority: Record<string, number> = {
+    "3dtiles": 0,
+    gltf: 1,
+    fbx: 2,
+    obj: 3,
+    dae: 4,
+    stl: 5,
+    ply: 6,
+    usd: 7,
+    json: 8
+  };
+
+  return files
+    .filter((file) => file.previewable)
+    .sort((a, b) => (
+      (priority[a.fileType] ?? 99) - (priority[b.fileType] ?? 99) ||
+      a.createdAt.localeCompare(b.createdAt) ||
+      a.fileName.localeCompare(b.fileName)
+    ))[0];
+}
+
+function resolvePreviewEntryFile(
+  requestedFile: ResultFilePayload | undefined,
+  files: ResultFilePayload[],
+  cache: TilesetResourceCache
+): ResultFilePayload | undefined {
+  if (!requestedFile) {
+    return selectDefaultPreviewFile(files);
+  }
+  return findTilesetEntryForResource(requestedFile, files, cache) || requestedFile;
+}
+
+function findTilesetEntryForResource(
+  file: ResultFilePayload,
+  files: ResultFilePayload[],
+  cache: TilesetResourceCache
+): ResultFilePayload | undefined {
+  if (file.fileType === "3dtiles") {
+    return file;
+  }
+
+  const normalizedName = normalizeContentFileName(file.fileName);
+  const extension = path.posix.extname(normalizedName).toLowerCase();
+  if (!file.previewable && !previewDependencyExtensions.has(extension)) {
+    return undefined;
+  }
+
+  return files.find((candidate) => tilesetReferencesResource(candidate, normalizedName, cache));
+}
+
+function previewVisibleFiles(
+  previewFile: ResultFilePayload | undefined,
+  files: ResultFilePayload[],
+  cache: TilesetResourceCache
+): ResultFilePayload[] {
+  if (!previewFile || previewFile.fileType !== "3dtiles") {
+    return files;
+  }
+
+  return files.filter((file) => (
+    file.id === previewFile.id ||
+    !tilesetReferencesResource(previewFile, normalizeContentFileName(file.fileName), cache)
+  ));
+}
+
+function tilesetReferencesResource(
+  tilesetFile: ResultFilePayload,
+  normalizedResourceName: string,
+  cache: TilesetResourceCache
+): boolean {
+  if (!tilesetFile.previewable || tilesetFile.fileType !== "3dtiles") {
+    return false;
+  }
+
+  const tilesetName = normalizeContentFileName(tilesetFile.fileName);
+  if (tilesetName === normalizedResourceName || !fs.existsSync(tilesetFile.filePath)) {
+    return false;
+  }
+
+  const referencedResources = collectTilesetResourceNames(tilesetFile, cache);
+  return referencedResources.has(normalizedResourceName);
+}
+
+function collectTilesetResourceNames(
+  tilesetFile: ResultFilePayload,
+  cache: TilesetResourceCache
+): Set<string> {
+  const cacheKey = `${tilesetFile.id}:${tilesetFile.filePath}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const resources = new Set<string>();
+  const tilesetRoot = path.posix.dirname(normalizeContentFileName(tilesetFile.fileName));
+
+  try {
+    const tileset = JSON.parse(fs.readFileSync(tilesetFile.filePath, "utf8")) as unknown;
+    const visit = (value: unknown, key = "") => {
+      if (typeof value === "string") {
+        if (key === "uri" || key === "url") {
+          const resourceName = normalizeTilesetResourceName(value, tilesetRoot);
+          if (resourceName) {
+            resources.add(resourceName);
+          }
+        }
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((item) => visit(item));
+        return;
+      }
+      if (value && typeof value === "object") {
+        Object.entries(value as Record<string, unknown>).forEach(([entryKey, entryValue]) => {
+          visit(entryValue, entryKey);
+        });
+      }
+    };
+    visit(tileset);
+  } catch {
+    cache.set(cacheKey, resources);
+    return resources;
+  }
+
+  cache.set(cacheKey, resources);
+  return resources;
+}
+
+function normalizeTilesetResourceName(uri: string, tilesetRoot: string): string | null {
+  const resourcePath = uri.split(/[?#]/, 1)[0].trim().replace(/\\/g, "/");
+  if (
+    !resourcePath ||
+    resourcePath.startsWith("/") ||
+    resourcePath.startsWith("//") ||
+    /^[a-z][a-z0-9+.-]*:/i.test(resourcePath)
+  ) {
+    return null;
+  }
+
+  const normalized = path.posix.normalize(
+    tilesetRoot === "." ? resourcePath : path.posix.join(tilesetRoot, resourcePath)
+  );
+  const segments = normalized.split("/").filter(Boolean);
+  if (!segments.length || segments.some((segment) => segment === "..")) {
+    return null;
+  }
+  return segments.join("/");
+}
+
+function normalizePreviewState(value: unknown): Record<string, unknown> | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "预览状态无效");
+  }
+
+  const input = value as Record<string, unknown>;
+  const state: Record<string, unknown> = {};
+
+  if (input.sceneMode !== undefined) {
+    if (input.sceneMode !== "sphere") {
+      throw new HttpError(400, "预览场景模式无效");
+    }
+    state.sceneMode = input.sceneMode;
+  }
+
+  if (input.transform !== undefined) {
+    state.transform = normalizeTransform(input.transform);
+  }
+
+  if (typeof input.selectedLayerKey === "string" || input.selectedLayerKey === null) {
+    state.selectedLayerKey = input.selectedLayerKey;
+  }
+
+  if (Array.isArray(input.hiddenLayerKeys)) {
+    state.hiddenLayerKeys = input.hiddenLayerKeys
+      .filter((key): key is string => typeof key === "string")
+      .slice(0, 500);
+  }
+
+  return state;
+}
+
+function normalizeTransform(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "模型变换状态无效");
+  }
+  const input = value as Record<string, unknown>;
+  const transform: Record<string, unknown> = {};
+
+  if (input.position !== undefined) {
+    transform.position = normalizeNumberTuple(input.position, "position");
+  }
+  if (input.rotation !== undefined) {
+    transform.rotation = normalizeNumberTuple(input.rotation, "rotation");
+  }
+  if (input.scale !== undefined) {
+    const scale = normalizeNumberTuple(input.scale, "scale");
+    if (scale.some((value) => value <= 0)) {
+      throw new HttpError(400, "缩放值必须大于 0");
+    }
+    transform.scale = scale;
+  }
+  if (input.geo !== undefined) {
+    transform.geo = normalizeGeo(input.geo);
+  }
+  if (typeof input.updatedAt === "string") {
+    transform.updatedAt = input.updatedAt;
+  }
+
+  return transform;
+}
+
+function normalizeNumberTuple(value: unknown, label: string): number[] {
+  if (!Array.isArray(value) || value.length !== 3) {
+    throw new HttpError(400, `${label} 必须包含 3 个数字`);
+  }
+  const tuple = value.map(Number);
+  if (!tuple.every(Number.isFinite)) {
+    throw new HttpError(400, `${label} 包含无效数字`);
+  }
+  return tuple;
+}
+
+function normalizeGeo(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "经纬度位置无效");
+  }
+  const input = value as Record<string, unknown>;
+  const longitude = Number(input.longitude);
+  const latitude = Number(input.latitude);
+  const height = Number(input.height ?? 0);
+  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    throw new HttpError(400, "经度必须在 -180 到 180 之间");
+  }
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+    throw new HttpError(400, "纬度必须在 -90 到 90 之间");
+  }
+  if (!Number.isFinite(height)) {
+    throw new HttpError(400, "高程必须是有效数字");
+  }
+  return { longitude, latitude, height };
 }
 
 function normalizeArchiveEntryName(fileName: string): string {

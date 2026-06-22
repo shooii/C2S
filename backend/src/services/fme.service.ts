@@ -311,7 +311,7 @@ export function scanOutputFiles(
   taskId: string,
   outputDir: string,
   baseline: OutputFileSnapshot = new Map()
-): Array<Omit<ResultFile, "id" | "createdAt">> {
+): Array<Omit<ResultFile, "id" | "createdAt" | "previewState">> {
   return listFilesRecursive(outputDir)
     .filter((file) => baseline.get(path.resolve(file.filePath)) !== `${file.fileSize}:${file.modifiedAt}`)
     .map((file) => ({
