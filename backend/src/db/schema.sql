@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS result_files (
   filePath TEXT NOT NULL,
   downloadable INTEGER NOT NULL DEFAULT 1,
   previewable INTEGER NOT NULL DEFAULT 0,
+  previewState TEXT,
   createdAt TEXT NOT NULL,
   FOREIGN KEY (taskId) REFERENCES conversion_tasks(id) ON DELETE CASCADE
 );

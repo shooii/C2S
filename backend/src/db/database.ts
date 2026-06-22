@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS result_files (
   filePath TEXT NOT NULL,
   downloadable INTEGER NOT NULL DEFAULT 1,
   previewable INTEGER NOT NULL DEFAULT 0,
+  previewState TEXT,
   createdAt TEXT NOT NULL,
   FOREIGN KEY (taskId) REFERENCES conversion_tasks(id) ON DELETE CASCADE
 );
@@ -160,6 +161,10 @@ function migrateDatabase(database: SqliteDatabase): void {
   }
   if (!parameterColumns.some((column) => column.name === "visibility")) {
     database.exec("ALTER TABLE template_parameters ADD COLUMN visibility TEXT");
+  }
+  const resultFileColumns = database.prepare("PRAGMA table_info(result_files)").all() as unknown as Array<{ name: string }>;
+  if (!resultFileColumns.some((column) => column.name === "previewState")) {
+    database.exec("ALTER TABLE result_files ADD COLUMN previewState TEXT");
   }
   migrateParameterMetadata(database);
   database.exec("CREATE INDEX IF NOT EXISTS idx_templates_group_id ON templates(groupId)");

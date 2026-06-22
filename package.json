@@ -9,6 +9,7 @@
   "scripts": {
     "install:all": "npm install",
     "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "test": "npm test -w backend && npm test -w frontend",
     "build": "npm run build -w backend && npm run build -w frontend",
     "start:backend": "npm run start -w backend",
     "init:db": "npm run init:db -w backend"

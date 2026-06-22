@@ -10,7 +10,20 @@ import {
 import { HttpError } from "../utils/httpError";
 
 const templateExtensions = new Set([".fmw", ".fmwt"]);
-const previewExtensions = new Set([".glb", ".gltf", ".json"]);
+const previewExtensions = new Set([
+  ".fbx",
+  ".dae",
+  ".glb",
+  ".gltf",
+  ".json",
+  ".obj",
+  ".ply",
+  ".stl",
+  ".usd",
+  ".usda",
+  ".usdc",
+  ".usdz"
+]);
 
 /**
  * 解码文件名，处理可能的中文编码问题
@@ -276,7 +289,13 @@ export function assertPathInside(root: string, targetPath: string): string {
 export function getResultFileType(fileName: string): string {
   const ext = path.extname(fileName).toLowerCase();
   if (fileName.toLowerCase().endsWith("tileset.json")) return "3dtiles";
+  if (ext === ".fbx") return "fbx";
   if (ext === ".glb" || ext === ".gltf") return "gltf";
+  if (ext === ".obj") return "obj";
+  if (ext === ".dae") return "dae";
+  if (ext === ".stl") return "stl";
+  if (ext === ".ply") return "ply";
+  if (ext === ".usd" || ext === ".usda" || ext === ".usdc" || ext === ".usdz") return "usd";
   if (ext === ".json") return "json";
   return ext.replace(".", "") || "file";
 }

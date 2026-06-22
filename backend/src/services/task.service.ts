@@ -36,11 +36,14 @@ type TaskRow = Omit<ConversionTask, "parameters" | "rerunnable"> & {
   parameters: string;
   rerunnable: number;
 };
-type ResultFileRow = Omit<ResultFile, "downloadable" | "previewable"> & {
+type ResultFileRow = Omit<ResultFile, "downloadable" | "previewable" | "previewState"> & {
   downloadable: number;
   previewable: number;
+  previewState: string | null;
 };
-type GeneratedResultFile = Omit<ResultFile, "id" | "createdAt">;
+type GeneratedResultFile = Omit<ResultFile, "id" | "createdAt" | "previewState"> & {
+  previewState?: Record<string, unknown> | null;
+};
 interface GeneratedResultSummary {
   files: GeneratedResultFile[];
   resultSize: number;
@@ -431,6 +434,20 @@ export function getResultFile(taskId: string, fileId: string): ResultFile {
   const mapped = mapResultFileRow(file);
   assertPathInside(resultOutputPath(taskId), mapped.filePath);
   return mapped;
+}
+
+export function updateResultFilePreviewState(
+  taskId: string,
+  fileId: string,
+  previewState: Record<string, unknown> | null
+): ResultFile {
+  getResultFile(taskId, fileId);
+  getDb().prepare(
+    `UPDATE result_files
+     SET previewState = ?
+     WHERE taskId = ? AND id = ?`
+  ).run(previewState ? JSON.stringify(previewState) : null, taskId, fileId);
+  return getResultFile(taskId, fileId);
 }
 
 export function recoverInterruptedTasks(): number {
@@ -881,9 +898,9 @@ function finalizeTaskWithResultFiles(
   const db = getDb();
   const insert = db.prepare(
     `INSERT INTO result_files (
-      id, taskId, fileName, fileType, fileSize, filePath, downloadable, previewable, createdAt
+      id, taskId, fileName, fileType, fileSize, filePath, downloadable, previewable, previewState, createdAt
     ) VALUES (
-      @id, @taskId, @fileName, @fileType, @fileSize, @filePath, @downloadable, @previewable, @createdAt
+      @id, @taskId, @fileName, @fileType, @fileSize, @filePath, @downloadable, @previewable, @previewState, @createdAt
     )`
   );
 
@@ -899,6 +916,7 @@ function finalizeTaskWithResultFiles(
           id: randomUUID(),
           downloadable: file.downloadable ? 1 : 0,
           previewable: isResultFilePreviewable(file) ? 1 : 0,
+          previewState: file.previewState ? JSON.stringify(file.previewState) : null,
           createdAt: nowIso()
         });
       });
@@ -1240,7 +1258,8 @@ function mapResultFileRow(row: ResultFileRow): ResultFile {
       fileName: row.fileName,
       fileSize: row.fileSize,
       previewable: Boolean(row.previewable)
-    })
+    }),
+    previewState: safeJsonObjectOrNull(row.previewState)
   };
 }
 
@@ -1250,5 +1269,19 @@ function safeJsonObject(value: string): Record<string, unknown> {
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch {
     return {};
+  }
+}
+
+function safeJsonObjectOrNull(value: string | null): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
   }
 }

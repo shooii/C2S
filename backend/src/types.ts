@@ -133,6 +133,7 @@ export interface ResultFile {
   filePath: string;
   downloadable: boolean;
   previewable: boolean;
+  previewState: Record<string, unknown> | null;
   createdAt: string;
 }
 
