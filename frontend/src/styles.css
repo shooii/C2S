@@ -290,61 +290,6 @@ body {
   font-weight: 500;
 }
 
-.path-parameter-preview {
-  display: flex;
-  min-width: 0;
-  min-height: 34px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 1px solid #e4edf7;
-  border-radius: 6px;
-  background: #f7faff;
-}
-
-.path-parameter-preview-main {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-}
-
-.path-parameter-preview-icon {
-  display: inline-flex;
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
-  align-items: center;
-  justify-content: center;
-  color: #1677ff;
-  border-radius: 5px;
-  background: #eaf3ff;
-}
-
-.path-parameter-preview-copy {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.path-parameter-preview-title {
-  max-width: 100%;
-  color: #1f2d3d;
-  line-height: 18px;
-}
-
-.path-parameter-preview-meta {
-  font-size: 12px;
-  line-height: 16px;
-}
-
-.path-parameter-copy-button {
-  flex: 0 0 auto;
-  color: #536579;
-}
-
 .config-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) clamp(300px, 27%, 340px);

@@ -25,7 +25,6 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import {
   ArrowLeftOutlined,
-  CopyOutlined,
   DeleteOutlined,
   FileSearchOutlined,
   FolderOpenOutlined,
@@ -847,12 +846,7 @@ function PathParameterInput({
   const selectionAbortRef = useRef<AbortController | null>(null);
   const kind = getPathKind(parameter);
   const multipleFiles = kind === "file" && parameter.multiple;
-  const selectedPaths = useMemo(
-    () => parseSelectedPathValue(value, multipleFiles),
-    [multipleFiles, value]
-  );
   const buttonLabel = kind === "folder" ? "选择目录" : multipleFiles ? "选择多个文件" : "选择文件";
-  const selectedSummary = summarizeSelectedPaths(selectedPaths, kind, multipleFiles);
 
   useEffect(() => () => {
     selectionAbortRef.current?.abort();
@@ -892,19 +886,6 @@ function PathParameterInput({
     }
   };
 
-  const copyValue = async () => {
-    const text = value?.trim();
-    if (!text) {
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-      message.success("路径已复制");
-    } catch {
-      message.error("复制路径失败");
-    }
-  };
-
   return (
     <div className="path-parameter-control">
       <Space.Compact className="path-parameter-compact">
@@ -927,33 +908,6 @@ function PathParameterInput({
           </Button>
         </Tooltip>
       </Space.Compact>
-      {selectedSummary ? (
-        <div className="path-parameter-preview">
-          <div className="path-parameter-preview-main">
-            <span className="path-parameter-preview-icon">
-              {kind === "folder" ? <FolderOpenOutlined /> : <FileSearchOutlined />}
-            </span>
-            <div className="path-parameter-preview-copy">
-              <Typography.Text className="path-parameter-preview-title" ellipsis={{ tooltip: value }}>
-                {selectedSummary}
-              </Typography.Text>
-              <Typography.Text className="path-parameter-preview-meta" type="secondary">
-                {multipleFiles ? "多个文件会按当前顺序传入" : "再次选择会从当前路径附近打开"}
-              </Typography.Text>
-            </div>
-          </div>
-          <Tooltip title="复制路径">
-            <Button
-              aria-label="复制路径"
-              className="path-parameter-copy-button"
-              icon={<CopyOutlined />}
-              size="small"
-              type="text"
-              onClick={copyValue}
-            />
-          </Tooltip>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -1104,47 +1058,6 @@ function firstPathValue(value?: string): string | undefined {
 
 function formatSelectedPathValue(paths: string[], multiple: boolean): string {
   return multiple ? paths.join(",") : paths[0] || "";
-}
-
-function parseSelectedPathValue(value: string | undefined, multiple: boolean): string[] {
-  const text = value?.trim();
-  if (!text) {
-    return [];
-  }
-  if (!multiple) {
-    return [stripPathQuotes(text)];
-  }
-  const quotedPaths = Array.from(text.matchAll(/"([^"]+)"/g))
-    .map((match) => match[1]?.trim())
-    .filter((item): item is string => Boolean(item));
-  if (quotedPaths.length) {
-    return quotedPaths;
-  }
-  return text
-    .split(",")
-    .map(stripPathQuotes)
-    .filter(Boolean);
-}
-
-function stripPathQuotes(value: string): string {
-  return value.trim().replace(/^"(.+)"$/, "$1").trim();
-}
-
-function pathBaseName(pathValue: string): string {
-  const normalized = pathValue.replace(/[\\/]+$/, "");
-  const baseName = normalized.split(/[\\/]/).filter(Boolean).pop();
-  return baseName || normalized || pathValue;
-}
-
-function summarizeSelectedPaths(paths: string[], kind: "file" | "folder", multiple: boolean): string {
-  if (!paths.length) {
-    return "";
-  }
-  if (multiple) {
-    const names = paths.slice(0, 2).map(pathBaseName).join("、");
-    return `已选 ${paths.length} 个文件${names ? `：${names}${paths.length > 2 ? "..." : ""}` : ""}`;
-  }
-  return `${kind === "folder" ? "当前目录" : "当前文件"}：${pathBaseName(paths[0])}`;
 }
 
 function selectionSuccessMessage(paths: string[], kind: "file" | "folder", multiple: boolean): string {
