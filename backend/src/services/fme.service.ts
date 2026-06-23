@@ -56,6 +56,16 @@ interface WorkspaceParseContext {
   packageRoot: string | null;
 }
 
+interface ParsedGuiLine {
+  type: string;
+  name: string;
+  label: string;
+  choices: string | null;
+  settings: string | null;
+  flags: string[];
+  raw: string;
+}
+
 interface ProgressStream {
   key: string;
   current: number;
@@ -167,9 +177,11 @@ function parseWorkspaceParameterText(
   text: string,
   context: WorkspaceParseContext = { packageRoot: null }
 ): ParsedWorkspaceParameter[] {
+  const defaultMacros = parseDefaultMacros(text);
   const parameters = normalizeParameters([
     ...parseUserParameterForms(text),
-    ...parseXmlGuiLineParameters(text),
+    ...parseXmlGuiLineParameters(text, defaultMacros),
+    ...parseGuiMacroParameters(text, defaultMacros),
     ...parseJsonLikeParameters(text),
     ...parseTextBlocks(text),
     ...parseCommandLineParameters(text),
@@ -629,7 +641,10 @@ function parseWriterDatasetOutputParameterNames(text: string): string[] {
   return names;
 }
 
-function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
+function parseXmlGuiLineParameters(
+  text: string,
+  defaultMacros: Map<string, string> = parseDefaultMacros(text)
+): ParsedWorkspaceParameter[] {
   const parameters: ParsedWorkspaceParameter[] = [];
   const blockRegex = /<(?:GLOBAL_PARAMETER|INFO)\b[\s\S]*?\/>/gi;
   let match: RegExpExecArray | null;
@@ -644,10 +659,13 @@ function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
     }
 
     const label = parsedGui?.label || attrs.PROMPT || attrs.LABEL || prettifyName(name);
-    const defaultValue = attrs.DEFAULT_VALUE || attrs.VALUE
-      ? decodeFmeTokens(attrs.DEFAULT_VALUE || attrs.VALUE)
-      : null;
-    const declaredType = [parsedGui?.type, attrs.TYPE, attrs.PARAMETER_TYPE].filter(Boolean).join(" ");
+    const defaultValue = normalizeDefaultValue(
+      attrs.DEFAULT_VALUE ?? attrs.VALUE ?? getDefaultMacroValue(defaultMacros, name)
+    );
+    const declaredType = [parsedGui?.flags.join(" "), parsedGui?.type, parsedGui?.settings, attrs.TYPE, attrs.PARAMETER_TYPE]
+      .filter(Boolean)
+      .join(" ");
+    const options = parseOptions(parsedGui?.choices || null);
 
     parameters.push({
       name,
@@ -657,11 +675,11 @@ function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
         label,
         declaredType,
         defaultValue,
-        options: parseOptions(parsedGui?.choices || null)
+        options
       }),
       defaultValue,
       required: inferGuiLineRequired(guiLine),
-      options: parseOptions(parsedGui?.choices || null),
+      options,
       visibility: null,
       description: attrs.DESCRIPTION || attrs.HELP || null,
       sortOrder: parameters.length
@@ -669,6 +687,163 @@ function parseXmlGuiLineParameters(text: string): ParsedWorkspaceParameter[] {
   }
 
   return parameters;
+}
+
+function parseGuiMacroParameters(
+  text: string,
+  defaultMacros: Map<string, string> = parseDefaultMacros(text)
+): ParsedWorkspaceParameter[] {
+  const guiLines: Array<{ gui: ParsedGuiLine; order: number }> = [];
+  const lines = text.split(/\r?\n/);
+
+  lines.forEach((line, index) => {
+    const guiText = extractPlainGuiLine(line);
+    if (!guiText) {
+      return;
+    }
+
+    const gui = parseGuiLine(guiText);
+    if (!gui || !isRenderableGuiParameter(gui)) {
+      return;
+    }
+
+    guiLines.push({ gui, order: index });
+  });
+
+  const visibilityByName = buildActiveDisclosureVisibilityMap(guiLines.map(({ gui }) => gui));
+
+  return guiLines.map(({ gui, order }) => {
+    const name = normalizeFmeParameterName(gui.name);
+    const label = gui.label || prettifyName(name);
+    const defaultValue = normalizeDefaultValue(getDefaultMacroValue(defaultMacros, name));
+    const options = parseOptions(gui.choices);
+    const declaredType = [gui.flags.join(" "), gui.type, gui.settings]
+      .filter(Boolean)
+      .join(" ");
+
+    return {
+      name,
+      label,
+      ...inferParameterMetadata({
+        name,
+        label,
+        declaredType,
+        defaultValue,
+        options
+      }),
+      defaultValue,
+      required: inferGuiLineRequired(gui.raw),
+      options,
+      visibility: visibilityByName.get(name.toUpperCase()) || null,
+      description: null,
+      sortOrder: order
+    };
+  });
+}
+
+function parseDefaultMacros(text: string): Map<string, string> {
+  const defaultMacros = new Map<string, string>();
+  const regex = /^[ \t]*DEFAULT_MACRO[ \t]+([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.-]*)(?:[ \t]+([^\r\n]*))?$/gmi;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    const name = normalizeFmeParameterName(match[1]);
+    if (!name || shouldSkipParameterName(name)) {
+      continue;
+    }
+
+    defaultMacros.set(name.toUpperCase(), cleanFmeScalar(match[2] ?? ""));
+  }
+
+  return defaultMacros;
+}
+
+function getDefaultMacroValue(defaultMacros: Map<string, string>, name: string): string | null {
+  const value = defaultMacros.get(normalizeFmeParameterName(name).toUpperCase());
+  return value === undefined ? null : value;
+}
+
+function normalizeDefaultValue(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const normalized = cleanFmeScalar(value);
+  return normalized || null;
+}
+
+function cleanFmeScalar(value: string): string {
+  return decodeFmeTokens(
+    decodeXmlEntities(value.trim())
+      .replace(/\\(["'])/g, "$1")
+      .replace(/^["']|["']$/g, "")
+  );
+}
+
+function extractPlainGuiLine(line: string): string | null {
+  const trimmed = line.trim().replace(/^#!\s*/, "").trim();
+  if (!/^GUI\s+/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed.replace(/\\\s*$/g, "").trim();
+}
+
+function isRenderableGuiParameter(gui: ParsedGuiLine): boolean {
+  const type = gui.type.toUpperCase();
+  const name = normalizeFmeParameterName(gui.name);
+
+  if (!name || shouldSkipParameterName(name) || /[,%\s]/.test(name)) {
+    return false;
+  }
+  if (["IGNORE", "LOOKUP", "DISCLOSUREGROUP"].includes(type)) {
+    return false;
+  }
+  if (gui.flags.includes("NO_EDIT") && type === "TEXT" && !gui.choices) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildActiveDisclosureVisibilityMap(guiLines: ParsedGuiLine[]): Map<string, ParameterVisibilityRule> {
+  const conditionsByChild = new Map<string, ParameterVisibilityRule[]>();
+
+  for (const gui of guiLines) {
+    if (gui.type.toUpperCase() !== "ACTIVEDISCLOSUREGROUP" || !gui.settings) {
+      continue;
+    }
+
+    const parent = normalizeFmeParameterName(gui.name);
+    const children = splitFmeList(gui.settings)
+      .map((child) => normalizeFmeParameterName(child))
+      .filter((child) => child && !shouldSkipParameterName(child));
+
+    for (const child of children) {
+      if (child.toUpperCase() === parent.toUpperCase()) {
+        continue;
+      }
+      const condition: ParameterVisibilityRule = { $isEnabled: { parameter: parent } };
+      const existing = conditionsByChild.get(child.toUpperCase()) || [];
+      existing.push(condition);
+      conditionsByChild.set(child.toUpperCase(), existing);
+    }
+  }
+
+  const visibilityByName = new Map<string, ParameterVisibilityRule>();
+  for (const [child, conditions] of conditionsByChild.entries()) {
+    visibilityByName.set(child, {
+      if: [
+        {
+          $allOf: conditions,
+          then: "visible"
+        },
+        {
+          then: "hidden"
+        }
+      ]
+    });
+  }
+
+  return visibilityByName;
 }
 
 function parseJsonLikeParameters(text: string): ParsedWorkspaceParameter[] {
@@ -833,22 +1008,31 @@ function extractPackagedPathValue(rawValue: string): string | null {
 }
 
 function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspaceParameter | null {
-  const name = stringValue(raw.name ?? raw.parameterName ?? raw.identifier ?? raw.macroName ?? raw.id);
+  const name = stringValue(
+    raw.name ??
+    raw.parameterName ??
+    raw.parameter_name ??
+    raw.identifier ??
+    raw.macroName ??
+    raw.macro ??
+    raw.id
+  );
   if (!name || shouldSkipParameterName(name)) {
     return null;
   }
 
-  const label = stringValue(raw.label ?? raw.displayName ?? raw.prompt ?? raw.title) || prettifyName(name);
+  const label = stringValue(raw.label ?? raw.displayName ?? raw.display_name ?? raw.prompt ?? raw.title) || prettifyName(name);
   const rawOptions = extractOptions(raw);
-  const rawDefaultValue = stringValue(raw.defaultValue ?? raw.default ?? raw.value);
+  const rawDefaultValue = stringValue(raw.defaultValue ?? raw.default_value ?? raw.default ?? raw.value ?? raw.currentValue);
   const defaultValue = rawDefaultValue ? decodeFmeTokens(rawDefaultValue) : null;
+  const selectMultiple = booleanValue(raw.selectMultiple ?? raw.multiple ?? raw.allowMultiple) === true;
   const declaredType = [
     stringValue(raw.type ?? raw.parameterType ?? raw.valueType),
     stringValue(raw.valueType),
     stringValue(raw.accessMode),
     stringValue(raw.itemsToSelect),
     stringValue(raw.guiType ?? raw.editor ?? raw.category),
-    Boolean(raw.selectMultiple) ? "multiple" : null
+    selectMultiple ? "multiple" : null
   ].filter((value): value is string => Boolean(value)).join(" ");
   const metadata = inferParameterMetadata({
     name,
@@ -858,7 +1042,7 @@ function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspacePar
     options: rawOptions,
     accessMode: stringValue(raw.accessMode),
     itemsToSelect: stringValue(raw.itemsToSelect),
-    selectMultiple: Boolean(raw.selectMultiple)
+    selectMultiple
   });
 
   return {
@@ -868,21 +1052,158 @@ function normalizeRawParameter(raw: Record<string, unknown>): ParsedWorkspacePar
     defaultValue,
     required: inferRawParameterRequired(raw),
     options: rawOptions,
-    visibility: normalizeVisibilityRule(raw.visibility),
+    visibility: normalizeVisibilityRule(
+      raw.visibility ??
+      raw.visibilityRule ??
+      raw.visibilityRules ??
+      raw.visibleWhen ??
+      raw.showWhen ??
+      raw.displayWhen ??
+      raw.enableWhen ??
+      raw.enabledWhen ??
+      raw.conditions
+    ),
     description: stringValue(raw.description ?? raw.help ?? raw.tooltip),
     sortOrder: 0
   };
 }
 
 function normalizeVisibilityRule(value: unknown): ParameterVisibilityRule | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!value) {
     return null;
   }
-  return value as ParameterVisibilityRule;
+  if (typeof value === "string") {
+    return parseVisibilityExpression(value);
+  }
+  if (Array.isArray(value)) {
+    const conditions = value
+      .map((item) => normalizeVisibilityCondition(item))
+      .filter((item): item is ParameterVisibilityRule => Boolean(item));
+    return conditions.length
+      ? { if: [{ $allOf: conditions, then: "visible" }, { then: "hidden" }] }
+      : null;
+  }
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as ParameterVisibilityRule;
+  if ("if" in record || "$allOf" in record || "$anyOf" in record || "$or" in record || "$and" in record || "$not" in record) {
+    return record;
+  }
+
+  const condition = normalizeVisibilityCondition(record);
+  if (condition) {
+    return { if: [{ ...condition, then: "visible" }, { then: "hidden" }] };
+  }
+  return record;
+}
+
+function normalizeVisibilityCondition(value: unknown): ParameterVisibilityRule | null {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return parseVisibilityExpression(value);
+  }
+  if (Array.isArray(value)) {
+    const conditions = value
+      .map((item) => normalizeVisibilityCondition(item))
+      .filter((item): item is ParameterVisibilityRule => Boolean(item));
+    return conditions.length ? { $allOf: conditions } : null;
+  }
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if ("$equals" in record || "$in" in record || "$allOf" in record || "$anyOf" in record || "$or" in record || "$and" in record || "$not" in record || "$isEnabled" in record) {
+    return record as ParameterVisibilityRule;
+  }
+
+  const nestedConditions = record.conditions ?? record.condition ?? record.rules;
+  if (nestedConditions) {
+    return normalizeVisibilityCondition(nestedConditions);
+  }
+
+  const parameter = stringValue(
+    record.parameter ??
+    record.parameterName ??
+    record.name ??
+    record.field ??
+    record.dependsOn ??
+    record.source
+  );
+  const expected = record.value ?? record.equals ?? record.equalTo ?? record.expectedValue;
+  const values = record.values ?? record.in ?? record.oneOf;
+
+  if (parameter && values !== undefined) {
+    return {
+      $in: {
+        parameter,
+        values: Array.isArray(values) ? values : splitFmeList(String(values))
+      }
+    };
+  }
+  if (parameter && expected !== undefined) {
+    return {
+      $equals: {
+        parameter,
+        value: expected
+      }
+    };
+  }
+  if (parameter) {
+    return {
+      $isEnabled: {
+        parameter
+      }
+    };
+  }
+
+  return null;
+}
+
+function parseVisibilityExpression(value: string): ParameterVisibilityRule | null {
+  const text = decodeFmeTokens(decodeXmlEntities(value)).trim();
+  if (!text) {
+    return null;
+  }
+
+  const equalsMatch = text.match(/(?:\$\(([^)]+)\)|@Value\(([^)]+)\)|([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.-]*))\s*(?:==|=|eq)\s*["']?([^"'\r\n]+?)["']?$/i);
+  if (equalsMatch) {
+    const parameter = equalsMatch[1] || equalsMatch[2] || equalsMatch[3];
+    const expectedValue = equalsMatch[4];
+    if (parameter && expectedValue) {
+      return {
+        $equals: {
+          parameter: parameter.trim(),
+          value: expectedValue.trim()
+        }
+      };
+    }
+  }
+
+  const enabledMatch = text.match(/^(?:\$\(([^)]+)\)|@Value\(([^)]+)\)|([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.-]*))$/i);
+  if (enabledMatch) {
+    const parameter = enabledMatch[1] || enabledMatch[2] || enabledMatch[3];
+    if (parameter) {
+      return {
+        $isEnabled: {
+          parameter: parameter.trim()
+        }
+      };
+    }
+  }
+
+  return null;
 }
 
 function inferRawParameterRequired(raw: Record<string, unknown>): boolean {
-  const required = raw.required ?? raw.mandatory;
+  if (booleanValue(raw.optional) === true) {
+    return false;
+  }
+  const required = raw.required ?? raw.isRequired ?? raw.mandatory ?? raw.mandatoryFlag;
   if (typeof required === "boolean") {
     return required;
   }
@@ -890,6 +1211,23 @@ function inferRawParameterRequired(raw: Record<string, unknown>): boolean {
     return /^(true|yes|1|required|mandatory)$/i.test(String(required).trim());
   }
   return true;
+}
+
+function booleanValue(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const text = String(value).trim();
+  if (/^(true|yes|1|on|enabled|multiple)$/i.test(text)) {
+    return true;
+  }
+  if (/^(false|no|0|off|disabled|single|none)$/i.test(text)) {
+    return false;
+  }
+  return null;
 }
 
 function inferGuiLineRequired(guiLine: string): boolean {
@@ -912,9 +1250,32 @@ function normalizeParameters(parameters: ParsedWorkspaceParameter[]): ParsedWork
         label: parameter.label || prettifyName(parameter.name),
         options: parameter.options || []
       });
+    } else {
+      byName.set(key, mergeParameterDefinitions(byName.get(key)!, parameter));
     }
   }
   return [...byName.values()].sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+function mergeParameterDefinitions(
+  existing: ParsedWorkspaceParameter,
+  incoming: ParsedWorkspaceParameter
+): ParsedWorkspaceParameter {
+  const useIncomingType = existing.type === "string" && incoming.type !== "string";
+  return {
+    ...existing,
+    label: existing.label || incoming.label || prettifyName(existing.name),
+    type: useIncomingType ? incoming.type : existing.type,
+    defaultValue: existing.defaultValue ?? incoming.defaultValue,
+    required: existing.required && incoming.required,
+    options: existing.options.length ? existing.options : incoming.options,
+    direction: existing.direction === "none" ? incoming.direction : existing.direction,
+    pathKind: existing.pathKind ?? incoming.pathKind,
+    multiple: existing.multiple || incoming.multiple,
+    visibility: existing.visibility ?? incoming.visibility,
+    description: existing.description ?? incoming.description,
+    sortOrder: Math.min(existing.sortOrder, incoming.sortOrder)
+  };
 }
 
 function extractOptions(raw: Record<string, unknown>): ParameterOption[] {
@@ -1022,6 +1383,7 @@ function inferType(
     /geometry|geojson|bounding|bbox|extent|polygon|几何|空间范围|地理范围|边界范围|包围盒/.test(text) ||
     looksLikeGeometryValue(defaultValue)
   ) return "geometry";
+  if (/activedisclosuregroup|checkbox|yes\/no|yesno|bool|boolean|switch|toggle|是\/否|是否|布尔/.test(text)) return "boolean";
   if (/reprojection file|grid file|datum.*grid|坐标转换网格|重投影文件/.test(text)) return "reprojection_file";
   if (/coord|coordinate system|coordsys|epsg|projection|坐标系/.test(text)) return "coordinate_system";
   if (/url|uri|endpoint|网址|链接/.test(text)) return "url";
@@ -1032,7 +1394,6 @@ function inferType(
   if (/choice|enum|select|lookup|radio|dropdown|选项|选择|单选/.test(text) || options.length > 0) {
     return hasAliases ? "choice_alias" : "enum";
   }
-  if (/yes\/no|yesno|bool|boolean|checkbox|switch|toggle|是\/否|是否|布尔/.test(text)) return "boolean";
   if (/number|integer|float|double|numeric|decimal|slider|数字|数值|数量|整数|浮点/.test(text)) return "number";
   if (/textarea|multiline|multi-line|long text|text_edit|多行|长文本/.test(text)) return "textarea";
   if (/(^|[\s_.-])text([\s_.-]|$)|plaintext|文本/.test(text)) return "text";
@@ -1160,46 +1521,105 @@ function parseOptions(raw: string | null): ParameterOption[] {
   if (!raw) {
     return [];
   }
-  const normalized = raw.replace(/%space%/gi, " ");
-  const rawOptions = normalized.includes("%")
-    ? normalized.split("%")
-    : normalized.includes("|")
-      ? normalized.split("|")
-      : normalized.includes(";")
-        ? normalized.split(";")
-        : normalized.split(",");
+  const normalized = decodeXmlEntities(raw).replace(/%space%/gi, "<space>");
+  const rawOptions = splitFmeOptionList(normalized);
 
   return rawOptions
     .map((rawOption): ParameterOption | null => {
-      const option = rawOption.trim().replace(/^["']|["']$/g, "");
-      if (!option) {
+      const option = decodeXmlEntities(rawOption.trim()).replace(/\\(["'])/g, "$1");
+      if (!cleanFmeScalar(option)) {
         return null;
       }
-      const aliasSeparator = findAliasSeparator(option);
-      if (aliasSeparator < 0) {
-        const value = decodeFmeTokens(option);
+      const fields = splitCsvLike(option).map((field) => cleanFmeScalar(field));
+      if (fields.length < 2) {
+        const value = cleanFmeScalar(option);
         return { label: value, value };
       }
-      const label = decodeFmeTokens(option.slice(0, aliasSeparator).trim());
-      const value = decodeFmeTokens(option.slice(aliasSeparator + 1).trim());
+      const [label, value] = fields;
       return value ? { label: label || value, value } : null;
     })
     .filter((option): option is ParameterOption => Boolean(option));
 }
 
-function findAliasSeparator(value: string): number {
+function splitFmeOptionList(value: string): string[] {
+  const delimiters = ["%", "|", ";"];
+  for (const delimiter of delimiters) {
+    const parts = splitRespectingQuotes(value, delimiter);
+    if (parts.length > 1) {
+      return parts;
+    }
+  }
+
+  const commaParts = splitCsvLike(value);
+  if (commaParts.length > 2) {
+    return commaParts;
+  }
+  return [value];
+}
+
+function splitFmeList(value: string): string[] {
+  const decoded = decodeXmlEntities(value).replace(/%space%/gi, "<space>");
+  const percentParts = splitRespectingQuotes(decoded, "%");
+  if (percentParts.length > 1) {
+    return percentParts.map((part) => cleanFmeScalar(part));
+  }
+  return splitRespectingQuotes(decoded, ",").map((part) => cleanFmeScalar(part));
+}
+
+function splitCsvLike(value: string): string[] {
+  return splitRespectingQuotes(value, ",");
+}
+
+function splitRespectingQuotes(value: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  let escaped = false;
   let angleDepth = 0;
+
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
+
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === "\"" || character === "'") {
+      quote = character;
+      continue;
+    }
     if (character === "<") {
       angleDepth += 1;
     } else if (character === ">" && angleDepth > 0) {
       angleDepth -= 1;
-    } else if (character === "," && angleDepth === 0) {
-      return index;
     }
+    if (character === delimiter && angleDepth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+
+    current += character;
   }
-  return -1;
+
+  if (escaped) {
+    current += "\\";
+  }
+  parts.push(current);
+  return parts.map((part) => part.trim()).filter(Boolean);
 }
 
 function resolveWorkspacePackagePath(value: string | null, context: WorkspaceParseContext): string | null {
@@ -1273,14 +1693,17 @@ function parseXmlAttributes(text: string): Record<string, string> {
   return attrs;
 }
 
-function parseGuiLine(guiLine: string): { type: string; name: string; label: string; choices: string | null } | null {
+function parseGuiLine(guiLine: string): ParsedGuiLine | null {
   if (!guiLine) {
     return null;
   }
-  const tokens = [...guiLine.matchAll(/"([^"]*)"|(\S+)/g)].map((match) => match[1] ?? match[2]);
+  const raw = decodeXmlEntities(guiLine.trim());
+  const tokens = tokenizeFmeLine(raw);
   const guiIndex = tokens.findIndex((token) => token.toUpperCase() === "GUI");
   let start = guiIndex >= 0 ? guiIndex + 1 : 0;
-  while (["OPTIONAL", "WHOLE_LINE"].includes((tokens[start] || "").toUpperCase())) {
+  const flags: string[] = [];
+  while (["OPTIONAL", "WHOLE_LINE", "NO_EDIT"].includes((tokens[start] || "").toUpperCase())) {
+    flags.push(tokens[start].toUpperCase());
     start += 1;
   }
   const type = tokens[start];
@@ -1288,14 +1711,89 @@ function parseGuiLine(guiLine: string): { type: string; name: string; label: str
   if (!type || !name) {
     return null;
   }
-  const labelTokens = tokens.slice(start + 2);
-  const choiceToken = labelTokens.find((token) => /[%|;]/.test(token));
+  const tailTokens = tokens.slice(start + 2);
+  const typeUpper = type.toUpperCase();
+  const firstTailToken = tailTokens[0] || null;
+  const choices = isChoiceGuiType(typeUpper) && firstTailToken
+    ? firstTailToken
+    : null;
+  const settings = !choices && firstTailToken && shouldTreatFirstTailTokenAsSettings(typeUpper, firstTailToken)
+    ? firstTailToken
+    : null;
+  const labelStart = choices || settings ? 1 : 0;
+  const label = decodeFmeTokens(tailTokens.slice(labelStart).join(" ")) || prettifyName(name);
+
   return {
     type,
     name,
-    label: decodeFmeTokens(labelTokens.filter((token) => token !== choiceToken).join(" ")) || prettifyName(name),
-    choices: choiceToken || null
+    label,
+    choices,
+    settings,
+    flags,
+    raw
   };
+}
+
+function tokenizeFmeLine(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  let escaped = false;
+
+  const pushCurrent = () => {
+    if (current) {
+      tokens.push(current);
+      current = "";
+    }
+  };
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote) {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === "\"" || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      pushCurrent();
+      continue;
+    }
+    current += character;
+  }
+
+  if (escaped) {
+    current += "\\";
+  }
+  pushCurrent();
+  return tokens;
+}
+
+function isChoiceGuiType(type: string): boolean {
+  return /(?:^|_)CHOICE(?:_|$)|LOOKUP_CHOICE|ACTIVECHOICE|CHECKBOX|RADIO/i.test(type);
+}
+
+function shouldTreatFirstTailTokenAsSettings(type: string, token: string): boolean {
+  if (/^(TEXT_EDIT|RANGE_SLIDER|MULTIFILE|MULTIDIRECTORY|FILENAME|FILE|AUTHENTICATOR|LITERAL|DISCLOSUREGROUP|ACTIVEDISCLOSUREGROUP)/i.test(type)) {
+    return true;
+  }
+  return /^(?:INCLUDE_|FME_|RANGE:|CONTAINER|GROUP|PROMPT_TYPE|PATH$|EXPOSED_ATTRS$)/i.test(token) || /%/.test(token);
 }
 
 function decodeXmlEntities(value: string): string {

@@ -423,10 +423,6 @@ function isParameterVisible(
     return visibilityResult;
   }
 
-  if (isDatasmithOnlyParameter(parameter)) {
-    return isDatasmithOutputValue(getOutputFormatValue(values));
-  }
-
   return true;
 }
 
@@ -444,7 +440,9 @@ function evaluateVisibilityRule(
       ? [rule.if]
       : null;
   if (!branches) {
-    return null;
+    return isVisibilityConditionLike(rule)
+      ? evaluateVisibilityCondition(rule, values)
+      : null;
   }
 
   for (const branch of branches) {
@@ -478,6 +476,9 @@ function evaluateVisibilityCondition(condition: unknown, values: Record<string, 
   if (Array.isArray(condition.$and)) {
     return condition.$and.every((item) => evaluateVisibilityCondition(item, values));
   }
+  if (Array.isArray(condition.conditions)) {
+    return condition.conditions.every((item) => evaluateVisibilityCondition(item, values));
+  }
   if ("$not" in condition) {
     return !evaluateVisibilityCondition(condition.$not, values);
   }
@@ -491,14 +492,74 @@ function evaluateVisibilityCondition(condition: unknown, values: Record<string, 
       condition.$equals.value
     );
   }
+  if (isRecord(condition.$in)) {
+    const parameterName = stringValue(condition.$in.parameter);
+    if (!parameterName) {
+      return false;
+    }
+    return parameterValueEquals(
+      getParameterValue(values, parameterName),
+      Array.isArray(condition.$in.values) ? condition.$in.values : condition.$in.value
+    );
+  }
+  if (isRecord(condition.$exists)) {
+    const parameterName = stringValue(condition.$exists.parameter);
+    return parameterName ? getParameterValue(values, parameterName) !== undefined : false;
+  }
+  if (isRecord(condition.$isTruthy)) {
+    const parameterName = stringValue(condition.$isTruthy.parameter);
+    return parameterName ? isTruthyParameterValue(getParameterValue(values, parameterName)) : false;
+  }
   if (isRecord(condition.$isEnabled)) {
-    return Boolean(stringValue(condition.$isEnabled.parameter));
+    const parameterName = stringValue(condition.$isEnabled.parameter);
+    return parameterName ? isTruthyParameterValue(getParameterValue(values, parameterName)) : false;
+  }
+
+  const directParameterName = stringValue(
+    condition.parameter ??
+    condition.parameterName ??
+    condition.name ??
+    condition.field
+  );
+  if (directParameterName) {
+    if ("values" in condition || "in" in condition) {
+      return parameterValueEquals(
+        getParameterValue(values, directParameterName),
+        condition.values ?? condition.in
+      );
+    }
+    if ("value" in condition || "equals" in condition || "equalTo" in condition) {
+      return parameterValueEquals(
+        getParameterValue(values, directParameterName),
+        condition.value ?? condition.equals ?? condition.equalTo
+      );
+    }
+    return isTruthyParameterValue(getParameterValue(values, directParameterName));
   }
 
   const nestedConditions = Object.entries(condition).filter(([key]) => key !== "then");
   return nestedConditions.length
     ? nestedConditions.every(([, value]) => evaluateVisibilityCondition(value, values))
     : true;
+}
+
+function isVisibilityConditionLike(rule: Record<string, unknown>): boolean {
+  return [
+    "$allOf",
+    "$anyOf",
+    "$or",
+    "$and",
+    "$not",
+    "$equals",
+    "$in",
+    "$exists",
+    "$isTruthy",
+    "$isEnabled",
+    "conditions",
+    "parameter",
+    "parameterName",
+    "field"
+  ].some((key) => key in rule);
 }
 
 function parameterValueEquals(actual: unknown, expected: unknown): boolean {
@@ -511,6 +572,14 @@ function parameterValueEquals(actual: unknown, expected: unknown): boolean {
   return stringValue(actual).toUpperCase() === stringValue(expected).toUpperCase();
 }
 
+function isTruthyParameterValue(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => isTruthyParameterValue(item));
+  }
+  const text = stringValue(value);
+  return Boolean(text) && !/^(false|no|0|off|disabled|hidden|none|null|undefined)$/i.test(text);
+}
+
 function getParameterValue(values: Record<string, unknown>, parameterName: string): unknown {
   if (Object.prototype.hasOwnProperty.call(values, parameterName)) {
     return values[parameterName];
@@ -518,21 +587,6 @@ function getParameterValue(values: Record<string, unknown>, parameterName: strin
   const normalizedName = parameterName.toLowerCase();
   const matchingKey = Object.keys(values).find((key) => key.toLowerCase() === normalizedName);
   return matchingKey ? values[matchingKey] : undefined;
-}
-
-function getOutputFormatValue(values: Record<string, unknown>): unknown {
-  const matchingKey = Object.keys(values).find((key) => /output[_\s-]*format|输出文件格式|输出格式/i.test(key));
-  return matchingKey ? values[matchingKey] : undefined;
-}
-
-function isDatasmithOnlyParameter(parameter: TemplateParameter): boolean {
-  const text = `${parameter.name} ${parameter.label}`.toLowerCase();
-  return /datasmith|unreal|ue工程|工程坐标原点/i.test(text)
-    && /wgs84|经度|纬度|坐标原点/i.test(text);
-}
-
-function isDatasmithOutputValue(value: unknown): boolean {
-  return /UDATASMITH|DATASMITH|Epic Games Unreal Datasmith/i.test(stringValue(value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

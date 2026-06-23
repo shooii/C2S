@@ -196,11 +196,34 @@ function decodeBase64(value: string): string {
 
 const selectorHostScript = `
 $ErrorActionPreference = "Stop"
-Add-Type @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -ReferencedAssemblies "System.Windows.Forms.dll" -TypeDefinition @"
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Windows.Forms;
+
+public sealed class C2SHiddenDialogOwner : Form
+{
+    public C2SHiddenDialogOwner()
+    {
+        ShowInTaskbar = false;
+        FormBorderStyle = FormBorderStyle.FixedToolWindow;
+        StartPosition = FormStartPosition.Manual;
+        Opacity = 0;
+        Width = 1;
+        Height = 1;
+        Left = -32000;
+        Top = -32000;
+        Text = String.Empty;
+    }
+
+    protected override bool ShowWithoutActivation
+    {
+        get { return true; }
+    }
+}
 
 public static class C2SDialogFocus
 {
@@ -363,9 +386,12 @@ public static class C2SPathPicker
     {
         bool pickFolder = String.Equals(kind, "folder", StringComparison.OrdinalIgnoreCase);
         IFileOpenDialog dialog = null;
+        C2SHiddenDialogOwner owner = null;
 
         try
         {
+            owner = new C2SHiddenDialogOwner();
+            IntPtr ownerHandle = owner.Handle;
             dialog = (IFileOpenDialog)new FileOpenDialog();
             uint options;
             ThrowIfFailed(dialog.GetOptions(out options));
@@ -383,7 +409,7 @@ public static class C2SPathPicker
             ThrowIfFailed(dialog.SetFileNameLabel(pickFolder ? "文件夹:" : "文件:"));
             ApplyInitialPath(dialog, initialPath, pickFolder);
 
-            int showResult = dialog.Show(IntPtr.Zero);
+            int showResult = dialog.Show(ownerHandle);
             if (showResult == HRESULT_CANCELLED)
             {
                 return new string[0];
@@ -402,6 +428,10 @@ public static class C2SPathPicker
             if (dialog != null)
             {
                 Marshal.ReleaseComObject(dialog);
+            }
+            if (owner != null)
+            {
+                owner.Dispose();
             }
         }
     }
