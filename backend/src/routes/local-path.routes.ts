@@ -9,6 +9,14 @@ router.post(
   "/select",
   asyncHandler(async (req, res) => {
     assertLocalRequest(req.socket.remoteAddress);
+    const controller = new AbortController();
+    const abortSelection = () => {
+      if (!res.writableEnded) {
+        controller.abort();
+      }
+    };
+    req.once("aborted", abortSelection);
+    res.once("close", abortSelection);
     const kind = req.body?.kind;
     if (kind !== "file" && kind !== "folder") {
       throw new HttpError(400, "kind 必须是 file 或 folder");
@@ -20,9 +28,20 @@ router.post(
     const title = typeof req.body?.title === "string"
       ? req.body.title.trim().slice(0, 120)
       : null;
-    res.json({
-      data: await selectLocalPath({ kind, initialPath, multiple, title })
-    });
+    try {
+      res.json({
+        data: await selectLocalPath({
+          kind,
+          initialPath,
+          multiple,
+          title,
+          signal: controller.signal
+        })
+      });
+    } finally {
+      req.off("aborted", abortSelection);
+      res.off("close", abortSelection);
+    }
   })
 );
 

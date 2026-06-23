@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   App,
@@ -844,6 +844,7 @@ function PathParameterInput({
 }) {
   const { message } = App.useApp();
   const [selecting, setSelecting] = useState(false);
+  const selectionAbortRef = useRef<AbortController | null>(null);
   const kind = getPathKind(parameter);
   const multipleFiles = kind === "file" && parameter.multiple;
   const selectedPaths = useMemo(
@@ -853,7 +854,18 @@ function PathParameterInput({
   const buttonLabel = kind === "folder" ? "选择目录" : multipleFiles ? "选择多个文件" : "选择文件";
   const selectedSummary = summarizeSelectedPaths(selectedPaths, kind, multipleFiles);
 
+  useEffect(() => () => {
+    selectionAbortRef.current?.abort();
+    selectionAbortRef.current = null;
+  }, []);
+
   const selectPath = async () => {
+    if (selecting) {
+      return;
+    }
+    selectionAbortRef.current?.abort();
+    const controller = new AbortController();
+    selectionAbortRef.current = controller;
     setSelecting(true);
     try {
       const result = await api.selectLocalPath({
@@ -861,15 +873,22 @@ function PathParameterInput({
         initialPath: firstPathValue(value),
         multiple: multipleFiles,
         title: pathPickerTitle(parameter, kind, multipleFiles)
+      }, {
+        signal: controller.signal
       });
       if (!result.cancelled && result.paths.length) {
         onChange?.(formatSelectedPathValue(result.paths, multipleFiles));
         message.success(selectionSuccessMessage(result.paths, kind, multipleFiles));
       }
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "本地路径选择失败");
+      if (!controller.signal.aborted) {
+        message.error(error instanceof Error ? error.message : "本地路径选择失败");
+      }
     } finally {
-      setSelecting(false);
+      if (selectionAbortRef.current === controller) {
+        selectionAbortRef.current = null;
+        setSelecting(false);
+      }
     }
   };
 

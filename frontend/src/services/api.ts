@@ -24,6 +24,8 @@ const http = axios.create({
   timeout: 30_000
 });
 
+const LOCAL_PATH_SELECTION_TIMEOUT_MS = 60_000;
+
 http.interceptors.response.use(
   (response) => response,
   (error) => {
@@ -45,9 +47,18 @@ export const api = {
     initialPath?: string;
     multiple?: boolean;
     title?: string;
-  }) => unwrap<{ cancelled: boolean; paths: string[] }>(
-    http.post("/api/local-paths/select", payload, { timeout: 0 })
-  ),
+  }, options?: { signal?: AbortSignal }) =>
+    unwrap<{ cancelled: boolean; paths: string[] }>(
+      http.post("/api/local-paths/select", payload, {
+        signal: options?.signal,
+        timeout: LOCAL_PATH_SELECTION_TIMEOUT_MS
+      })
+    ).catch((error) => {
+      if (error instanceof Error && /timeout|aborted|canceled/i.test(error.message)) {
+        throw new Error("本地路径选择窗口未响应，请重试");
+      }
+      throw error;
+    }),
 
   listTemplates: (params?: { search?: string; enabled?: boolean }) =>
     unwrap<TemplateRecord[]>(http.get("/api/templates", { params })),

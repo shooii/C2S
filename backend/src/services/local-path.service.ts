@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { HttpError } from "../utils/httpError";
 
 export interface LocalPathSelection {
@@ -14,148 +17,42 @@ interface SelectionRequest {
   title: string;
 }
 
-interface PendingSelection {
-  resolve: (result: LocalPathSelection) => void;
-  reject: (error: Error) => void;
+interface OneShotSelectorResult {
+  cancelled?: unknown;
+  paths?: unknown;
+  error?: unknown;
 }
 
+const LOCAL_PATH_SELECTION_TIMEOUT_MS = 120_000;
+
 class WindowsPathSelector {
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private readyPromise: Promise<void> | null = null;
-  private readyResolve: (() => void) | null = null;
-  private readyReject: ((error: Error) => void) | null = null;
-  private stdoutBuffer = "";
-  private stderrBuffer = "";
-  private pending = new Map<string, PendingSelection>();
-
   warmUp(): void {
-    if (process.platform === "win32") {
-      void this.ensureReady()
-        .then(() => console.log("[C2S] Local path selector ready"))
-        .catch((error) => {
-          console.error(`[C2S] Local path selector warm-up failed: ${error.message}`);
-        });
-    }
+    return;
   }
 
-  async select(request: SelectionRequest): Promise<LocalPathSelection> {
-    await this.ensureReady();
-    const child = this.child;
-    if (!child) {
-      throw new Error("本地路径选择器未启动");
-    }
-
+  async select(request: SelectionRequest, signal?: AbortSignal): Promise<LocalPathSelection> {
     const id = randomUUID();
-    const payload = encodeBase64(JSON.stringify(request));
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      child.stdin.write(`${id}|${payload}\n`, "utf8", (error) => {
-        if (!error) {
-          return;
-        }
-        this.pending.delete(id);
-        reject(error);
-      });
+    const resultPath = join(tmpdir(), `c2s-local-path-selection-${id}.json`);
+    const scriptPath = join(tmpdir(), `c2s-local-path-selector-${id}.ps1`);
+
+    await writeFile(scriptPath, buildOneShotSelectorScript(request, resultPath), "utf8");
+
+    const child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-STA",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-WindowStyle",
+      "Hidden",
+      "-File",
+      scriptPath
+    ], {
+      stdio: "ignore",
+      windowsHide: true
     });
-  }
+    child.unref();
 
-  private ensureReady(): Promise<void> {
-    if (this.readyPromise) {
-      return this.readyPromise;
-    }
-
-    this.readyPromise = new Promise((resolve, reject) => {
-      this.readyResolve = resolve;
-      this.readyReject = reject;
-    });
-    this.start();
-    return this.readyPromise;
-  }
-
-  private start(): void {
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-STA", "-NonInteractive", "-Command", selectorHostScript],
-      { windowsHide: true }
-    );
-    this.child = child;
-    this.stdoutBuffer = "";
-    this.stderrBuffer = "";
-
-    child.stdout.on("data", (buffer: Buffer) => {
-      this.stdoutBuffer += buffer.toString("utf8");
-      this.consumeStdout();
-    });
-    child.stderr.on("data", (buffer: Buffer) => {
-      this.stderrBuffer += buffer.toString("utf8");
-    });
-    child.on("error", (error) => this.handleExit(error));
-    child.on("close", (code) => {
-      this.handleExit(new Error(
-        this.stderrBuffer.trim() || `本地路径选择器已退出（${code ?? "unknown"}）`
-      ));
-    });
-  }
-
-  private consumeStdout(): void {
-    let newlineIndex = this.stdoutBuffer.indexOf("\n");
-    while (newlineIndex >= 0) {
-      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
-      if (line) {
-        this.handleLine(line);
-      }
-      newlineIndex = this.stdoutBuffer.indexOf("\n");
-    }
-  }
-
-  private handleLine(line: string): void {
-    if (line === "READY") {
-      this.readyResolve?.();
-      this.readyResolve = null;
-      this.readyReject = null;
-      return;
-    }
-
-    const [id, status, encodedPayload] = line.split("|", 3);
-    const pending = this.pending.get(id);
-    if (!pending) {
-      return;
-    }
-    this.pending.delete(id);
-
-    try {
-      if (status === "ERROR") {
-        pending.reject(new Error(decodeBase64(encodedPayload) || "本地路径选择失败"));
-        return;
-      }
-      const paths = JSON.parse(decodeBase64(encodedPayload));
-      if (!Array.isArray(paths) || paths.some((value) => typeof value !== "string")) {
-        throw new Error("本地路径选择结果无效");
-      }
-      pending.resolve({
-        cancelled: status === "CANCELLED",
-        paths
-      });
-    } catch (error) {
-      pending.reject(error instanceof Error ? error : new Error("本地路径选择结果解析失败"));
-    }
-  }
-
-  private handleExit(error: Error): void {
-    if (!this.child && !this.readyPromise) {
-      return;
-    }
-    this.child = null;
-    this.readyReject?.(error);
-    this.readyPromise = null;
-    this.readyResolve = null;
-    this.readyReject = null;
-    this.stderrBuffer = "";
-    for (const pending of this.pending.values()) {
-      pending.reject(error);
-    }
-    this.pending.clear();
+    return waitForOneShotSelection(child, resultPath, scriptPath, signal);
   }
 }
 
@@ -170,132 +67,142 @@ export function selectLocalPath(options: {
   initialPath?: string | null;
   multiple?: boolean;
   title?: string | null;
+  signal?: AbortSignal;
 }): Promise<LocalPathSelection> {
   if (process.platform !== "win32") {
     throw new HttpError(501, "本地路径选择器目前仅支持 Windows");
   }
-  return windowsPathSelector.select({
-    kind: options.kind,
-    initialPath: options.initialPath || "",
-    multiple: Boolean(options.multiple),
-    title: normalizeDialogTitle(options.title)
-  });
+
+  return windowsPathSelector.select(
+    {
+      kind: options.kind,
+      initialPath: options.initialPath || "",
+      multiple: Boolean(options.multiple),
+      title: normalizeDialogTitle(options.title)
+    },
+    options.signal
+  );
 }
 
 function normalizeDialogTitle(value: string | null | undefined): string {
   return (value || "").trim().slice(0, 120);
 }
 
-function encodeBase64(value: string): string {
-  return Buffer.from(value, "utf8").toString("base64");
+function waitForOneShotSelection(
+  child: ChildProcess,
+  resultPath: string,
+  scriptPath: string,
+  signal?: AbortSignal
+): Promise<LocalPathSelection> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let polling = false;
+
+    const cleanup = () => {
+      void rm(resultPath, { force: true });
+      void rm(scriptPath, { force: true });
+    };
+
+    const finish = (error: Error | null, result?: LocalPathSelection) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearInterval(interval);
+      clearTimeout(timeout);
+      child.removeAllListeners();
+      signal?.removeEventListener("abort", abortSelection);
+      if (!child.killed) {
+        child.kill();
+      }
+      cleanup();
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(result || { cancelled: true, paths: [] });
+    };
+
+    const abortSelection = () => {
+      finish(new Error("本地路径选择已取消"));
+    };
+
+    if (signal?.aborted) {
+      abortSelection();
+      return;
+    }
+    signal?.addEventListener("abort", abortSelection, { once: true });
+
+    const readResult = async (finalAttempt = false) => {
+      if (settled || polling) {
+        return;
+      }
+      polling = true;
+      try {
+        const text = await readFile(resultPath, "utf8");
+        finish(null, parseOneShotSelectionResult(text));
+      } catch (error) {
+        if (isFileNotFound(error)) {
+          if (finalAttempt) {
+            finish(new Error("本地路径选择器未返回结果"));
+          }
+          return;
+        }
+        finish(error instanceof Error ? error : new Error("本地路径选择结果读取失败"));
+      } finally {
+        polling = false;
+      }
+    };
+
+    const interval = setInterval(() => {
+      void readResult();
+    }, 200);
+    interval.unref?.();
+
+    const timeout = setTimeout(() => {
+      finish(new Error("本地路径选择窗口未响应，请重试"));
+    }, LOCAL_PATH_SELECTION_TIMEOUT_MS);
+    timeout.unref?.();
+
+    child.once("error", (error) => finish(error));
+    child.once("exit", () => {
+      setTimeout(() => {
+        void readResult(true);
+      }, 300).unref?.();
+    });
+  });
 }
 
-function decodeBase64(value: string): string {
-  return Buffer.from(value || "", "base64").toString("utf8");
+function parseOneShotSelectionResult(text: string): LocalPathSelection {
+  const parsed = JSON.parse(text) as OneShotSelectorResult;
+  if (typeof parsed.error === "string" && parsed.error.trim()) {
+    throw new Error(parsed.error);
+  }
+  const paths = Array.isArray(parsed.paths)
+    ? parsed.paths.filter((value): value is string => typeof value === "string")
+    : [];
+  return {
+    cancelled: parsed.cancelled === true || paths.length === 0,
+    paths
+  };
 }
 
-const selectorHostScript = `
+function isFileNotFound(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+function buildOneShotSelectorScript(request: SelectionRequest, resultPath: string): string {
+  const requestPayload = encodeBase64(JSON.stringify(request));
+  const resultPathPayload = encodeBase64(resultPath);
+  return `
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -ReferencedAssemblies "System.Windows.Forms.dll" -TypeDefinition @"
+Add-Type -TypeDefinition @"
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Windows.Forms;
 
-public sealed class C2SHiddenDialogOwner : Form
-{
-    public C2SHiddenDialogOwner()
-    {
-        ShowInTaskbar = false;
-        FormBorderStyle = FormBorderStyle.FixedToolWindow;
-        StartPosition = FormStartPosition.Manual;
-        Opacity = 0;
-        Width = 1;
-        Height = 1;
-        Left = -32000;
-        Top = -32000;
-        Text = String.Empty;
-    }
-
-    protected override bool ShowWithoutActivation
-    {
-        get { return true; }
-    }
-}
-
-public static class C2SDialogFocus
-{
-    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr extraData);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool SetWindowPos(
-        IntPtr hWnd,
-        IntPtr hWndInsertAfter,
-        int x,
-        int y,
-        int width,
-        int height,
-        uint flags
-    );
-
-    public static void Start()
-    {
-        uint currentProcessId = (uint)Process.GetCurrentProcess().Id;
-        Thread thread = new Thread(delegate()
-        {
-            for (int attempt = 0; attempt < 50; attempt++)
-            {
-                Thread.Sleep(100);
-                bool found = false;
-                EnumWindows(delegate(IntPtr hWnd, IntPtr extraData)
-                {
-                    uint processId;
-                    GetWindowThreadProcessId(hWnd, out processId);
-                    if (processId != currentProcessId || !IsWindowVisible(hWnd))
-                    {
-                        return true;
-                    }
-
-                    SetWindowPos(
-                        hWnd,
-                        new IntPtr(-1),
-                        0,
-                        0,
-                        0,
-                        0,
-                        0x0001 | 0x0002 | 0x0040
-                    );
-                    SetForegroundWindow(hWnd);
-                    found = true;
-                    return false;
-                }, IntPtr.Zero);
-
-                if (found)
-                {
-                    return;
-                }
-            }
-        });
-        thread.IsBackground = true;
-        thread.Start();
-    }
-}
-
-public static class C2SPathPicker
+public static class C2SNativeFilePicker
 {
     private const uint FOS_PICKFOLDERS = 0x00000020;
     private const uint FOS_FORCEFILESYSTEM = 0x00000040;
@@ -303,7 +210,10 @@ public static class C2SPathPicker
     private const uint FOS_PATHMUSTEXIST = 0x00000800;
     private const uint FOS_FILEMUSTEXIST = 0x00001000;
     private const uint SIGDN_FILESYSPATH = 0x80058000;
-    private static readonly int HRESULT_CANCELLED = unchecked((int)0x800704C7);
+    private const int HRESULT_CANCELLED = unchecked((int)0x800704C7);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 
     [ComImport]
     [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
@@ -386,12 +296,9 @@ public static class C2SPathPicker
     {
         bool pickFolder = String.Equals(kind, "folder", StringComparison.OrdinalIgnoreCase);
         IFileOpenDialog dialog = null;
-        C2SHiddenDialogOwner owner = null;
 
         try
         {
-            owner = new C2SHiddenDialogOwner();
-            IntPtr ownerHandle = owner.Handle;
             dialog = (IFileOpenDialog)new FileOpenDialog();
             uint options;
             ThrowIfFailed(dialog.GetOptions(out options));
@@ -404,34 +311,28 @@ public static class C2SPathPicker
             }
 
             ThrowIfFailed(dialog.SetOptions(nextOptions));
-            ThrowIfFailed(dialog.SetTitle(title));
-            ThrowIfFailed(dialog.SetOkButtonLabel(pickFolder ? "选择文件夹" : "选择文件"));
-            ThrowIfFailed(dialog.SetFileNameLabel(pickFolder ? "文件夹:" : "文件:"));
+            if (!String.IsNullOrWhiteSpace(title))
+            {
+                ThrowIfFailed(dialog.SetTitle(title));
+            }
             ApplyInitialPath(dialog, initialPath, pickFolder);
 
-            int showResult = dialog.Show(ownerHandle);
+            int showResult = dialog.Show(GetForegroundWindow());
             if (showResult == HRESULT_CANCELLED)
             {
                 return new string[0];
             }
             ThrowIfFailed(showResult);
 
-            if (!pickFolder && multiple)
-            {
-                return GetMultipleResultPaths(dialog);
-            }
-
-            return GetSingleResultPath(dialog);
+            return (!pickFolder && multiple)
+                ? GetMultipleResultPaths(dialog)
+                : GetSingleResultPath(dialog);
         }
         finally
         {
             if (dialog != null)
             {
                 Marshal.ReleaseComObject(dialog);
-            }
-            if (owner != null)
-            {
-                owner.Dispose();
             }
         }
     }
@@ -449,22 +350,22 @@ public static class C2SPathPicker
 
         try
         {
-            if (System.IO.Directory.Exists(text))
+            if (Directory.Exists(text))
             {
                 initialDirectory = text;
             }
-            else if (System.IO.File.Exists(text))
+            else if (File.Exists(text))
             {
-                initialDirectory = System.IO.Path.GetDirectoryName(text);
-                initialFileName = System.IO.Path.GetFileName(text);
+                initialDirectory = Path.GetDirectoryName(text);
+                initialFileName = Path.GetFileName(text);
             }
             else
             {
-                string parent = System.IO.Path.GetDirectoryName(text);
-                if (!String.IsNullOrWhiteSpace(parent) && System.IO.Directory.Exists(parent))
+                string parent = Path.GetDirectoryName(text);
+                if (!String.IsNullOrWhiteSpace(parent) && Directory.Exists(parent))
                 {
                     initialDirectory = parent;
-                    initialFileName = System.IO.Path.GetFileName(text);
+                    initialFileName = Path.GetFileName(text);
                 }
             }
         }
@@ -531,7 +432,7 @@ public static class C2SPathPicker
 
             uint count;
             ThrowIfFailed(items.GetCount(out count));
-            System.Collections.Generic.List<string> paths = new System.Collections.Generic.List<string>();
+            List<string> paths = new List<string>();
 
             for (uint index = 0; index < count; index++)
             {
@@ -592,55 +493,42 @@ public static class C2SPathPicker
 }
 "@
 
-[Console]::Out.WriteLine("READY")
-[Console]::Out.Flush()
+$requestJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${requestPayload}"))
+$resultPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${resultPathPayload}"))
 
-while (($line = [Console]::In.ReadLine()) -ne $null) {
-  if (-not $line) { continue }
-  $separator = $line.IndexOf("|")
-  if ($separator -lt 1) { continue }
-  $id = $line.Substring(0, $separator)
-  try {
-    $payload = $line.Substring($separator + 1)
-    $json = [System.Text.Encoding]::UTF8.GetString(
-      [System.Convert]::FromBase64String($payload)
-    )
-    $request = ConvertFrom-Json $json
-    $paths = @()
-    $cancelled = $false
+function Write-C2SSelectionResult {
+  param([hashtable]$Value)
+  $json = $Value | ConvertTo-Json -Compress -Depth 5
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($resultPath, $json, $utf8)
+}
 
-    $title = if (-not [String]::IsNullOrWhiteSpace([string]$request.title)) {
-      [string]$request.title
-    } elseif ($request.kind -eq "folder") {
-      "选择目录路径"
-    } else {
-      "选择文件路径"
-    }
-    [C2SDialogFocus]::Start()
-    $selectedPaths = [C2SPathPicker]::SelectPaths(
-      [string]$request.kind,
-      $title,
-      [string]$request.initialPath,
-      [bool]$request.multiple
-    )
-    if ($selectedPaths -and $selectedPaths.Length -gt 0) {
-      $paths = @($selectedPaths)
-    } else {
-      $cancelled = $true
-    }
-
-    $resultJson = ConvertTo-Json -Compress -InputObject @($paths)
-    $result = [System.Convert]::ToBase64String(
-      [System.Text.Encoding]::UTF8.GetBytes($resultJson)
-    )
-    $status = if ($cancelled) { "CANCELLED" } else { "OK" }
-    [Console]::Out.WriteLine("$id|$status|$result")
-  } catch {
-    $errorPayload = [System.Convert]::ToBase64String(
-      [System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)
-    )
-    [Console]::Out.WriteLine("$id|ERROR|$errorPayload")
+try {
+  $request = ConvertFrom-Json $requestJson
+  $kind = [string]$request.kind
+  $multiple = [bool]$request.multiple
+  $title = [string]$request.title
+  if ([System.String]::IsNullOrWhiteSpace($title)) {
+    $title = if ($kind -eq "folder") { "选择目录路径" } else { "选择文件路径" }
   }
-  [Console]::Out.Flush()
+
+  $paths = @([C2SNativeFilePicker]::SelectPaths(
+    $kind,
+    $title,
+    [string]$request.initialPath,
+    $multiple
+  ))
+  if (-not $paths) {
+    $paths = @()
+  }
+
+  Write-C2SSelectionResult @{ cancelled = (@($paths).Count -eq 0); paths = @($paths) }
+} catch {
+  Write-C2SSelectionResult @{ cancelled = $true; paths = @(); error = $_.Exception.Message }
 }
 `;
+}
+
+function encodeBase64(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64");
+}
