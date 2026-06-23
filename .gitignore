@@ -3,6 +3,8 @@ dist/
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+frontend/vite/**/*.js
+frontend/vite/**/*.d.ts
 .env
 .env.*
 !.env.example

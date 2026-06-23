@@ -279,191 +279,39 @@ if (
 ) {
   failures.push("src/pages/Preview/index.tsx: FPS status updates should throttle small value jitter without delaying adaptive performance mode changes");
 }
-if (!previewPage.includes("hasCancelableInteraction") || !previewPage.includes("const cancelledInteraction = globeControls?._cancelInteractionMomentum?.({ clearHint: false }) ?? false") || !previewPage.includes("if (!cancelledInteraction)")) {
-  failures.push("src/pages/Preview/index.tsx: Escape should only keep the stopped-inertia hint when a globe interaction was actually cancelled");
-}
-const sceneRefreshStart = previewPage.indexOf("notifySceneRefreshRef.current = (options) => {");
-const sceneRefreshEnd = previewPage.indexOf("const handlePreviewVisibilityChange", sceneRefreshStart);
-const sceneRefreshBranch = sceneRefreshStart >= 0 && sceneRefreshEnd > sceneRefreshStart
-  ? previewPage.slice(sceneRefreshStart, sceneRefreshEnd)
-  : "";
-if (!sceneRefreshBranch.includes("options?.syncCamera") || !sceneRefreshBranch.includes("syncSceneViewState()")) {
-  failures.push("src/pages/Preview/index.tsx: camera view commands should immediately sync scene view state after refreshing the camera");
-}
-if (!previewPage.includes("PREVIEW_INTERACTION_MARK_INTERVAL_MS") || !previewPage.includes("lastPreviewInteractionMarkTime") || !previewPage.includes("now - lastPreviewInteractionMarkTime < PREVIEW_INTERACTION_MARK_INTERVAL_MS")) {
-  failures.push("src/pages/Preview/index.tsx: interaction marking should be throttled during continuous pointer movement");
-}
-const globeInteractionStart = previewPage.indexOf("function attachCesiumLikeGlobeInteractions(");
-const globeInteractionEnd = previewPage.indexOf("function normalizeGlobeWheelZoomDelta", globeInteractionStart);
-const globeInteractionBranch = globeInteractionStart >= 0 && globeInteractionEnd > globeInteractionStart
-  ? previewPage.slice(globeInteractionStart, globeInteractionEnd)
-  : "";
-if (!globeInteractionBranch.includes("currentInteractionHint") || !globeInteractionBranch.includes("currentInteractionHint === hint") || !globeInteractionBranch.includes("emitInteractionHint(null)")) {
-  failures.push("src/pages/Preview/index.tsx: globe interaction hints should avoid repeatedly notifying React with the same high-frequency hint");
-}
-if (!previewPage.includes("!isGlobePanModifier(event) && Boolean(getModelHitFromEvent(event))")) {
-  failures.push("src/pages/Preview/index.tsx: globe pan modifier drags should not raycast or bypass on model hits");
-}
-if (!globeInteractionBranch.includes('const shouldClearSelection = leftCandidate.mode !== "pan"') || !globeInteractionBranch.includes("if (shouldClearSelection)")) {
-  failures.push("src/pages/Preview/index.tsx: globe pan modifier clicks should not clear the selected model layer");
-}
-const globePointerDownStart = globeInteractionBranch.indexOf("const handlePointerDown = (event: PointerEvent) => {");
-const globePointerDownEnd = globeInteractionBranch.indexOf("const handlePointerMove", globePointerDownStart);
-const globePointerDownBranch = globePointerDownStart >= 0 && globePointerDownEnd > globePointerDownStart
-  ? globeInteractionBranch.slice(globePointerDownStart, globePointerDownEnd)
-  : "";
-const globePointerMoveStart = globeInteractionBranch.indexOf("const handlePointerMove = (event: PointerEvent) => {");
-const globePointerMoveEnd = globeInteractionBranch.indexOf("const handlePointerEnd", globePointerMoveStart);
-const globePointerMoveBranch = globePointerMoveStart >= 0 && globePointerMoveEnd > globePointerMoveStart
-  ? globeInteractionBranch.slice(globePointerMoveStart, globePointerMoveEnd)
-  : "";
-const stalePointerGestureStart = globeInteractionBranch.indexOf("const cancelStalePointerGesture = (event: PointerEvent, endGesture: (event: PointerEvent) => void) => {");
-const stalePointerGestureEnd = globeInteractionBranch.indexOf("const handlePointerDown", stalePointerGestureStart);
-const stalePointerGestureBranch = stalePointerGestureStart >= 0 && stalePointerGestureEnd > stalePointerGestureStart
-  ? globeInteractionBranch.slice(stalePointerGestureStart, stalePointerGestureEnd)
-  : "";
 if (
-  !globePointerDownBranch.includes("controls.resetState();\n      onInteraction();\n      middleDrag") ||
-  !globePointerDownBranch.includes("controls.resetState();\n    onInteraction();\n    setHoverPoint(event)")
+  previewPage.includes("attachCesiumLikeGlobeInteractions") ||
+  previewPage.includes("normalizeGlobeWheelZoomDelta") ||
+  previewPage.includes("normalizeGlobeDragZoomDelta") ||
+  previewPage.includes("isGlobePanModifier") ||
+  previewPage.includes("CESIUM_RIGHT_DRAG_ZOOM_SPEED") ||
+  previewPage.includes("GLOBE_INERTIA_DECAY")
 ) {
-  failures.push("src/pages/Preview/index.tsx: middle-button tilt and right-button zoom should enter the interaction performance window on pointer-down");
+  failures.push("src/pages/Preview/index.tsx: sphere preview should discard the previous custom Cesium-like mouse interaction implementation");
 }
 if (
-  !stalePointerGestureBranch.includes("endGesture(event)") ||
-  !stalePointerGestureBranch.includes("cancelOrbitInertia()") ||
-  !stalePointerGestureBranch.includes("clearQueuedZoom()") ||
-  !stalePointerGestureBranch.includes("controls.resetState()") ||
-  !stalePointerGestureBranch.includes("runtimeControls.needsUpdate = true") ||
-  !stalePointerGestureBranch.includes("onInteraction()") ||
-  !globePointerMoveBranch.includes("cancelStalePointerGesture(event, endLeftDrag)") ||
-  !globePointerMoveBranch.includes("cancelStalePointerGesture(event, endMiddleDrag)") ||
-  !globePointerMoveBranch.includes("cancelStalePointerGesture(event, endRightDrag)")
+  !previewPage.includes("configurePreviewGlobeControls(globeControls") ||
+  !combinedSource.includes("function modifyPivotMesh") ||
+  !combinedSource.includes("runtimeControls.adjustHeight = false") ||
+  !combinedSource.includes("runtimeControls.adjustHeight = true") ||
+  !combinedSource.includes("_cancelInteractionMomentum")
 ) {
-  failures.push("src/pages/Preview/index.tsx: stale globe pointer-move gestures should reset controls and schedule one recovery render");
-}
-const globePointerCancelStart = globeInteractionBranch.indexOf("const handlePointerCancel = (event: PointerEvent) => {");
-const globePointerCancelEnd = globeInteractionBranch.indexOf("const handleLostPointerCapture", globePointerCancelStart);
-const globePointerCancelBranch = globePointerCancelStart >= 0 && globePointerCancelEnd > globePointerCancelStart
-  ? globeInteractionBranch.slice(globePointerCancelStart, globePointerCancelEnd)
-  : "";
-const globeLostCaptureStart = globeInteractionBranch.indexOf("const handleLostPointerCapture = (event: PointerEvent) => {");
-const globeLostCaptureEnd = globeInteractionBranch.indexOf("const handleContextMenu", globeLostCaptureStart);
-const globeLostCaptureBranch = globeLostCaptureStart >= 0 && globeLostCaptureEnd > globeLostCaptureStart
-  ? globeInteractionBranch.slice(globeLostCaptureStart, globeLostCaptureEnd)
-  : "";
-const globePointerEndStart = globeInteractionBranch.indexOf("const handlePointerEnd = (event: PointerEvent) => {");
-const globePointerEndEnd = globeInteractionBranch.indexOf("const handlePointerCancel", globePointerEndStart);
-const globePointerEndBranch = globePointerEndStart >= 0 && globePointerEndEnd > globePointerEndStart
-  ? globeInteractionBranch.slice(globePointerEndStart, globePointerEndEnd)
-  : "";
-const leftCandidatePointerEndIndex = globePointerEndBranch.indexOf("if (leftCandidate && leftCandidate.id === event.pointerId)");
-const pointerEndClearSelectionIndex = globePointerEndBranch.indexOf("const shouldClearSelection = leftCandidate.mode !== \"pan\"");
-const pointerEndStartInertiaIndex = globePointerEndBranch.indexOf("startOrbitInertia");
-if (
-  !globePointerEndBranch.includes("if (!canHandle()) {\n        cancelStalePointerGesture(event, endLeftDrag);\n        return;\n      }\n      const inertiaVelocity") ||
-  leftCandidatePointerEndIndex < 0 ||
-  pointerEndClearSelectionIndex < 0 ||
-  globePointerEndBranch.indexOf("if (!canHandle()) {\n        cancelStalePointerGesture(event, endLeftDrag);\n        return;\n      }\n      const shouldClearSelection", leftCandidatePointerEndIndex) < 0 ||
-  globePointerEndBranch.indexOf("if (!canHandle()) {\n        cancelStalePointerGesture(event, endMiddleDrag);\n        return;\n      }\n      const inertiaVelocity") < 0 ||
-  globePointerEndBranch.indexOf("if (!canHandle()) {\n      cancelStalePointerGesture(event, endRightDrag);\n      return;\n    }\n    endRightDrag(event)") < 0 ||
-  globePointerEndBranch.indexOf("if (!canHandle()) {\n        cancelStalePointerGesture(event, endLeftDrag);\n        return;\n      }\n      const shouldClearSelection", leftCandidatePointerEndIndex) > pointerEndClearSelectionIndex ||
-  globePointerEndBranch.indexOf("if (!canHandle()) {\n        cancelStalePointerGesture(event, endLeftDrag);\n        return;\n      }\n      const inertiaVelocity") > pointerEndStartInertiaIndex
-) {
-  failures.push("src/pages/Preview/index.tsx: globe pointer-up should end stale gestures without inertia or empty-click selection when interaction handling is no longer active");
+  failures.push("src/pages/Preview: globe controls should use the threejs-render GlobeControls initialization and cancellation adapter");
 }
 if (
-  !globePointerCancelBranch.includes("cancelOrbitInertia()") ||
-  !globePointerCancelBranch.includes("clearQueuedZoom()") ||
-  !globePointerCancelBranch.includes("controls.resetState()") ||
-  !globePointerCancelBranch.includes("runtimeControls.needsUpdate = true") ||
-  globePointerCancelBranch.includes("startOrbitInertia") ||
-  !globeInteractionBranch.includes('window.addEventListener("pointercancel", handlePointerCancel, true)') ||
-  !globeInteractionBranch.includes('window.removeEventListener("pointercancel", handlePointerCancel, true)')
+  !previewPage.includes("isNativeGlobeRotateModifier(event)") ||
+  !previewPage.includes("isNativeGlobeRotateModifier(request)")
 ) {
-  failures.push("src/pages/Preview/index.tsx: globe pointercancel should clean up drags without starting inertia or empty-click selection");
+  failures.push("src/pages/Preview/index.tsx: native Shift+left globe rotation should not also trigger hover or model selection work");
 }
 if (
-  !globeLostCaptureBranch.includes("cancelOrbitInertia()") ||
-  !globeLostCaptureBranch.includes("clearQueuedZoom()") ||
-  !globeLostCaptureBranch.includes("controls.resetState()") ||
-  !globeLostCaptureBranch.includes("runtimeControls.needsUpdate = true") ||
-  !globeLostCaptureBranch.includes("updatePanCursorPreview(isGlobePanModifier(event))") ||
-  !globeInteractionBranch.includes('element.addEventListener("lostpointercapture", handleLostPointerCapture, true)') ||
-  !globeInteractionBranch.includes('element.removeEventListener("lostpointercapture", handleLostPointerCapture, true)')
+  !previewPage.includes("拖动地球表面平移") ||
+  !previewPage.includes("Shift + 左键") ||
+  !previewPage.includes("按鼠标位置缩放") ||
+  previewPage.includes("地球区域放大；Shift + 双击缩小") ||
+  previewPage.includes("旋转 / 拖动地球")
 ) {
-  failures.push("src/pages/Preview/index.tsx: globe lost pointer capture should reset stale controls and schedule a recovery render");
-}
-const globePointerLeaveStart = globeInteractionBranch.indexOf("const handlePointerLeave = (event: PointerEvent) => {");
-const globePointerLeaveEnd = globeInteractionBranch.indexOf("const handleModifierKeyChange", globePointerLeaveStart);
-const globePointerLeaveBranch = globePointerLeaveStart >= 0 && globePointerLeaveEnd > globePointerLeaveStart
-  ? globeInteractionBranch.slice(globePointerLeaveStart, globePointerLeaveEnd)
-  : "";
-if (
-  !globePointerLeaveBranch.includes("event.buttons") ||
-  !globePointerLeaveBranch.includes("leftCandidate?.id === event.pointerId") ||
-  !globePointerLeaveBranch.includes("endLeftDrag(event)") ||
-  globePointerLeaveBranch.includes("onEmptyLeftClick")
-) {
-  failures.push("src/pages/Preview/index.tsx: leaving the globe canvas with a pending left-click candidate should cancel it without clearing selection");
-}
-const globeModifierKeyStart = globeInteractionBranch.indexOf("const handleModifierKeyChange = (event: KeyboardEvent) => {");
-const globeModifierKeyEnd = globeInteractionBranch.indexOf("const handleWheel", globeModifierKeyStart);
-const globeModifierKeyBranch = globeModifierKeyStart >= 0 && globeModifierKeyEnd > globeModifierKeyStart
-  ? globeInteractionBranch.slice(globeModifierKeyStart, globeModifierKeyEnd)
-  : "";
-if (
-  !previewPage.includes("function isGlobePanModifierKey(event: KeyboardEvent): boolean") ||
-  !globeModifierKeyBranch.includes("isEditableKeyboardTarget(event.target)") ||
-  !globeModifierKeyBranch.includes("clearPanCursorPreview()") ||
-  !globeModifierKeyBranch.includes("if (!isGlobePanModifierKey(event))") ||
-  !globeModifierKeyBranch.includes("updatePanCursorPreview(isGlobePanModifier(event))")
-) {
-  failures.push("src/pages/Preview/index.tsx: globe pan modifier keyboard preview should ignore editable fields and non-modifier keys");
-}
-const globeWindowBlurStart = globeInteractionBranch.indexOf("const handleWindowBlur = () => {");
-const globeWindowBlurEnd = globeInteractionBranch.indexOf("const handleVisibilityChange", globeWindowBlurStart);
-const globeWindowBlurBranch = globeWindowBlurStart >= 0 && globeWindowBlurEnd > globeWindowBlurStart
-  ? globeInteractionBranch.slice(globeWindowBlurStart, globeWindowBlurEnd)
-  : "";
-if (
-  !globeWindowBlurBranch.includes("const hadCancelableInteraction = hasCancelableInteraction()") ||
-  !globeWindowBlurBranch.includes("clearQueuedZoom()") ||
-  !globeWindowBlurBranch.includes("clearInteractionHint()") ||
-  !globeWindowBlurBranch.includes("if (hadCancelableInteraction)") ||
-  !globeWindowBlurBranch.includes("controls.resetState()") ||
-  !globeWindowBlurBranch.includes("runtimeControls.needsUpdate = true") ||
-  !globeWindowBlurBranch.includes("onInteraction()")
-) {
-  failures.push("src/pages/Preview/index.tsx: globe blur/visibility cleanup should reset stale controls and schedule one recovery render when cancelling active interaction");
-}
-const cancelInteractionMomentumStart = globeInteractionBranch.indexOf("const cancelInteractionMomentum = (options: { clearHint?: boolean } = {}) => {");
-const cancelInteractionMomentumEnd = globeInteractionBranch.indexOf("runtimeControls._cancelInteractionMomentum = cancelInteractionMomentum", cancelInteractionMomentumStart);
-const cancelInteractionMomentumBranch = cancelInteractionMomentumStart >= 0 && cancelInteractionMomentumEnd > cancelInteractionMomentumStart
-  ? globeInteractionBranch.slice(cancelInteractionMomentumStart, cancelInteractionMomentumEnd)
-  : "";
-if (
-  !cancelInteractionMomentumBranch.includes("const hadCancelableInteraction = hasCancelableInteraction()") ||
-  !cancelInteractionMomentumBranch.includes("if (!hadCancelableInteraction)") ||
-  !cancelInteractionMomentumBranch.includes("return false;") ||
-  !cancelInteractionMomentumBranch.includes("return true;") ||
-  cancelInteractionMomentumBranch.indexOf("if (!hadCancelableInteraction)") > cancelInteractionMomentumBranch.indexOf("controls.resetState()") ||
-  cancelInteractionMomentumBranch.indexOf("controls.resetState()") > cancelInteractionMomentumBranch.indexOf("runtimeControls.needsUpdate = true") ||
-  cancelInteractionMomentumBranch.indexOf("runtimeControls.needsUpdate = true") > cancelInteractionMomentumBranch.indexOf("onInteraction()")
-) {
-  failures.push("src/pages/Preview/index.tsx: cancel-interaction should skip globe control resets when there is no active drag, inertia, or queued zoom to cancel");
-}
-const globeWheelStart = globeInteractionBranch.indexOf("const handleWheel = (event: WheelEvent) => {");
-const globeWheelEnd = globeInteractionBranch.indexOf("const handleDoubleClick", globeWheelStart);
-const globeWheelBranch = globeWheelStart >= 0 && globeWheelEnd > globeWheelStart
-  ? globeInteractionBranch.slice(globeWheelStart, globeWheelEnd)
-  : "";
-if (
-  !globeWheelBranch.includes("if (!hasNonZeroWheelDelta(event)) return") ||
-  !globeWheelBranch.includes("const zoomDelta = normalizeGlobeWheelZoomDelta(event, element)") ||
-  !globeWheelBranch.includes("if (!zoomDelta)") ||
-  globeWheelBranch.indexOf("if (!zoomDelta)") > globeWheelBranch.indexOf("cancelOrbitInertia()")
-) {
-  failures.push("src/pages/Preview/index.tsx: zero-delta globe wheel samples should not reset inertia or show zoom feedback");
+  failures.push("src/pages/Preview/index.tsx: sphere operation help should describe the native threejs-render globe controls instead of the previous custom controls");
 }
 const rendererSelectorSource = readSource("src/components/preview/RendererSelector.tsx");
 if (!rendererSelectorSource.includes('aria-label="渲染器"')) {
@@ -748,7 +596,7 @@ if (
   failures.push("src/hooks/usePreviewSettings.ts: preview setting updates should skip unchanged state and storage writes");
 }
 const engineSwitchingEffectStart = previewPage.indexOf("const nextSwitchSignature = `${previewEngine}:${threeRenderer}`;");
-const engineSwitchingEffectEnd = previewPage.indexOf("useEffect(() => {\n    if (!webgpuSupport.checking", engineSwitchingEffectStart);
+const engineSwitchingEffectEnd = previewPage.indexOf("const markDirty = useCallback", engineSwitchingEffectStart);
 const engineSwitchingEffectBranch = engineSwitchingEffectStart >= 0 && engineSwitchingEffectEnd > engineSwitchingEffectStart
   ? previewPage.slice(engineSwitchingEffectStart, engineSwitchingEffectEnd)
   : "";
@@ -760,6 +608,22 @@ if (
   engineSwitchingEffectBranch.indexOf("if (previewEngineSwitchSignatureRef.current === nextSwitchSignature)") > engineSwitchingEffectBranch.indexOf("setEngineSwitching(true)")
 ) {
   failures.push("src/pages/Preview/index.tsx: preview engine switch mask should not flash on initial render or unchanged renderer settings");
+}
+if (
+  !previewPage.includes("createWebGPUPreviewRenderer(container, rendererPreference") ||
+  !previewPage.includes("const renderer = new WebGPURenderer({") ||
+  !previewPage.includes("forceWebGL") ||
+  !previewPage.includes("await renderer.init()") ||
+  !previewPage.includes("highPrecision")
+) {
+  failures.push("src/pages/Preview/index.tsx: online preview should use the threejs-render WebGPURenderer initialization path");
+}
+if (
+  !previewPage.includes("createPreviewAtmosphereRenderer") ||
+  !combinedSource.includes("aerialPerspective") ||
+  !combinedSource.includes("AtmosphereContext")
+) {
+  failures.push("src/pages/Preview: online sphere preview should keep the threejs-render atmosphere earth rendering path");
 }
 const viewOptionsWriterStart = previewPage.indexOf("function writePreviewViewOptions(");
 const viewOptionsWriterEnd = previewPage.indexOf("function readPreviewSidePanelPreferences", viewOptionsWriterStart);

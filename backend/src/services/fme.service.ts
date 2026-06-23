@@ -178,15 +178,20 @@ function parseWorkspaceParameterText(
   context: WorkspaceParseContext = { packageRoot: null }
 ): ParsedWorkspaceParameter[] {
   const defaultMacros = parseDefaultMacros(text);
-  const parameters = normalizeParameters([
+  const declaredParameters = normalizeParameters([
     ...parseUserParameterForms(text),
-    ...parseXmlGuiLineParameters(text, defaultMacros),
-    ...parseGuiMacroParameters(text, defaultMacros),
-    ...parseJsonLikeParameters(text),
-    ...parseTextBlocks(text),
-    ...parseCommandLineParameters(text),
-    ...parsePackagedPathParameters(text)
+    ...parseXmlGuiLineParameters(text, defaultMacros)
   ]);
+  const fallbackParameters = declaredParameters.length
+    ? []
+    : normalizeParameters([
+        ...parseGuiMacroParameters(text, defaultMacros),
+        ...parseJsonLikeParameters(text),
+        ...parseTextBlocks(text),
+        ...parseCommandLineParameters(text),
+        ...parsePackagedPathParameters(text)
+      ]);
+  const parameters = declaredParameters.length ? declaredParameters : fallbackParameters;
 
   return parameters.map((parameter, index) => ({
     ...parameter,

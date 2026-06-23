@@ -1,8 +1,13 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import {
+  validateWebGPUExternalImageEsbuild,
+  validateWebGPUExternalImagePlugin
+} from "./vite/validateWebGPUExternalImage";
 
 export default defineConfig({
   plugins: [
+    validateWebGPUExternalImagePlugin(),
     react()
   ],
   build: {
@@ -20,6 +25,13 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": "http://localhost:4000"
+    }
+  },
+  optimizeDeps: {
+    esbuildOptions: {
+      plugins: [
+        validateWebGPUExternalImageEsbuild
+      ]
     }
   }
 });

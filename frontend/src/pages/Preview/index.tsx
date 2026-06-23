@@ -66,6 +66,8 @@ import { UnrealPreview } from "../../components/preview/UnrealPreview";
 import { usePreviewSettings } from "../../hooks/usePreviewSettings";
 import { useSceneViewState } from "../../hooks/useSceneViewState";
 import { useWebGPUSupport } from "../../hooks/useWebGPUSupport";
+import { createPreviewAtmosphereRenderer, type PreviewAtmosphereRenderer } from "./previewAtmosphereRenderer";
+import { configurePreviewGlobeControls, type RuntimeGlobeControls } from "./previewGlobeControls";
 import type {
   PreviewGeoPlacement,
   PreviewPayload,
@@ -540,8 +542,6 @@ interface CanvasHoverRequest {
   clientX: number;
   clientY: number;
   shiftKey: boolean;
-  ctrlKey: boolean;
-  metaKey: boolean;
 }
 
 const DEFAULT_TRANSFORM: PreviewTransform = {
@@ -571,20 +571,6 @@ const MIN_GLOBE_ZOOM_DISTANCE = 2;
 const MIN_GLOBE_CAMERA_NEAR = 0.001;
 const MAX_GLOBE_CAMERA_FAR = 120_000_000;
 const MIN_GLOBE_FOCUS_DISTANCE = 0.5;
-const CESIUM_RIGHT_DRAG_ZOOM_SPEED = 0.85;
-const CESIUM_WHEEL_ZOOM_SPEED = 0.42;
-const CESIUM_DOUBLE_CLICK_ZOOM_DELTA = 360;
-const CESIUM_REFERENCE_VIEWPORT_HEIGHT = 720;
-const CESIUM_MIN_VIEWPORT_ZOOM_SCALE = 0.75;
-const CESIUM_MAX_VIEWPORT_ZOOM_SCALE = 1.85;
-const CESIUM_DOUBLE_CLICK_ZOOM_VIEWPORT_RATIO = 0.58;
-const CESIUM_MIN_DOUBLE_CLICK_ZOOM_DELTA = 240;
-const CESIUM_MAX_DOUBLE_CLICK_ZOOM_DELTA = 520;
-const CESIUM_MAX_QUEUED_ZOOM_DELTA = 720;
-const GLOBE_DRAG_THRESHOLD_PX = 3;
-const GLOBE_INERTIA_DECAY = 0.9;
-const GLOBE_INERTIA_MIN_DELTA = 0.08;
-const GLOBE_INERTIA_MAX_DELTA = 38;
 const PREVIEW_MAX_PIXEL_RATIO = 1.5;
 const PREVIEW_INTERACTIVE_PIXEL_RATIO = 0.9;
 const PREVIEW_LOW_FPS_PIXEL_RATIO = 0.85;
@@ -1039,12 +1025,6 @@ function PreviewWorkspace({
     const timer = window.setTimeout(() => setEngineSwitching(false), 180);
     return () => window.clearTimeout(timer);
   }, [previewEngine, threeRenderer]);
-
-  useEffect(() => {
-    if (!webgpuSupport.checking && !webgpuSupport.supported && threeRenderer === "webgpu") {
-      setThreeRenderer("webgl");
-    }
-  }, [setThreeRenderer, threeRenderer, webgpuSupport.checking, webgpuSupport.supported]);
 
   const markDirty = useCallback(() => {
     if (payload.file?.id && isModelPreviewType(payload.type)) {
@@ -2396,30 +2376,53 @@ function PreviewWorkspace({
               <div className="preview-operation-help-section">
                 <span>浏览场景</span>
                 <dl>
-                  <div>
-                    <dt>左键拖动</dt>
-                    <dd>{sceneMode === "sphere" ? "旋转 / 拖动地球" : "旋转视角"}</dd>
-                  </div>
-                  <div>
-                    <dt>Shift/Ctrl/⌘ + 左键</dt>
-                    <dd>平移视角</dd>
-                  </div>
-                  <div>
-                    <dt>滚轮</dt>
-                    <dd>以鼠标位置缩放</dd>
-                  </div>
-                  <div>
-                    <dt>右键上下拖动</dt>
-                    <dd>快速缩放</dd>
-                  </div>
-                  <div>
-                    <dt>中键拖动</dt>
-                    <dd>俯仰观察</dd>
-                  </div>
-                  <div>
-                    <dt>双击左键</dt>
-                    <dd>{isSphereScene ? "地球区域放大；Shift + 双击缩小" : "双击模型时选中并聚焦对象"}</dd>
-                  </div>
+                  {isSphereScene ? (
+                    <>
+                      <div>
+                        <dt>左键拖动</dt>
+                        <dd>拖动地球表面平移</dd>
+                      </div>
+                      <div>
+                        <dt>右键拖动</dt>
+                        <dd>旋转视角</dd>
+                      </div>
+                      <div>
+                        <dt>Shift + 左键</dt>
+                        <dd>旋转视角</dd>
+                      </div>
+                      <div>
+                        <dt>滚轮</dt>
+                        <dd>按鼠标位置缩放</dd>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <dt>左键拖动</dt>
+                        <dd>旋转视角</dd>
+                      </div>
+                      <div>
+                        <dt>Shift/Ctrl/⌘ + 左键</dt>
+                        <dd>平移视角</dd>
+                      </div>
+                      <div>
+                        <dt>滚轮</dt>
+                        <dd>以鼠标位置缩放</dd>
+                      </div>
+                      <div>
+                        <dt>右键上下拖动</dt>
+                        <dd>快速缩放</dd>
+                      </div>
+                      <div>
+                        <dt>中键拖动</dt>
+                        <dd>俯仰观察</dd>
+                      </div>
+                      <div>
+                        <dt>双击左键</dt>
+                        <dd>双击模型时选中并聚焦对象</dd>
+                      </div>
+                    </>
+                  )}
                 </dl>
               </div>
               <div className="preview-operation-help-section">
@@ -3818,6 +3821,7 @@ const ThreeScene = memo(function ThreeScene({
     let pendingTransformChangeTimer = 0;
     let lastTransformChangeEmitTime = 0;
     const plainBackground = new THREE.Color(0x071422);
+    let atmosphereRenderer: PreviewAtmosphereRenderer | null = null;
     const cancelScheduledPreviewResize = () => {
       if (!resizeFrameId) {
         return;
@@ -3953,7 +3957,7 @@ const ThreeScene = memo(function ThreeScene({
     });
 
     const run = async () => {
-      const rendererResult = await createRenderer(container, rendererPreference, (backend) => {
+      const rendererResult = await createWebGPUPreviewRenderer(container, rendererPreference, (backend) => {
         onSceneInfoChange({
           backend,
           status: "loading",
@@ -3976,7 +3980,6 @@ const ThreeScene = memo(function ThreeScene({
       const globeControls = new GlobeControls(sceneContentRoot, camera, renderer.domElement);
       globeControls.enableDamping = true;
       globeControls.dampingFactor = 0.09;
-      globeControls.adjustHeight = true;
       globeControls.enableFlight = true;
       globeControls.flightSpeed = 1000;
       globeControls.flightSpeedMultiplier = 8;
@@ -3990,6 +3993,11 @@ const ThreeScene = memo(function ThreeScene({
       globeControls.maxZoom = Number.POSITIVE_INFINITY;
       globeControls.setEllipsoid(WGS84_ELLIPSOID, ellipsoidAnchor);
       globeControlsRef.current = globeControls;
+      const detachGlobeControlsBehavior = configurePreviewGlobeControls(globeControls, {
+        overlayScene: scene,
+        onInteraction: markPreviewInteraction,
+        onInteractionHintChange
+      });
       const rendererElement = renderer.domElement;
       const pointer = new THREE.Vector2();
       const raycaster = new THREE.Raycaster();
@@ -4072,30 +4080,31 @@ const ThreeScene = memo(function ThreeScene({
         event.clientX,
         event.clientY
       );
-      const detachCesiumLikeInteractions = attachCesiumLikeGlobeInteractions(
-        globeControls,
-        rendererElement,
-        () => latestSceneModeRef.current === "sphere" &&
-          !transformControlsRef.current?.dragging &&
-          !latestPlacementModeRef.current,
-        (event) => isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement) ||
-          (!isGlobePanModifier(event) && Boolean(getModelHitFromEvent(event))),
-        markPreviewInteraction,
-        (event) => isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement) ||
-          Boolean(getModelHitFromEvent(event)),
-        () => onSelectLayer(null),
-        onInteractionHintChange
-      );
 
       const updateNavigationMode = (dragging = false) => {
         globeControls.enabled = !dragging;
       };
       updateNavigationMode();
 
-      scene.add(new THREE.HemisphereLight(0xdcefff, 0x162032, 1.1));
-      const directional = new THREE.DirectionalLight(0xffffff, 4.2);
-      directional.position.set(1, 0.35, 0.55).normalize();
-      scene.add(directional);
+      try {
+        atmosphereRenderer = createPreviewAtmosphereRenderer({
+          renderer,
+          scene,
+          camera,
+          ellipsoidFrame: ellipsoidAnchor,
+          getGeospatialEllipsoid: () => ellipsoidContextRef.current.geospatialEllipsoid
+        });
+      } catch (error) {
+        console.warn("Takram atmosphere preview renderer failed to initialize.", error);
+        atmosphereRenderer = null;
+      }
+
+      scene.add(new THREE.HemisphereLight(0xdcefff, 0x162032, atmosphereRenderer ? 0.35 : 1.1));
+      if (!atmosphereRenderer) {
+        const directional = new THREE.DirectionalLight(0xffffff, 4.2);
+        directional.position.set(1, 0.35, 0.55).normalize();
+        scene.add(directional);
+      }
 
       starField = createStarField();
       starField.visible = true;
@@ -4484,7 +4493,7 @@ const ThreeScene = memo(function ThreeScene({
           event.buttons ||
           transformControls.dragging ||
           latestPlacementModeRef.current ||
-          isGlobePanModifier(event) ||
+          isNativeGlobeRotateModifier(event) ||
           performance.now() < lowFpsRecoveryUntil
         ) {
           clearCanvasHoverCursor();
@@ -4497,9 +4506,7 @@ const ThreeScene = memo(function ThreeScene({
         pendingCanvasHoverRequest = {
           clientX: event.clientX,
           clientY: event.clientY,
-          shiftKey: event.shiftKey,
-          ctrlKey: event.ctrlKey,
-          metaKey: event.metaKey
+          shiftKey: event.shiftKey
         };
         if (pendingCanvasHoverFrame) {
           return;
@@ -4515,7 +4522,7 @@ const ThreeScene = memo(function ThreeScene({
             !modelRootRef.current ||
             transformControls.dragging ||
             latestPlacementModeRef.current ||
-            isGlobePanModifier(request) ||
+            isNativeGlobeRotateModifier(request) ||
             performance.now() < lowFpsRecoveryUntil
           ) {
             clearCanvasHoverCursor();
@@ -4545,6 +4552,7 @@ const ThreeScene = memo(function ThreeScene({
           !modelRootRef.current ||
           transformControls.dragging ||
           event.button !== 0 ||
+          isNativeGlobeRotateModifier(event) ||
           isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
         ) {
           return;
@@ -4570,6 +4578,7 @@ const ThreeScene = memo(function ThreeScene({
           !modelRootRef.current ||
           transformControls.dragging ||
           event.button !== 0 ||
+          isNativeGlobeRotateModifier(event) ||
           isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
         ) {
           cancelPendingCanvasPick();
@@ -4616,6 +4625,7 @@ const ThreeScene = memo(function ThreeScene({
           transformControls.dragging ||
           latestPlacementModeRef.current ||
           event.button !== 0 ||
+          isNativeGlobeRotateModifier(event) ||
           isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
         ) {
           return;
@@ -5092,7 +5102,18 @@ const ThreeScene = memo(function ThreeScene({
         lastRenderTime = now;
         fpsFrameCount += 1;
         try {
-          renderer.render(scene, camera);
+          if (latestSceneModeRef.current === "sphere" && atmosphereRenderer) {
+            try {
+              atmosphereRenderer.render();
+            } catch (error) {
+              console.warn("Takram atmosphere preview renderer failed during render; using the base renderer.", error);
+              atmosphereRenderer.dispose();
+              atmosphereRenderer = null;
+              renderer.render(scene, camera);
+            }
+          } else {
+            renderer.render(scene, camera);
+          }
         } catch (error) {
           if (!renderFailed && rendererPreference === "webgpu") {
             renderFailed = true;
@@ -5107,7 +5128,9 @@ const ThreeScene = memo(function ThreeScene({
       schedulePreviewAnimation();
 
       return () => {
-        detachCesiumLikeInteractions();
+        detachGlobeControlsBehavior();
+        atmosphereRenderer?.dispose();
+        atmosphereRenderer = null;
         cancelPendingCanvasPick();
         clearCanvasHoverCursor();
         cancelScheduledPreviewAnimation();
@@ -5145,6 +5168,8 @@ const ThreeScene = memo(function ThreeScene({
       globeControlsRef.current?.dispose();
       tileEventCleanups.splice(0).forEach((cleanup) => cleanup());
       loadedObjects.forEach(disposeLoaded);
+      atmosphereRenderer?.dispose();
+      atmosphereRenderer = null;
       rendererRef.current = null;
       cameraRef.current = null;
       modelRootRef.current = null;
@@ -5169,12 +5194,12 @@ const ThreeScene = memo(function ThreeScene({
   const canvasInteractionDescription = placementMode
     ? "地表落位模式：单击地球表面放置模型，按 Esc 退出"
     : sceneMode === "sphere"
-      ? "三维操作：左键拖动地球，Shift、Ctrl 或 ⌘ 加左键平移，滚轮按鼠标位置缩放，右键上下拖动快速缩放，中键俯仰观察，双击地球放大，Shift 加双击缩小，双击模型聚焦"
+      ? "三维操作：左键拖动平移地球，右键或 Shift 加左键旋转，滚轮缩放，双击模型聚焦"
       : "三维操作：左键旋转，Shift、Ctrl 或 ⌘ 加左键平移，滚轮缩放，右键上下拖动缩放，中键俯仰观察，双击模型聚焦";
   const canvasInteractionTitle = placementMode
     ? "地表落位：单击地球表面放置 · Esc 退出"
     : sceneMode === "sphere"
-      ? "左键拖动地球 · Shift/Ctrl/⌘+左键平移 · 滚轮按鼠标缩放 · 右键快速缩放 · 中键俯仰 · 双击地球缩放 / 双击模型聚焦"
+      ? "左键拖动平移地球 · 右键或 Shift+左键旋转 · 滚轮缩放 · 双击模型聚焦"
       : "左键旋转 · Shift/Ctrl/⌘+左键平移 · 滚轮缩放 · 右键拖动缩放 · 中键俯仰 · 双击模型聚焦";
 
   return (
@@ -5402,68 +5427,43 @@ function ControlTriplet({
   );
 }
 
-async function createRenderer(
+async function createWebGPUPreviewRenderer(
   container: HTMLDivElement,
   preference: ThreeRendererPreference,
   onBackend: (backend: RendererBackend) => void
 ): Promise<PreviewRendererResult> {
-  const gpu = (navigator as Navigator & { gpu?: { requestAdapter?: () => Promise<unknown> } }).gpu;
-  if (preference === "webgpu" && gpu?.requestAdapter) {
-    try {
-      const adapter = await withTimeout(gpu.requestAdapter(), 2000, "WebGPU 适配器请求超时。");
-      if (!adapter) {
-        throw new Error("当前设备没有可用的 WebGPU 适配器。");
-      }
-      const renderer = new WebGPURenderer({
-        antialias: true,
-        alpha: true
-      });
-      await withTimeout(renderer.init(), 2500, "WebGPU 初始化超时。");
-      renderer.outputColorSpace = THREE.SRGBColorSpace;
-      renderer.toneMapping = THREE.AgXToneMapping;
-      renderer.toneMappingExposure = 1.25;
-      renderer.setPixelRatio(getPreviewPixelRatio());
-      resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
-      const backend = getRendererBackend(renderer);
-      onBackend(backend);
-      return { renderer, backend };
-    } catch {
-      // Fall through to WebGL when WebGPU is unavailable or initialization stalls.
-    }
-  }
-
-  const renderer = new THREE.WebGLRenderer({
+  const forceWebGL = preference === "webgl" || !(await isWebGPUAvailable());
+  const renderer = new WebGPURenderer({
     antialias: true,
     alpha: true,
-    powerPreference: "high-performance"
+    forceWebGL
   });
+  await renderer.init();
+  (renderer as unknown as { highPrecision?: boolean }).highPrecision = true;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.AgXToneMapping;
   renderer.toneMappingExposure = 1.25;
   renderer.setPixelRatio(getPreviewPixelRatio());
   resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
-  onBackend("WebGL");
+  const backend = getRendererBackend(renderer);
+  onBackend(backend);
   return {
     renderer,
-    backend: "WebGL",
-    fallbackMessage: preference === "webgpu" ? WEBGPU_FALLBACK_MESSAGE : undefined
+    backend,
+    fallbackMessage: preference === "webgpu" && backend !== "WebGPU" ? WEBGPU_FALLBACK_MESSAGE : undefined
   };
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
-    promise.then(
-      (value) => {
-        window.clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        window.clearTimeout(timer);
-        reject(error);
-      }
-    );
-  });
+async function isWebGPUAvailable(): Promise<boolean> {
+  const gpu = (navigator as Navigator & { gpu?: { requestAdapter?: () => Promise<unknown> } }).gpu;
+  if (!gpu?.requestAdapter) {
+    return false;
+  }
+  try {
+    return Boolean(await gpu.requestAdapter());
+  } catch {
+    return false;
+  }
 }
 
 async function loadPreviewObject(
@@ -5566,842 +5566,12 @@ function getPreviewPixelRatio(mode: "normal" | "interactive" | "low-fps" = "norm
   return normalPixelRatio;
 }
 
-type RuntimeGlobeControls = GlobeControls & {
-  needsUpdate: boolean;
-  zoomDelta: number;
-  zoomDirectionSet: boolean;
-  zoomPointSet: boolean;
-  _cancelInteractionMomentum?: (options?: { clearHint?: boolean }) => boolean;
-  _inertiaNeedsUpdate?: () => boolean;
-  _applyRotation?: (x: number, y: number, pivotPoint: THREE.Vector3) => void;
-  pointerTracker?: {
-    setHoverEvent: (event: unknown) => void;
-  };
-};
-
-type GlobeDragMode = "rotate" | "pan" | "tilt";
-
-interface GlobeLeftDragCandidate {
-  id: number;
-  mode: GlobeDragMode;
-  startX: number;
-  startY: number;
-  lastX: number;
-  lastY: number;
-  anchor: THREE.Vector3 | null;
-  pivot: THREE.Vector3;
-  previousCursor: string;
-}
-
-interface GlobeOrbitDrag {
-  id: number;
-  mode: GlobeDragMode;
-  lastX: number;
-  lastY: number;
-  lastTime: number;
-  velocityX: number;
-  velocityY: number;
-  anchor: THREE.Vector3 | null;
-  pivot: THREE.Vector3;
-  previousCursor: string;
-}
-
-interface GlobeMiddleDrag {
-  id: number;
-  lastX: number;
-  lastY: number;
-  lastTime: number;
-  velocityX: number;
-  velocityY: number;
-  anchor: THREE.Vector3;
-  previousCursor: string;
-}
-
-interface GlobeOrbitInertia {
-  frameId: number;
-  pivot: THREE.Vector3;
-  previousTime: number;
-  velocityX: number;
-  velocityY: number;
-}
-
-function attachCesiumLikeGlobeInteractions(
-  controls: GlobeControls,
-  element: HTMLElement,
-  isActive: () => boolean,
-  shouldBypassLeftDrag: (event: PointerEvent) => boolean = () => false,
-  onInteraction: () => void = () => undefined,
-  shouldBypassDoubleClick: (event: MouseEvent) => boolean = () => false,
-  onEmptyLeftClick: () => void = () => undefined,
-  onInteractionHintChange: (hint: PreviewInteractionHint | null) => void = () => undefined
-) {
-  const runtimeControls = controls as RuntimeGlobeControls;
-  let leftCandidate: GlobeLeftDragCandidate | null = null;
-  let leftDrag: GlobeOrbitDrag | null = null;
-  let rightDrag: { id: number; lastY: number; previousCursor: string } | null = null;
-  let middleDrag: GlobeMiddleDrag | null = null;
-  let orbitInertia: GlobeOrbitInertia | null = null;
-  let pointerHoveringElement = false;
-  let panPreviewCursorPrevious: string | null = null;
-  let panPreviewHintActive = false;
-  let currentInteractionHint: PreviewInteractionHint | null = null;
-  const pointer = new THREE.Vector2();
-  const raycaster = new THREE.Raycaster();
-  const localRay = new THREE.Ray();
-  const surfacePoint = new THREE.Vector3();
-  const tmpVector = new THREE.Vector3();
-  const tmpRight = new THREE.Vector3();
-  const tmpUp = new THREE.Vector3();
-  let interactionHintClearTimer = 0;
-
-  const canHandle = () => controls.enabled && isActive();
-  const emitInteractionHint = (hint: PreviewInteractionHint | null) => {
-    if (currentInteractionHint === hint) {
-      return;
-    }
-    currentInteractionHint = hint;
-    onInteractionHintChange(hint);
-  };
-  const setInteractionHint = (hint: PreviewInteractionHint | null, autoClearMs = 0) => {
-    if (interactionHintClearTimer) {
-      window.clearTimeout(interactionHintClearTimer);
-      interactionHintClearTimer = 0;
-    }
-    emitInteractionHint(hint);
-    if (hint && autoClearMs > 0) {
-      interactionHintClearTimer = window.setTimeout(() => {
-        interactionHintClearTimer = 0;
-        emitInteractionHint(null);
-      }, autoClearMs);
-    }
-  };
-  const clearInteractionHint = () => setInteractionHint(null);
-  const blockEvent = (event: Event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-  };
-  const setHoverPoint = (event: PointerEvent | MouseEvent) => {
-    runtimeControls.pointerTracker?.setHoverEvent({
-      type: event.type || "pointermove",
-      pointerType: "pointerType" in event ? event.pointerType || "mouse" : "mouse",
-      target: event.target,
-      clientX: event.clientX,
-      clientY: event.clientY
-    });
-  };
-  const clearQueuedZoom = () => {
-    runtimeControls.zoomDelta = 0;
-    runtimeControls.zoomDirectionSet = false;
-    runtimeControls.zoomPointSet = false;
-  };
-  const releasePointer = (event?: PointerEvent) => {
-    if (!event) return;
-    try {
-      element.releasePointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture may already be released by the browser.
-    }
-  };
-  const capturePointer = (event: PointerEvent) => {
-    try {
-      element.setPointerCapture(event.pointerId);
-    } catch {
-      // Some browser targets do not allow pointer capture.
-    }
-  };
-  const getControlsPivotPoint = () => {
-    const pivot = new THREE.Vector3();
-    const readPivot = controls.getPivotPoint as unknown as (target: THREE.Vector3) => THREE.Vector3 | null;
-    return readPivot.call(controls, pivot) ? pivot : null;
-  };
-  const getSurfacePoint = (clientX: number, clientY: number) => {
-    const camera = controls.camera;
-    if (!camera) return null;
-    const rect = element.getBoundingClientRect();
-    pointer.x = ((clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1;
-    pointer.y = -((clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1;
-    raycaster.setFromCamera(pointer, camera);
-    localRay.copy(raycaster.ray).applyMatrix4(controls.ellipsoidFrameInverse);
-    const hit = controls.ellipsoid.intersectRay(localRay, surfacePoint);
-    if (!hit) return null;
-    return surfacePoint.clone().applyMatrix4(controls.ellipsoidFrame);
-  };
-  const getScreenCenterPivot = () => {
-    const rect = element.getBoundingClientRect();
-    return getSurfacePoint(rect.left + rect.width / 2, rect.top + rect.height / 2) || getControlsPivotPoint();
-  };
-  const queueZoom = (delta: number) => {
-    if (!delta || !canHandle()) return;
-    if (
-      runtimeControls.zoomDelta &&
-      Math.sign(runtimeControls.zoomDelta) !== Math.sign(delta)
-    ) {
-      runtimeControls.zoomDelta = 0;
-    }
-    runtimeControls.zoomDelta = THREE.MathUtils.clamp(
-      runtimeControls.zoomDelta + delta,
-      -CESIUM_MAX_QUEUED_ZOOM_DELTA,
-      CESIUM_MAX_QUEUED_ZOOM_DELTA
-    );
-    runtimeControls.zoomDirectionSet = false;
-    runtimeControls.zoomPointSet = false;
-    runtimeControls.needsUpdate = true;
-    onInteraction();
-  };
-  const orbitAroundPivot = (deltaX: number, deltaY: number, pivot: THREE.Vector3) => {
-    if (!runtimeControls._applyRotation) return;
-    const scale = 2 * Math.PI / Math.max(element.clientHeight, 1);
-    runtimeControls._applyRotation.call(runtimeControls, deltaX * scale, deltaY * scale, pivot);
-    runtimeControls.needsUpdate = true;
-    onInteraction();
-  };
-  const cancelOrbitInertia = () => {
-    if (orbitInertia) {
-      window.cancelAnimationFrame(orbitInertia.frameId);
-      orbitInertia = null;
-    }
-  };
-  const updateOrbitVelocity = (
-    drag: { lastTime: number; velocityX: number; velocityY: number },
-    deltaX: number,
-    deltaY: number,
-    now = performance.now()
-  ) => {
-    const elapsed = Math.max(now - drag.lastTime, 8);
-    const frameScale = 16.67 / elapsed;
-    drag.velocityX = THREE.MathUtils.clamp(
-      drag.velocityX * 0.38 + deltaX * frameScale * 0.62,
-      -GLOBE_INERTIA_MAX_DELTA,
-      GLOBE_INERTIA_MAX_DELTA
-    );
-    drag.velocityY = THREE.MathUtils.clamp(
-      drag.velocityY * 0.38 + deltaY * frameScale * 0.62,
-      -GLOBE_INERTIA_MAX_DELTA,
-      GLOBE_INERTIA_MAX_DELTA
-    );
-    drag.lastTime = now;
-  };
-  const startOrbitInertia = (velocityX: number, velocityY: number, pivot: THREE.Vector3) => {
-    cancelOrbitInertia();
-    if (!runtimeControls._applyRotation || Math.hypot(velocityX, velocityY) < GLOBE_INERTIA_MIN_DELTA) {
-      return;
-    }
-    const inertia: GlobeOrbitInertia = {
-      frameId: 0,
-      pivot: pivot.clone(),
-      previousTime: performance.now(),
-      velocityX,
-      velocityY
-    };
-    const step = (now: number) => {
-      if (orbitInertia !== inertia || !canHandle() || !runtimeControls._applyRotation) {
-        orbitInertia = null;
-        return;
-      }
-      const elapsedFrames = THREE.MathUtils.clamp((now - inertia.previousTime) / 16.67, 0.35, 2.5);
-      inertia.previousTime = now;
-      orbitAroundPivot(inertia.velocityX * elapsedFrames, inertia.velocityY * elapsedFrames, inertia.pivot);
-      const decay = Math.pow(GLOBE_INERTIA_DECAY, elapsedFrames);
-      inertia.velocityX *= decay;
-      inertia.velocityY *= decay;
-      if (Math.hypot(inertia.velocityX, inertia.velocityY) < GLOBE_INERTIA_MIN_DELTA) {
-        orbitInertia = null;
-        return;
-      }
-      inertia.frameId = window.requestAnimationFrame(step);
-    };
-    orbitInertia = inertia;
-    inertia.frameId = window.requestAnimationFrame(step);
-    onInteraction();
-  };
-  const moveCameraToKeepSurfacePointUnderPointer = (
-    anchor: THREE.Vector3 | null,
-    event: PointerEvent,
-    lastX: number,
-    lastY: number,
-    pivot: THREE.Vector3 | null,
-    allowOrbitFallback = false
-  ) => {
-    const camera = controls.camera;
-    if (!camera) return;
-    const currentPoint = anchor ? getSurfacePoint(event.clientX, event.clientY) : null;
-    if (anchor && currentPoint) {
-      tmpVector.subVectors(anchor, currentPoint);
-      camera.position.add(tmpVector);
-      camera.updateMatrixWorld();
-      runtimeControls.needsUpdate = true;
-      onInteraction();
-      return;
-    }
-    const deltaX = event.clientX - lastX;
-    const deltaY = event.clientY - lastY;
-    if (allowOrbitFallback && pivot && runtimeControls._applyRotation) {
-      orbitAroundPivot(deltaX, deltaY, pivot);
-    } else {
-      const reference = anchor || pivot || getControlsPivotPoint() || camera.position;
-      const distance = Math.max(camera.position.distanceTo(reference), MIN_GLOBE_ZOOM_DISTANCE);
-      const worldUnitsPerPixel = camera instanceof THREE.PerspectiveCamera
-        ? 2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / Math.max(element.clientHeight, 1)
-        : 1;
-      tmpRight.set(1, 0, 0).transformDirection(camera.matrixWorld);
-      tmpUp.set(0, 1, 0).transformDirection(camera.matrixWorld);
-      camera.position
-        .addScaledVector(tmpRight, -deltaX * worldUnitsPerPixel)
-        .addScaledVector(tmpUp, deltaY * worldUnitsPerPixel);
-      camera.updateMatrixWorld();
-      runtimeControls.needsUpdate = true;
-      onInteraction();
-    }
-  };
-  const endLeftDrag = (event?: PointerEvent, clearHint = true) => {
-    if (!leftDrag && !leftCandidate) return;
-    element.style.cursor = (leftDrag || leftCandidate)?.previousCursor || "";
-    releasePointer(event);
-    leftDrag = null;
-    leftCandidate = null;
-    if (clearHint) {
-      clearInteractionHint();
-    }
-  };
-  const endRightDrag = (event?: PointerEvent, clearHint = true) => {
-    if (!rightDrag) return;
-    element.style.cursor = rightDrag.previousCursor;
-    releasePointer(event);
-    rightDrag = null;
-    if (clearHint) {
-      clearInteractionHint();
-    }
-  };
-  const endMiddleDrag = (event?: PointerEvent, clearHint = true) => {
-    if (!middleDrag) return;
-    element.style.cursor = middleDrag.previousCursor;
-    releasePointer(event);
-    middleDrag = null;
-    if (clearHint) {
-      clearInteractionHint();
-    }
-  };
-  const hasActivePointerGesture = () => Boolean(leftCandidate || leftDrag || middleDrag || rightDrag);
-  const hasCancelableInteraction = () => Boolean(
-    orbitInertia ||
-    runtimeControls.zoomDelta ||
-    runtimeControls._inertiaNeedsUpdate?.() ||
-    hasActivePointerGesture()
-  );
-  const clearPanCursorPreview = (clearHint = true) => {
-    if (panPreviewCursorPrevious === null) {
-      return;
-    }
-    element.style.cursor = panPreviewCursorPrevious;
-    panPreviewCursorPrevious = null;
-    if (panPreviewHintActive && clearHint) {
-      clearInteractionHint();
-    }
-    panPreviewHintActive = false;
-  };
-  const updatePanCursorPreview = (modifierActive: boolean) => {
-    if (
-      !pointerHoveringElement ||
-      !modifierActive ||
-      hasActivePointerGesture() ||
-      !canHandle()
-    ) {
-      clearPanCursorPreview();
-      return;
-    }
-    if (panPreviewCursorPrevious !== null) {
-      return;
-    }
-    panPreviewCursorPrevious = element.style.cursor;
-    element.style.cursor = "move";
-    panPreviewHintActive = true;
-    setInteractionHint("globe-pan");
-  };
-  const cancelStalePointerGesture = (event: PointerEvent, endGesture: (event: PointerEvent) => void) => {
-    endGesture(event);
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    controls.resetState();
-    runtimeControls.needsUpdate = true;
-    updatePanCursorPreview(isGlobePanModifier(event));
-    onInteraction();
-  };
-  const handlePointerDown = (event: PointerEvent) => {
-    if (!canHandle()) return;
-    if (hasActivePointerGesture()) {
-      blockEvent(event);
-      return;
-    }
-    clearPanCursorPreview();
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    clearInteractionHint();
-    if (event.button === 0) {
-      if (!runtimeControls._applyRotation || shouldBypassLeftDrag(event)) return;
-      const anchor = getSurfacePoint(event.clientX, event.clientY);
-      const mode: GlobeDragMode = isGlobePanModifier(event) ? "pan" : "rotate";
-      const pivot = mode === "rotate" ? anchor || getScreenCenterPivot() : anchor || getScreenCenterPivot();
-      if (!pivot) return;
-      blockEvent(event);
-      controls.resetState();
-      onInteraction();
-      leftCandidate = {
-        id: event.pointerId,
-        mode,
-        startX: event.clientX,
-        startY: event.clientY,
-        lastX: event.clientX,
-        lastY: event.clientY,
-        anchor: mode === "pan" ? anchor : null,
-        pivot,
-        previousCursor: element.style.cursor
-      };
-      return;
-    }
-    if (event.button === 1) {
-      const anchor = getSurfacePoint(event.clientX, event.clientY) || getScreenCenterPivot();
-      if (!anchor) return;
-      blockEvent(event);
-      controls.resetState();
-      onInteraction();
-      middleDrag = {
-        id: event.pointerId,
-        lastX: event.clientX,
-        lastY: event.clientY,
-        lastTime: performance.now(),
-        velocityX: 0,
-        velocityY: 0,
-        anchor,
-        previousCursor: element.style.cursor
-      };
-      element.style.cursor = "all-scroll";
-      element.focus();
-      capturePointer(event);
-      setInteractionHint("globe-tilt");
-      return;
-    }
-    if (event.button !== 2) return;
-    blockEvent(event);
-    controls.resetState();
-    onInteraction();
-    setHoverPoint(event);
-    rightDrag = {
-      id: event.pointerId,
-      lastY: event.clientY,
-      previousCursor: element.style.cursor
-    };
-    element.style.cursor = "ns-resize";
-    element.focus();
-    capturePointer(event);
-    setInteractionHint("globe-zoom");
-  };
-  const handlePointerMove = (event: PointerEvent) => {
-    if (!hasActivePointerGesture()) {
-      updatePanCursorPreview(isGlobePanModifier(event));
-    }
-    if (leftDrag && leftDrag.id === event.pointerId) {
-      blockEvent(event);
-      if (!canHandle() || !runtimeControls._applyRotation) {
-        cancelStalePointerGesture(event, endLeftDrag);
-        return;
-      }
-      const previousX = leftDrag.lastX;
-      const previousY = leftDrag.lastY;
-      const deltaX = event.clientX - previousX;
-      const deltaY = event.clientY - previousY;
-      leftDrag.lastX = event.clientX;
-      leftDrag.lastY = event.clientY;
-      updateOrbitVelocity(leftDrag, deltaX, deltaY);
-      if (leftDrag.mode === "pan") {
-        moveCameraToKeepSurfacePointUnderPointer(
-          leftDrag.anchor,
-          event,
-          previousX,
-          previousY,
-          leftDrag.pivot
-        );
-      } else {
-        orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
-      }
-      return;
-    }
-    if (leftCandidate && leftCandidate.id === event.pointerId) {
-      if (!canHandle()) {
-        cancelStalePointerGesture(event, endLeftDrag);
-        return;
-      }
-      const moved = Math.hypot(event.clientX - leftCandidate.startX, event.clientY - leftCandidate.startY);
-      if (moved <= GLOBE_DRAG_THRESHOLD_PX) {
-        return;
-      }
-      blockEvent(event);
-      controls.resetState();
-      leftDrag = {
-        id: leftCandidate.id,
-        mode: leftCandidate.mode,
-        lastX: leftCandidate.lastX,
-        lastY: leftCandidate.lastY,
-        lastTime: performance.now(),
-        velocityX: 0,
-        velocityY: 0,
-        anchor: leftCandidate.anchor,
-        pivot: leftCandidate.pivot,
-        previousCursor: leftCandidate.previousCursor
-      };
-      leftCandidate = null;
-      element.style.cursor = leftDrag.mode === "pan" ? "move" : "grabbing";
-      capturePointer(event);
-      setInteractionHint(leftDrag.mode === "pan" ? "globe-pan" : "globe-rotate");
-      const previousX = leftDrag.lastX;
-      const previousY = leftDrag.lastY;
-      const deltaX = event.clientX - previousX;
-      const deltaY = event.clientY - previousY;
-      leftDrag.lastX = event.clientX;
-      leftDrag.lastY = event.clientY;
-      updateOrbitVelocity(leftDrag, deltaX, deltaY);
-      if (leftDrag.mode === "pan") {
-        moveCameraToKeepSurfacePointUnderPointer(
-          leftDrag.anchor,
-          event,
-          previousX,
-          previousY,
-          leftDrag.pivot
-        );
-      } else {
-        orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
-      }
-      return;
-    }
-    if (middleDrag && middleDrag.id === event.pointerId) {
-      blockEvent(event);
-      if (!canHandle()) {
-        cancelStalePointerGesture(event, endMiddleDrag);
-        return;
-      }
-      const deltaX = (event.clientX - middleDrag.lastX) * 0.45;
-      const deltaY = (event.clientY - middleDrag.lastY) * 1.1;
-      updateOrbitVelocity(middleDrag, deltaX, deltaY);
-      orbitAroundPivot(deltaX, deltaY, middleDrag.anchor);
-      middleDrag.lastX = event.clientX;
-      middleDrag.lastY = event.clientY;
-      return;
-    }
-    if (!rightDrag || rightDrag.id !== event.pointerId) return;
-    blockEvent(event);
-    if (!canHandle()) {
-      cancelStalePointerGesture(event, endRightDrag);
-      return;
-    }
-    const deltaY = rightDrag.lastY - event.clientY;
-    rightDrag.lastY = event.clientY;
-    setHoverPoint(event);
-    queueZoom(normalizeGlobeDragZoomDelta(deltaY, element));
-  };
-  const handlePointerEnd = (event: PointerEvent) => {
-    if (leftDrag && leftDrag.id === event.pointerId) {
-      blockEvent(event);
-      if (!canHandle()) {
-        cancelStalePointerGesture(event, endLeftDrag);
-        return;
-      }
-      const inertiaVelocity = leftDrag.mode === "rotate"
-        ? { x: leftDrag.velocityX, y: leftDrag.velocityY, pivot: leftDrag.pivot }
-        : null;
-      endLeftDrag(event);
-      if (inertiaVelocity) {
-        startOrbitInertia(inertiaVelocity.x, inertiaVelocity.y, inertiaVelocity.pivot);
-      }
-      updatePanCursorPreview(isGlobePanModifier(event));
-      return;
-    }
-    if (leftCandidate && leftCandidate.id === event.pointerId) {
-      blockEvent(event);
-      if (!canHandle()) {
-        cancelStalePointerGesture(event, endLeftDrag);
-        return;
-      }
-      const shouldClearSelection = leftCandidate.mode !== "pan";
-      leftCandidate = null;
-      if (shouldClearSelection) {
-        onEmptyLeftClick();
-      }
-      updatePanCursorPreview(isGlobePanModifier(event));
-      return;
-    }
-    if (middleDrag && middleDrag.id === event.pointerId) {
-      blockEvent(event);
-      if (!canHandle()) {
-        cancelStalePointerGesture(event, endMiddleDrag);
-        return;
-      }
-      const inertiaVelocity = {
-        x: middleDrag.velocityX,
-        y: middleDrag.velocityY,
-        pivot: middleDrag.anchor
-      };
-      endMiddleDrag(event);
-      startOrbitInertia(inertiaVelocity.x, inertiaVelocity.y, inertiaVelocity.pivot);
-      updatePanCursorPreview(isGlobePanModifier(event));
-      return;
-    }
-    if (!rightDrag || rightDrag.id !== event.pointerId) return;
-    blockEvent(event);
-    if (!canHandle()) {
-      cancelStalePointerGesture(event, endRightDrag);
-      return;
-    }
-    endRightDrag(event);
-    updatePanCursorPreview(isGlobePanModifier(event));
-  };
-  const handlePointerCancel = (event: PointerEvent) => {
-    if (
-      leftDrag?.id !== event.pointerId &&
-      leftCandidate?.id !== event.pointerId &&
-      middleDrag?.id !== event.pointerId &&
-      rightDrag?.id !== event.pointerId
-    ) {
-      return;
-    }
-    blockEvent(event);
-    endLeftDrag(event);
-    endMiddleDrag(event);
-    endRightDrag(event);
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    controls.resetState();
-    runtimeControls.needsUpdate = true;
-    updatePanCursorPreview(isGlobePanModifier(event));
-    onInteraction();
-  };
-  const handleLostPointerCapture = (event: PointerEvent) => {
-    let hadActiveDrag = false;
-    if (leftDrag?.id === event.pointerId) {
-      hadActiveDrag = true;
-      endLeftDrag(event);
-    }
-    if (leftCandidate?.id === event.pointerId) {
-      hadActiveDrag = true;
-      endLeftDrag(event);
-    }
-    if (middleDrag?.id === event.pointerId) {
-      hadActiveDrag = true;
-      endMiddleDrag(event);
-    }
-    if (rightDrag?.id === event.pointerId) {
-      hadActiveDrag = true;
-      endRightDrag(event);
-    }
-    if (!hadActiveDrag) {
-      return;
-    }
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    controls.resetState();
-    runtimeControls.needsUpdate = true;
-    updatePanCursorPreview(isGlobePanModifier(event));
-    onInteraction();
-  };
-  const handleContextMenu = (event: MouseEvent) => {
-    if (canHandle()) {
-      blockEvent(event);
-    }
-  };
-  const handleAuxClick = (event: MouseEvent) => {
-    if (!canHandle()) {
-      return;
-    }
-    if (event.button === 1 || event.button === 2) {
-      blockEvent(event);
-    }
-  };
-  const handlePointerEnter = (event: PointerEvent) => {
-    pointerHoveringElement = true;
-    updatePanCursorPreview(isGlobePanModifier(event));
-  };
-  const handlePointerLeave = (event: PointerEvent) => {
-    pointerHoveringElement = false;
-    clearPanCursorPreview();
-    if (event.buttons && leftCandidate?.id === event.pointerId) {
-      endLeftDrag(event);
-    }
-  };
-  const handleModifierKeyChange = (event: KeyboardEvent) => {
-    if (isEditableKeyboardTarget(event.target)) {
-      clearPanCursorPreview();
-      return;
-    }
-    if (!isGlobePanModifierKey(event)) {
-      return;
-    }
-    updatePanCursorPreview(isGlobePanModifier(event));
-  };
-  const handleWheel = (event: WheelEvent) => {
-    if (!canHandle()) return;
-    if (!hasNonZeroWheelDelta(event)) return;
-    const zoomDelta = normalizeGlobeWheelZoomDelta(event, element);
-    blockEvent(event);
-    if (!zoomDelta) {
-      return;
-    }
-    cancelOrbitInertia();
-    controls.resetState();
-    setHoverPoint(event);
-    queueZoom(zoomDelta);
-    setInteractionHint("globe-zoom", 700);
-  };
-  const handleDoubleClick = (event: MouseEvent) => {
-    if (event.button !== 0 || !canHandle()) return;
-    if (shouldBypassDoubleClick(event)) return;
-    blockEvent(event);
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    controls.resetState();
-    setHoverPoint(event);
-    queueZoom(getGlobeDoubleClickZoomDelta(event, element));
-    setInteractionHint("globe-zoom", 700);
-  };
-  const handleWindowBlur = () => {
-    const hadCancelableInteraction = hasCancelableInteraction();
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    clearPanCursorPreview();
-    endLeftDrag();
-    endRightDrag();
-    endMiddleDrag();
-    clearInteractionHint();
-    if (hadCancelableInteraction) {
-      controls.resetState();
-      runtimeControls.needsUpdate = true;
-      onInteraction();
-    }
-  };
-  const handleVisibilityChange = () => {
-    if (document.visibilityState === "hidden") {
-      handleWindowBlur();
-    }
-  };
-  const cancelInteractionMomentum = (options: { clearHint?: boolean } = {}) => {
-    const shouldClearHint = options.clearHint !== false;
-    const hadCancelableInteraction = hasCancelableInteraction();
-    cancelOrbitInertia();
-    clearQueuedZoom();
-    clearPanCursorPreview(shouldClearHint);
-    endLeftDrag(undefined, shouldClearHint);
-    endRightDrag(undefined, shouldClearHint);
-    endMiddleDrag(undefined, shouldClearHint);
-    if (shouldClearHint) {
-      clearInteractionHint();
-    }
-    if (!hadCancelableInteraction) {
-      return false;
-    }
-    controls.resetState();
-    runtimeControls.needsUpdate = true;
-    onInteraction();
-    return true;
-  };
-  runtimeControls._cancelInteractionMomentum = cancelInteractionMomentum;
-
-  element.addEventListener("pointerdown", handlePointerDown, true);
-  element.addEventListener("pointerenter", handlePointerEnter, true);
-  element.addEventListener("pointerleave", handlePointerLeave, true);
-  element.addEventListener("lostpointercapture", handleLostPointerCapture, true);
-  element.addEventListener("contextmenu", handleContextMenu, true);
-  element.addEventListener("auxclick", handleAuxClick, true);
-  element.addEventListener("wheel", handleWheel, { capture: true, passive: false });
-  element.addEventListener("dblclick", handleDoubleClick, true);
-  window.addEventListener("pointermove", handlePointerMove, true);
-  window.addEventListener("pointerup", handlePointerEnd, true);
-  window.addEventListener("pointercancel", handlePointerCancel, true);
-  window.addEventListener("keydown", handleModifierKeyChange, true);
-  window.addEventListener("keyup", handleModifierKeyChange, true);
-  window.addEventListener("blur", handleWindowBlur);
-  document.addEventListener("visibilitychange", handleVisibilityChange);
-
-  return () => {
-    cancelInteractionMomentum();
-    if (interactionHintClearTimer) {
-      window.clearTimeout(interactionHintClearTimer);
-      interactionHintClearTimer = 0;
-    }
-    if (runtimeControls._cancelInteractionMomentum === cancelInteractionMomentum) {
-      delete runtimeControls._cancelInteractionMomentum;
-    }
-    element.removeEventListener("pointerdown", handlePointerDown, true);
-    element.removeEventListener("pointerenter", handlePointerEnter, true);
-    element.removeEventListener("pointerleave", handlePointerLeave, true);
-    element.removeEventListener("lostpointercapture", handleLostPointerCapture, true);
-    element.removeEventListener("contextmenu", handleContextMenu, true);
-    element.removeEventListener("auxclick", handleAuxClick, true);
-    element.removeEventListener("wheel", handleWheel, true);
-    element.removeEventListener("dblclick", handleDoubleClick, true);
-  window.removeEventListener("pointermove", handlePointerMove, true);
-  window.removeEventListener("pointerup", handlePointerEnd, true);
-  window.removeEventListener("pointercancel", handlePointerCancel, true);
-    window.removeEventListener("keydown", handleModifierKeyChange, true);
-    window.removeEventListener("keyup", handleModifierKeyChange, true);
-    window.removeEventListener("blur", handleWindowBlur);
-    document.removeEventListener("visibilitychange", handleVisibilityChange);
-  };
-}
-
 function hasNonZeroWheelDelta(event: WheelEvent): boolean {
   return event.deltaX !== 0 || event.deltaY !== 0 || event.deltaZ !== 0;
 }
 
-function normalizeGlobeWheelZoomDelta(event: WheelEvent, element: HTMLElement): number {
-  const deltaModeScale = event.deltaMode === WheelEvent.DOM_DELTA_LINE
-    ? 16
-    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-      ? Math.max(element.clientHeight, 1)
-      : 1;
-  const rawDelta = -event.deltaY * deltaModeScale;
-  if (!rawDelta) {
-    return 0;
-  }
-  const direction = Math.sign(rawDelta);
-  const easedMagnitude = Math.pow(Math.abs(rawDelta), 0.88) * CESIUM_WHEEL_ZOOM_SPEED;
-  return THREE.MathUtils.clamp(direction * easedMagnitude, -360, 360);
-}
-
-function getGlobeViewportZoomScale(element: HTMLElement): number {
-  return THREE.MathUtils.clamp(
-    CESIUM_REFERENCE_VIEWPORT_HEIGHT / Math.max(element.clientHeight, 1),
-    CESIUM_MIN_VIEWPORT_ZOOM_SCALE,
-    CESIUM_MAX_VIEWPORT_ZOOM_SCALE
-  );
-}
-
-function normalizeGlobeDragZoomDelta(deltaY: number, element: HTMLElement): number {
-  if (!deltaY) {
-    return 0;
-  }
-  return THREE.MathUtils.clamp(
-    deltaY * CESIUM_RIGHT_DRAG_ZOOM_SPEED * getGlobeViewportZoomScale(element),
-    -360,
-    360
-  );
-}
-
-function getGlobeDoubleClickZoomDelta(event: MouseEvent, element: HTMLElement): number {
-  const rawMagnitude = element.clientHeight > 0
-    ? element.clientHeight * CESIUM_DOUBLE_CLICK_ZOOM_VIEWPORT_RATIO
-    : CESIUM_DOUBLE_CLICK_ZOOM_DELTA;
-  const magnitude = THREE.MathUtils.clamp(
-    rawMagnitude,
-    CESIUM_MIN_DOUBLE_CLICK_ZOOM_DELTA,
-    CESIUM_MAX_DOUBLE_CLICK_ZOOM_DELTA
-  );
-  return event.shiftKey ? -magnitude : magnitude;
-}
-
-function isGlobePanModifier(event: Pick<MouseEvent | KeyboardEvent, "shiftKey" | "ctrlKey" | "metaKey">): boolean {
-  return event.shiftKey || event.ctrlKey || event.metaKey;
-}
-
-function isGlobePanModifierKey(event: KeyboardEvent): boolean {
-  return event.key === "Shift" || event.key === "Control" || event.key === "Meta" || event.key === "OS";
+function isNativeGlobeRotateModifier(event: Pick<MouseEvent | KeyboardEvent, "shiftKey">): boolean {
+  return event.shiftKey;
 }
 
 function isTransformControlPointerHit(
