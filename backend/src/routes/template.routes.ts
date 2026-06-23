@@ -135,7 +135,22 @@ router.get(
 router.post(
   "/:id/parse",
   asyncHandler(async (req, res) => {
-    res.json({ data: await parseTemplate(req.params.id) });
+    const { parameterLabels } = req.body || {};
+    if (
+      parameterLabels !== undefined &&
+      (
+        !Array.isArray(parameterLabels) ||
+        parameterLabels.some((item) => (
+          !item ||
+          typeof item.id !== "string" ||
+          typeof item.name !== "string" ||
+          typeof item.label !== "string"
+        ))
+      )
+    ) {
+      throw new HttpError(400, "参数名称配置格式不正确");
+    }
+    res.json({ data: await parseTemplate(req.params.id, { parameterLabels }) });
   })
 );
 

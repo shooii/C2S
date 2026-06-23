@@ -44,6 +44,7 @@ export const api = {
     kind: "file" | "folder";
     initialPath?: string;
     multiple?: boolean;
+    title?: string;
   }) => unwrap<{ cancelled: boolean; paths: string[] }>(
     http.post("/api/local-paths/select", payload, { timeout: 0 })
   ),
@@ -53,8 +54,10 @@ export const api = {
 
   getTemplate: (id: string) => unwrap<TemplateDetail>(http.get(`/api/templates/${id}`)),
 
-  parseTemplate: (id: string) =>
-    unwrap<TemplateDetail>(http.post(`/api/templates/${id}/parse`)),
+  parseTemplate: (
+    id: string,
+    payload?: { parameterLabels?: Array<{ id: string; name: string; label: string }> }
+  ) => unwrap<TemplateDetail>(http.post(`/api/templates/${id}/parse`, payload || {})),
 
   updateTemplateConfiguration: (
     id: string,

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "tsc -b && vite build",
+    "check-preview-source": "node scripts/check-preview-source.mjs",
     "test": "node scripts/check-preview-source.mjs",
     "preview": "vite preview --host 0.0.0.0 --port 5173"
   },

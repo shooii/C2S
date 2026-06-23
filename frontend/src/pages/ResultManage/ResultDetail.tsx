@@ -66,6 +66,7 @@ export default function ResultDetail() {
   const appliedSeqRef = useRef(0);
   const foregroundLoadSeqRef = useRef(0);
   const fileRequestSeqRef = useRef(0);
+  const loadFilesRef = useRef<() => Promise<void>>(async () => undefined);
   const actionBusyRef = useRef(false);
   const mountedRef = useRef(true);
   const normalizedFileSearch = debouncedFileSearch.trim();
@@ -141,6 +142,10 @@ export default function ResultDetail() {
   }, [currentResultFolder, filePageNumber, id, message, normalizedFileSearch]);
 
   useEffect(() => {
+    loadFilesRef.current = loadFiles;
+  }, [loadFiles]);
+
+  useEffect(() => {
     void load();
   }, [load]);
 
@@ -180,7 +185,7 @@ export default function ResultDetail() {
     if (!task || ["pending", "running"].includes(task.status)) {
       return;
     }
-    void loadFiles();
+    void loadFilesRef.current();
   }, [task?.id, task?.status]);
 
   const refreshLogs = useCallback(async (showLoading = false) => {

@@ -14,6 +14,9 @@ function readStorageValue(key: string): string | null {
 
 function writeStorageValue(key: string, value: string) {
   try {
+    if (window.localStorage.getItem(key) === value) {
+      return;
+    }
     window.localStorage.setItem(key, value);
   } catch {
     // Storage can be unavailable in locked-down or private browser contexts.
@@ -41,11 +44,11 @@ export function usePreviewSettings() {
   }, [threeRenderer]);
 
   const setPreviewEngine = useCallback((engine: PreviewEngine) => {
-    setPreviewEngineState(engine);
+    setPreviewEngineState((current) => (current === engine ? current : engine));
   }, []);
 
   const setThreeRenderer = useCallback((renderer: ThreeRendererPreference) => {
-    setThreeRendererState(renderer);
+    setThreeRendererState((current) => (current === renderer ? current : renderer));
   }, []);
 
   return {

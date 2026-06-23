@@ -11,6 +11,7 @@ interface SelectionRequest {
   kind: "file" | "folder";
   initialPath: string;
   multiple: boolean;
+  title: string;
 }
 
 interface PendingSelection {
@@ -168,6 +169,7 @@ export function selectLocalPath(options: {
   kind: "file" | "folder";
   initialPath?: string | null;
   multiple?: boolean;
+  title?: string | null;
 }): Promise<LocalPathSelection> {
   if (process.platform !== "win32") {
     throw new HttpError(501, "本地路径选择器目前仅支持 Windows");
@@ -175,8 +177,13 @@ export function selectLocalPath(options: {
   return windowsPathSelector.select({
     kind: options.kind,
     initialPath: options.initialPath || "",
-    multiple: Boolean(options.multiple)
+    multiple: Boolean(options.multiple),
+    title: normalizeDialogTitle(options.title)
   });
+}
+
+function normalizeDialogTitle(value: string | null | undefined): string {
+  return (value || "").trim().slice(0, 120);
 }
 
 function encodeBase64(value: string): string {
@@ -572,7 +579,13 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     $paths = @()
     $cancelled = $false
 
-    $title = if ($request.kind -eq "folder") { "选择目录路径" } else { "选择文件路径" }
+    $title = if (-not [String]::IsNullOrWhiteSpace([string]$request.title)) {
+      [string]$request.title
+    } elseif ($request.kind -eq "folder") {
+      "选择目录路径"
+    } else {
+      "选择文件路径"
+    }
     [C2SDialogFocus]::Start()
     $selectedPaths = [C2SPathPicker]::SelectPaths(
       [string]$request.kind,

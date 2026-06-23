@@ -1,8 +1,9 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type Dispatch, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction, memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Divider,
   Empty,
+  Input,
   InputNumber,
   Radio,
   Result,
@@ -15,6 +16,7 @@ import {
 import {
   AimOutlined,
   ArrowLeftOutlined,
+  BgColorsOutlined,
   CloseOutlined,
   ColumnHeightOutlined,
   CompressOutlined,
@@ -24,18 +26,22 @@ import {
   FileOutlined,
   FullscreenExitOutlined,
   FullscreenOutlined,
+  GlobalOutlined,
   HomeOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   NodeIndexOutlined,
+  QuestionCircleOutlined,
   ReloadOutlined,
   RightOutlined,
   RotateRightOutlined,
+  SearchOutlined,
   SettingOutlined,
   StarOutlined,
-  UndoOutlined
+  UndoOutlined,
+  UpOutlined
 } from "@ant-design/icons";
 import * as THREE from "three";
 import { WebGPURenderer } from "three/webgpu";
@@ -81,7 +87,23 @@ import type {
 type TransformMode = "translate" | "rotate" | "scale";
 type RendererBackend = ThreeRendererBackend;
 type LoadStatus = PreviewLoadStatus;
-type ViewCommand = "fit" | "reset" | null;
+type ViewCommand = "fit" | "focus-selected" | "reset" | "earth-default" | "cancel-interaction";
+type PreviewPerformanceMode = "normal" | "adaptive";
+type PreviewInteractionHint =
+  | "globe-rotate"
+  | "globe-pan"
+  | "globe-tilt"
+  | "globe-zoom"
+  | "view-fit"
+  | "view-focus-selected"
+  | "view-reset"
+  | "view-earth-default"
+  | "view-cancel-interaction"
+  | "transform-translate"
+  | "transform-rotate"
+  | "transform-scale";
+type PreviewSideTab = "files" | "materials" | "meshes";
+type PreviewMeshViewMode = "list" | "tree";
 type LayerVisibilityState = "visible" | "hidden" | "partial";
 type PreviewSaveState = "idle" | "saving" | "saved" | "error";
 
@@ -92,7 +114,16 @@ interface PreviewViewOptions {
 interface LayerNode {
   key: string;
   title: string;
+  kind?: string;
   children?: LayerNode[];
+}
+
+interface MaterialNode {
+  key: string;
+  title: string;
+  layerKey: string | null;
+  objectCount: number;
+  color?: string;
 }
 
 interface SceneInfo {
@@ -102,9 +133,369 @@ interface SceneInfo {
   meshes: number;
   vertices: number;
   fps?: number;
+  performanceMode?: PreviewPerformanceMode;
+}
+
+interface PreviewStateSaveQueueItem {
+  taskId: string;
+  fileId: string;
+  signature: string;
+  previewState: PreviewState;
+}
+
+interface ViewCommandRequest {
+  type: ViewCommand;
+  revision: number;
+  signature: string;
+}
+
+interface ViewCommandHandledResult {
+  cancelledInteraction?: boolean;
 }
 
 type PreviewRenderer = THREE.WebGLRenderer | InstanceType<typeof WebGPURenderer>;
+
+const PREVIEW_LEFT_PANEL_MIN_WIDTH = 260;
+const PREVIEW_LEFT_PANEL_MAX_WIDTH = 460;
+const PREVIEW_LEFT_PANEL_DEFAULT_WIDTH = 312;
+const PREVIEW_RIGHT_PANEL_MIN_WIDTH = 248;
+const PREVIEW_RIGHT_PANEL_MAX_WIDTH = 420;
+const PREVIEW_RIGHT_PANEL_DEFAULT_WIDTH = 288;
+const PREVIEW_PANEL_LAYOUT_STORAGE_KEY = "c2s.preview.panelLayout.v1";
+const PREVIEW_VIEW_OPTIONS_STORAGE_KEY = "c2s.preview.viewOptions.v1";
+const PREVIEW_SIDE_PANEL_STORAGE_KEY = "c2s.preview.sidePanel.v1";
+const PREVIEW_LAYER_ROW_HEIGHT = 36;
+const PREVIEW_LAYER_VIRTUAL_THRESHOLD = 140;
+const PREVIEW_LAYER_VIRTUAL_OVERSCAN = 12;
+const PREVIEW_MATERIAL_ROW_HEIGHT = 40;
+const PREVIEW_MATERIAL_VIRTUAL_THRESHOLD = 120;
+const PREVIEW_MATERIAL_VIRTUAL_OVERSCAN = 10;
+const PREVIEW_MODEL_HIT_CACHE_MS = 350;
+const PREVIEW_DYNAMIC_LAYER_SIGNATURE_LIMIT = 160;
+const PREVIEW_DYNAMIC_PICKABLE_SCAN_LIMIT = 1200;
+const PREVIEW_DYNAMIC_PICKABLE_OBJECT_LIMIT = 520;
+const PREVIEW_DYNAMIC_MATERIAL_SCAN_LIMIT = 650;
+const PREVIEW_DYNAMIC_STATS_SCAN_LIMIT = 1000;
+
+function clampPreviewLeftPanelWidth(width: number): number {
+  return Math.round(THREE.MathUtils.clamp(
+    width,
+    PREVIEW_LEFT_PANEL_MIN_WIDTH,
+    PREVIEW_LEFT_PANEL_MAX_WIDTH
+  ));
+}
+
+function clampPreviewRightPanelWidth(width: number): number {
+  return Math.round(THREE.MathUtils.clamp(
+    width,
+    PREVIEW_RIGHT_PANEL_MIN_WIDTH,
+    PREVIEW_RIGHT_PANEL_MAX_WIDTH
+  ));
+}
+
+function normalizePreviewFps(fps?: number): number | undefined {
+  return typeof fps === "number" && Number.isFinite(fps) && fps > 0
+    ? Math.round(fps)
+    : undefined;
+}
+
+function isSamePreviewSceneInfo(current: SceneInfo, next: SceneInfo): boolean {
+  return current.backend === next.backend &&
+    current.status === next.status &&
+    current.message === next.message &&
+    current.meshes === next.meshes &&
+    current.vertices === next.vertices &&
+    normalizePreviewFps(current.fps) === normalizePreviewFps(next.fps) &&
+    (current.performanceMode || "normal") === (next.performanceMode || "normal");
+}
+
+function normalizePreviewKeyList(keys: string[]): string[] {
+  return Array.from(new Set(keys)).sort();
+}
+
+function isSamePreviewKeySet(first: string[], second: string[]): boolean {
+  const normalizedFirst = normalizePreviewKeyList(first);
+  const normalizedSecond = normalizePreviewKeyList(second);
+  return normalizedFirst.length === normalizedSecond.length &&
+    normalizedFirst.every((key, index) => key === normalizedSecond[index]);
+}
+
+function formatPreviewStateNumber(value: number): number {
+  return Number.isFinite(value)
+    ? Math.round(value * 1_000_000_000) / 1_000_000_000
+    : 0;
+}
+
+function getPreviewTransformPersistenceState(transform: PreviewTransform) {
+  return {
+    position: transform.position.map(formatPreviewStateNumber),
+    rotation: transform.rotation.map(formatPreviewStateNumber),
+    scale: transform.scale.map(formatPreviewStateNumber),
+    geo: transform.geo
+      ? {
+        longitude: formatPreviewStateNumber(transform.geo.longitude),
+        latitude: formatPreviewStateNumber(transform.geo.latitude),
+        height: formatPreviewStateNumber(transform.geo.height)
+      }
+      : null
+  };
+}
+
+function getPreviewTransformPersistenceSignature(
+  sceneMode: PreviewSceneMode,
+  transform: PreviewTransform
+): string {
+  return JSON.stringify({
+    sceneMode,
+    transform: getPreviewTransformPersistenceState(transform)
+  });
+}
+
+function isSamePreviewTransform(
+  sceneMode: PreviewSceneMode,
+  current: PreviewTransform,
+  next: PreviewTransform
+): boolean {
+  return getPreviewTransformPersistenceSignature(sceneMode, current) ===
+    getPreviewTransformPersistenceSignature(sceneMode, next);
+}
+
+function getPreviewStatePersistenceSignature(
+  sceneMode: PreviewSceneMode,
+  transform: PreviewTransform,
+  selectedLayerKey: string | null,
+  hiddenLayerKeys: string[]
+): string {
+  return JSON.stringify({
+    sceneMode,
+    transform: getPreviewTransformPersistenceState(transform),
+    selectedLayerKey: selectedLayerKey || null,
+    hiddenLayerKeys: normalizePreviewKeyList(hiddenLayerKeys)
+  });
+}
+type PreviewTilesQuality = "normal" | "balanced" | "interactive";
+
+interface PreviewTilesResolutionState {
+  width: number;
+  height: number;
+  quality: PreviewTilesQuality;
+  errorTarget: number;
+  maxTilesProcessed: number;
+}
+
+interface PreviewPanelWidthRafState {
+  frameId: number;
+  width: number | null;
+}
+
+interface PreviewPanelLayoutPreferences {
+  leftPanelWidth?: number;
+  rightPanelWidth?: number;
+  leftPanelCollapsed?: boolean;
+  rightPanelCollapsed?: boolean;
+}
+
+interface PreviewSidePanelPreferences {
+  activeSideTab?: PreviewSideTab;
+  meshViewMode?: PreviewMeshViewMode;
+}
+
+function isPreviewSideTab(value: unknown): value is PreviewSideTab {
+  return value === "files" || value === "materials" || value === "meshes";
+}
+
+function isPreviewMeshViewMode(value: unknown): value is PreviewMeshViewMode {
+  return value === "list" || value === "tree";
+}
+
+function readPreviewPanelLayoutPreferences(): PreviewPanelLayoutPreferences {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  try {
+    const rawValue = window.localStorage.getItem(PREVIEW_PANEL_LAYOUT_STORAGE_KEY);
+    if (!rawValue) {
+      return {};
+    }
+    const parsedValue = JSON.parse(rawValue) as PreviewPanelLayoutPreferences;
+    return parsedValue && typeof parsedValue === "object" ? parsedValue : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePreviewPanelLayoutPreferences(nextPreferences: PreviewPanelLayoutPreferences) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const currentPreferences = readPreviewPanelLayoutPreferences();
+    const nextValue = JSON.stringify({
+      ...currentPreferences,
+      ...nextPreferences
+    });
+    if (window.localStorage.getItem(PREVIEW_PANEL_LAYOUT_STORAGE_KEY) === nextValue) {
+      return;
+    }
+    window.localStorage.setItem(PREVIEW_PANEL_LAYOUT_STORAGE_KEY, nextValue);
+  } catch {
+    // Local storage may be unavailable in restricted browsing modes.
+  }
+}
+
+function getInitialPreviewLeftPanelWidth(): number {
+  const storedWidth = readPreviewPanelLayoutPreferences().leftPanelWidth;
+  return typeof storedWidth === "number" && Number.isFinite(storedWidth)
+    ? clampPreviewLeftPanelWidth(storedWidth)
+    : PREVIEW_LEFT_PANEL_DEFAULT_WIDTH;
+}
+
+function getInitialPreviewRightPanelWidth(): number {
+  const storedWidth = readPreviewPanelLayoutPreferences().rightPanelWidth;
+  return typeof storedWidth === "number" && Number.isFinite(storedWidth)
+    ? clampPreviewRightPanelWidth(storedWidth)
+    : PREVIEW_RIGHT_PANEL_DEFAULT_WIDTH;
+}
+
+function getInitialPreviewLeftPanelCollapsed(): boolean {
+  const storedCollapsed = readPreviewPanelLayoutPreferences().leftPanelCollapsed;
+  return typeof storedCollapsed === "boolean" ? storedCollapsed : shouldDefaultCollapseLayerPanel();
+}
+
+function getInitialPreviewRightPanelCollapsed(): boolean {
+  const storedCollapsed = readPreviewPanelLayoutPreferences().rightPanelCollapsed;
+  return typeof storedCollapsed === "boolean" ? storedCollapsed : shouldDefaultCollapseInspector();
+}
+
+function hasStoredPreviewLeftPanelCollapsedPreference(): boolean {
+  return typeof readPreviewPanelLayoutPreferences().leftPanelCollapsed === "boolean";
+}
+
+function hasStoredPreviewRightPanelCollapsedPreference(): boolean {
+  return typeof readPreviewPanelLayoutPreferences().rightPanelCollapsed === "boolean";
+}
+
+function readPreviewViewOptions(): PreviewViewOptions {
+  if (typeof window === "undefined") {
+    return { stars: true };
+  }
+  try {
+    const rawValue = window.localStorage.getItem(PREVIEW_VIEW_OPTIONS_STORAGE_KEY);
+    if (!rawValue) {
+      return { stars: true };
+    }
+    const parsedValue = JSON.parse(rawValue) as Partial<PreviewViewOptions>;
+    return {
+      stars: typeof parsedValue.stars === "boolean" ? parsedValue.stars : true
+    };
+  } catch {
+    return { stars: true };
+  }
+}
+
+function writePreviewViewOptions(nextOptions: PreviewViewOptions) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const nextValue = JSON.stringify(nextOptions);
+    if (window.localStorage.getItem(PREVIEW_VIEW_OPTIONS_STORAGE_KEY) === nextValue) {
+      return;
+    }
+    window.localStorage.setItem(PREVIEW_VIEW_OPTIONS_STORAGE_KEY, nextValue);
+  } catch {
+    // Local storage may be unavailable in restricted browsing modes.
+  }
+}
+
+function readPreviewSidePanelPreferences(): PreviewSidePanelPreferences {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  try {
+    const rawValue = window.localStorage.getItem(PREVIEW_SIDE_PANEL_STORAGE_KEY);
+    if (!rawValue) {
+      return {};
+    }
+    const parsedValue = JSON.parse(rawValue) as PreviewSidePanelPreferences;
+    return {
+      activeSideTab: isPreviewSideTab(parsedValue.activeSideTab) ? parsedValue.activeSideTab : undefined,
+      meshViewMode: isPreviewMeshViewMode(parsedValue.meshViewMode) ? parsedValue.meshViewMode : undefined
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writePreviewSidePanelPreferences(nextPreferences: PreviewSidePanelPreferences) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const currentPreferences = readPreviewSidePanelPreferences();
+    const nextValue = JSON.stringify({
+      ...currentPreferences,
+      ...nextPreferences
+    });
+    if (window.localStorage.getItem(PREVIEW_SIDE_PANEL_STORAGE_KEY) === nextValue) {
+      return;
+    }
+    window.localStorage.setItem(PREVIEW_SIDE_PANEL_STORAGE_KEY, nextValue);
+  } catch {
+    // Local storage may be unavailable in restricted browsing modes.
+  }
+}
+
+function getInitialPreviewSideTab(): PreviewSideTab {
+  return readPreviewSidePanelPreferences().activeSideTab || "files";
+}
+
+function getInitialPreviewMeshViewMode(): PreviewMeshViewMode {
+  return readPreviewSidePanelPreferences().meshViewMode || "list";
+}
+
+function schedulePreviewPanelWidthUpdate(
+  updateRef: { current: PreviewPanelWidthRafState },
+  width: number,
+  setWidth: Dispatch<SetStateAction<number>>
+) {
+  updateRef.current.width = width;
+  if (updateRef.current.frameId) {
+    return;
+  }
+  updateRef.current.frameId = window.requestAnimationFrame(() => {
+    const nextWidth = updateRef.current.width;
+    updateRef.current.frameId = 0;
+    updateRef.current.width = null;
+    if (typeof nextWidth === "number") {
+      setWidth((current) => (current === nextWidth ? current : nextWidth));
+    }
+  });
+}
+
+function flushPreviewPanelWidthUpdate(
+  updateRef: { current: PreviewPanelWidthRafState },
+  setWidth: Dispatch<SetStateAction<number>>
+) {
+  if (updateRef.current.frameId) {
+    window.cancelAnimationFrame(updateRef.current.frameId);
+    updateRef.current.frameId = 0;
+  }
+  const nextWidth = updateRef.current.width;
+  updateRef.current.width = null;
+  if (typeof nextWidth === "number") {
+    setWidth((current) => (current === nextWidth ? current : nextWidth));
+  }
+}
+
+function cancelPreviewPanelWidthUpdate(updateRef: { current: PreviewPanelWidthRafState }) {
+  if (updateRef.current.frameId) {
+    window.cancelAnimationFrame(updateRef.current.frameId);
+  }
+  updateRef.current.frameId = 0;
+  updateRef.current.width = null;
+}
+
 interface PreviewRendererResult {
   renderer: PreviewRenderer;
   backend: RendererBackend;
@@ -139,6 +530,20 @@ interface CanvasPointerIntent {
   y: number;
 }
 
+interface CanvasPickRequest {
+  clientX: number;
+  clientY: number;
+  modelRoot: THREE.Object3D;
+}
+
+interface CanvasHoverRequest {
+  clientX: number;
+  clientY: number;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+}
+
 const DEFAULT_TRANSFORM: PreviewTransform = {
   position: [0, 0, 0],
   rotation: [0, 0, 0],
@@ -149,12 +554,13 @@ const DEFAULT_TRANSFORM: PreviewTransform = {
 const TRANSFORM_MODE_OPTIONS: Array<{
   value: TransformMode;
   label: string;
+  shortcut: string;
   tooltip: string;
   icon: ReactNode;
 }> = [
-  { value: "translate", label: "平移", tooltip: "切换到平移", icon: <DragOutlined /> },
-  { value: "rotate", label: "旋转", tooltip: "切换到旋转", icon: <RotateRightOutlined /> },
-  { value: "scale", label: "缩放", tooltip: "切换到缩放", icon: <CompressOutlined /> }
+  { value: "translate", label: "平移 W", shortcut: "W", tooltip: "切换到平移（W）", icon: <DragOutlined /> },
+  { value: "rotate", label: "旋转 E", shortcut: "E", tooltip: "切换到旋转（E）", icon: <RotateRightOutlined /> },
+  { value: "scale", label: "缩放 R", shortcut: "R", tooltip: "切换到缩放（R）", icon: <CompressOutlined /> }
 ];
 
 const METERS_PER_DEGREE = 111_319.49079327358;
@@ -166,7 +572,53 @@ const MIN_GLOBE_CAMERA_NEAR = 0.001;
 const MAX_GLOBE_CAMERA_FAR = 120_000_000;
 const MIN_GLOBE_FOCUS_DISTANCE = 0.5;
 const CESIUM_RIGHT_DRAG_ZOOM_SPEED = 0.85;
+const CESIUM_WHEEL_ZOOM_SPEED = 0.42;
 const CESIUM_DOUBLE_CLICK_ZOOM_DELTA = 360;
+const CESIUM_REFERENCE_VIEWPORT_HEIGHT = 720;
+const CESIUM_MIN_VIEWPORT_ZOOM_SCALE = 0.75;
+const CESIUM_MAX_VIEWPORT_ZOOM_SCALE = 1.85;
+const CESIUM_DOUBLE_CLICK_ZOOM_VIEWPORT_RATIO = 0.58;
+const CESIUM_MIN_DOUBLE_CLICK_ZOOM_DELTA = 240;
+const CESIUM_MAX_DOUBLE_CLICK_ZOOM_DELTA = 520;
+const CESIUM_MAX_QUEUED_ZOOM_DELTA = 720;
+const GLOBE_DRAG_THRESHOLD_PX = 3;
+const GLOBE_INERTIA_DECAY = 0.9;
+const GLOBE_INERTIA_MIN_DELTA = 0.08;
+const GLOBE_INERTIA_MAX_DELTA = 38;
+const PREVIEW_MAX_PIXEL_RATIO = 1.5;
+const PREVIEW_INTERACTIVE_PIXEL_RATIO = 0.9;
+const PREVIEW_LOW_FPS_PIXEL_RATIO = 0.85;
+const PREVIEW_LOW_FPS_THRESHOLD = 18;
+const PREVIEW_LOW_FPS_RECOVER_THRESHOLD = 28;
+const PREVIEW_LOW_FPS_RECOVERY_MS = 2200;
+const PREVIEW_LOW_FPS_INFO_INTERVAL_MS = 1800;
+const PREVIEW_FPS_SIGNIFICANT_CHANGE = 3;
+const PREVIEW_TILES_MAX_RESOLUTION = 1600;
+const PREVIEW_BALANCED_TILES_MAX_RESOLUTION = 900;
+const PREVIEW_INTERACTIVE_TILES_MAX_RESOLUTION = 520;
+const PREVIEW_TILE_ERROR_TARGET = 12;
+const PREVIEW_BALANCED_TILE_ERROR_TARGET = 42;
+const PREVIEW_INTERACTIVE_TILE_ERROR_TARGET = 96;
+const PREVIEW_TILE_MAX_PROCESSED = 220;
+const PREVIEW_BALANCED_TILE_MAX_PROCESSED = 110;
+const PREVIEW_INTERACTIVE_TILE_MAX_PROCESSED = 60;
+const PREVIEW_DYNAMIC_SUMMARY_INTERVAL_MS = 1500;
+const PREVIEW_DEFERRED_SUMMARY_DELAY_MS = 350;
+const PREVIEW_VIEW_STATE_SYNC_INTERVAL_MS = 2000;
+const PREVIEW_DEFERRED_VIEW_STATE_SYNC_DELAY_MS = 280;
+const PREVIEW_SCENE_VIEW_NUMBER_PRECISION = 2;
+const PREVIEW_IDLE_RENDER_INTERVAL_MS = 125;
+const PREVIEW_LOW_FPS_TILES_UPDATE_INTERVAL_MS = 320;
+const PREVIEW_BACKGROUND_RENDER_INTERVAL_MS = 1000;
+const PREVIEW_SCENE_VISUAL_DIRTY_MS = 320;
+const PREVIEW_TILES_VISUAL_DIRTY_MS = 900;
+const PREVIEW_LOAD_PROGRESS_STEP = 5;
+const PREVIEW_LOAD_PROGRESS_INTERVAL_MS = 250;
+const PREVIEW_INTERACTION_MARK_INTERVAL_MS = 80;
+const PREVIEW_TRANSFORM_CHANGE_THROTTLE_MS = 80;
+const PREVIEW_HOVER_PICK_INTERVAL_MS = 90;
+const PREVIEW_HOVER_PICK_MOVE_THRESHOLD_PX = 6;
+const GLOBE_INTERACTION_QUALITY_RECOVERY_MS = 650;
 const WEBGPU_FALLBACK_MESSAGE = "当前环境无法使用 WebGPU，已自动切换为 WebGL。";
 const CESIUM_ION_TOKEN = String(import.meta.env.VITE_CESIUM_ION_TOKEN || "").trim();
 const CESIUM_ION_ASSET_ID = String(import.meta.env.VITE_CESIUM_ION_ASSET_ID || "2275207").trim();
@@ -175,6 +627,11 @@ const GEOSPATIAL_WGS84 = GeospatialEllipsoid.WGS84;
 // three-geospatial ENU uses Z as local Up, matching the preview transform fields.
 const OBJECT_FRAME_ADJUSTMENT = new THREE.Matrix4();
 const IMPORT_OBJECT_FRAME_ADJUSTMENT = new THREE.Matrix4().makeRotationX(Math.PI / 2);
+const TILE_RESOLUTION_SIZE = new THREE.Vector2();
+const TRANSFORM_CONTROL_HIT_POINTER = new THREE.Vector2();
+const TRANSFORM_CONTROL_HIT_RAYCASTER = new THREE.Raycaster();
+const TILE_CAMERA_CACHE = new WeakMap<TilesRenderer, THREE.Camera>();
+const TILE_RESOLUTION_CACHE = new WeakMap<TilesRenderer, PreviewTilesResolutionState>();
 
 THREE.Cache.enabled = true;
 
@@ -285,68 +742,299 @@ function PreviewWorkspace({
   const [hiddenLayerKeys, setHiddenLayerKeys] = useState<string[]>(() => initialState?.hiddenLayerKeys || []);
   const [expandedLayerKeys, setExpandedLayerKeys] = useState<string[]>([]);
   const [layerTree, setLayerTree] = useState<LayerNode[]>([]);
+  const [activeSideTab, setActiveSideTab] = useState<PreviewSideTab>(getInitialPreviewSideTab);
+  const [renderedSideTab, setRenderedSideTab] = useState<PreviewSideTab>(getInitialPreviewSideTab);
+  const [meshViewMode, setMeshViewMode] = useState<PreviewMeshViewMode>(getInitialPreviewMeshViewMode);
+  const [meshSearchText, setMeshSearchText] = useState("");
+  const deferredMeshSearchText = useDeferredValue(meshSearchText);
+  const [materialList, setMaterialList] = useState<MaterialNode[]>([]);
+  const [selectedMaterialKey, setSelectedMaterialKey] = useState<string | null>(null);
   const [transformMode, setTransformMode] = useState<TransformMode>("translate");
-  const [viewOptions, setViewOptions] = useState<PreviewViewOptions>({
-    stars: true
-  });
-  const [viewCommand, setViewCommand] = useState<ViewCommand>(null);
+  const [viewOptions, setViewOptions] = useState<PreviewViewOptions>(readPreviewViewOptions);
+  const [viewCommand, setViewCommand] = useState<ViewCommandRequest | null>(null);
   const [placementMode, setPlacementMode] = useState(false);
-  const [sceneInfo, setSceneInfo] = useState<SceneInfo>({
+  const [placementFeedback, setPlacementFeedback] = useState("");
+  const [operationHelpOpen, setOperationHelpOpen] = useState(false);
+  const [interactionHint, setInteractionHint] = useState<PreviewInteractionHint | null>(null);
+  const initialSceneInfo: SceneInfo = {
     backend: "Detecting",
     status: "idle",
     message: "",
     meshes: 0,
-    vertices: 0
-  });
+    vertices: 0,
+    performanceMode: "normal"
+  };
+  const [sceneInfo, setSceneInfo] = useState<SceneInfo>(initialSceneInfo);
   const [unrealStatus, setUnrealStatus] = useState<UnrealConnectionStatus>("idle");
   const [unrealMessage, setUnrealMessage] = useState("");
   const [engineSwitching, setEngineSwitching] = useState(false);
   const [saveState, setSaveState] = useState<PreviewSaveState>("idle");
   const [saveRevision, setSaveRevision] = useState(0);
-  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() => shouldDefaultCollapseLayerPanel());
-  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => shouldDefaultCollapseInspector());
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(getInitialPreviewLeftPanelCollapsed);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(getInitialPreviewLeftPanelWidth);
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(getInitialPreviewRightPanelCollapsed);
+  const [rightPanelWidth, setRightPanelWidth] = useState(getInitialPreviewRightPanelWidth);
   const [stageFullscreen, setStageFullscreen] = useState(false);
-  const leftPanelTouchedRef = useRef(false);
-  const rightPanelTouchedRef = useRef(false);
+  const placementModeRef = useRef(placementMode);
+  const operationHelpOpenRef = useRef(operationHelpOpen);
+  const transformModeRef = useRef<TransformMode>(transformMode);
+  const stageFullscreenRef = useRef(stageFullscreen);
+  const leftPanelTouchedRef = useRef(hasStoredPreviewLeftPanelCollapsedPreference());
+  const leftPanelCollapsedRef = useRef(leftPanelCollapsed);
+  const leftPanelResizeRef = useRef<{ startX: number; startWidth: number; lastWidth: number } | null>(null);
+  const leftPanelWidthUpdateRef = useRef<PreviewPanelWidthRafState>({ frameId: 0, width: null });
+  const rightPanelTouchedRef = useRef(hasStoredPreviewRightPanelCollapsedPreference());
+  const rightPanelCollapsedRef = useRef(rightPanelCollapsed);
+  const rightPanelResizeRef = useRef<{ startX: number; startWidth: number; lastWidth: number } | null>(null);
+  const rightPanelWidthUpdateRef = useRef<PreviewPanelWidthRafState>({ frameId: 0, width: null });
+  const placementFeedbackTimerRef = useRef(0);
+  const placementFeedbackRef = useRef("");
+  const interactionHintTimerRef = useRef(0);
+  const interactionHintRef = useRef<PreviewInteractionHint | null>(null);
+  const viewCommandRef = useRef<ViewCommandRequest | null>(null);
+  const sceneInfoRef = useRef<SceneInfo>(initialSceneInfo);
+  const unrealStatusRef = useRef<UnrealConnectionStatus>("idle");
+  const unrealMessageRef = useRef("");
+  const previewEngineSwitchSignatureRef = useRef(`${previewEngine}:${threeRenderer}`);
+  const saveStateRef = useRef<PreviewSaveState>("idle");
+  const layerTreeSignatureRef = useRef("");
+  const expandedLayerKeysRef = useRef<string[]>([]);
+  const materialListSignatureRef = useRef("");
+  const selectedMaterialKeyRef = useRef<string | null>(null);
+  const sideTabRenderTimerRef = useRef(0);
+  const activeSideTabRef = useRef<PreviewSideTab>(getInitialPreviewSideTab());
+  const meshViewModeRef = useRef<PreviewMeshViewMode>(meshViewMode);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const transformRef = useRef<PreviewTransform>(normalizeTransformState(initialState, initialSceneMode));
+  const selectedLayerKeyRef = useRef<string | null>(initialState?.selectedLayerKey || null);
+  const meshSearchRevealSelectionRef = useRef<string | null>(initialState?.selectedLayerKey || null);
+  const hiddenLayerKeysRef = useRef<string[]>(initialState?.hiddenLayerKeys || []);
+  const latestPreviewSaveRequestSignatureRef = useRef("");
+  const previewSaveGenerationRef = useRef(0);
+  const previewSaveInFlightRef = useRef(false);
+  const queuedPreviewSaveRef = useRef<PreviewStateSaveQueueItem | null>(null);
+  const lastPersistedPreviewStateSignatureRef = useRef(getPreviewStatePersistenceSignature(
+    initialSceneMode,
+    normalizeTransformState(initialState, initialSceneMode),
+    initialState?.selectedLayerKey || null,
+    initialState?.hiddenLayerKeys || []
+  ));
+  const isModel = isModelPreviewType(payload.type);
+  const hasUnrealPreview = Boolean(UE_PIXEL_STREAMING_URL);
+  const activePreviewEngine: PreviewEngine = hasUnrealPreview ? previewEngine : "three";
+  const canEditScene = isModel && activePreviewEngine === "three";
   const fileKey = payload.file?.id || "none";
+
+  const updateSaveState = useCallback((nextState: PreviewSaveState) => {
+    if (saveStateRef.current === nextState) {
+      return;
+    }
+    saveStateRef.current = nextState;
+    setSaveState(nextState);
+  }, []);
+
+  const commitSceneInfo = useCallback((next: SceneInfo) => {
+    if (isSamePreviewSceneInfo(sceneInfoRef.current, next)) {
+      return;
+    }
+    sceneInfoRef.current = next;
+    setSceneInfo(next);
+  }, []);
+
+  const commitUnrealStatus = useCallback((status: UnrealConnectionStatus, message = "") => {
+    if (unrealStatusRef.current === status && unrealMessageRef.current === message) {
+      return;
+    }
+    unrealStatusRef.current = status;
+    unrealMessageRef.current = message;
+    setUnrealStatus(status);
+    setUnrealMessage(message);
+  }, []);
+
+  const commitLeftPanelCollapsed = useCallback((collapsed: boolean) => {
+    if (leftPanelCollapsedRef.current === collapsed) {
+      return;
+    }
+    leftPanelCollapsedRef.current = collapsed;
+    setLeftPanelCollapsed(collapsed);
+  }, []);
+
+  const commitRightPanelCollapsed = useCallback((collapsed: boolean) => {
+    if (rightPanelCollapsedRef.current === collapsed) {
+      return;
+    }
+    rightPanelCollapsedRef.current = collapsed;
+    setRightPanelCollapsed(collapsed);
+  }, []);
+
+  const commitStageFullscreen = useCallback((fullscreen: boolean) => {
+    if (stageFullscreenRef.current === fullscreen) {
+      return;
+    }
+    stageFullscreenRef.current = fullscreen;
+    setStageFullscreen(fullscreen);
+  }, []);
+
+  const commitPlacementMode = useCallback((enabled: boolean) => {
+    if (placementModeRef.current === enabled) {
+      return;
+    }
+    placementModeRef.current = enabled;
+    setPlacementMode(enabled);
+  }, []);
+
+  const togglePlacementMode = useCallback(() => {
+    const nextPlacementMode = !placementModeRef.current;
+    placementModeRef.current = nextPlacementMode;
+    setPlacementMode(nextPlacementMode);
+  }, []);
+
+  const commitOperationHelpOpen = useCallback((open: boolean) => {
+    if (operationHelpOpenRef.current === open) {
+      return;
+    }
+    operationHelpOpenRef.current = open;
+    setOperationHelpOpen(open);
+  }, []);
+
+  const toggleOperationHelpOpen = useCallback(() => {
+    const nextOpen = !operationHelpOpenRef.current;
+    operationHelpOpenRef.current = nextOpen;
+    setOperationHelpOpen(nextOpen);
+  }, []);
+
+  const commitTransformMode = useCallback((mode: TransformMode) => {
+    if (transformModeRef.current === mode) {
+      return false;
+    }
+    transformModeRef.current = mode;
+    setTransformMode(mode);
+    return true;
+  }, []);
+
+  const clearViewCommand = useCallback(() => {
+    if (!viewCommandRef.current) {
+      return;
+    }
+    viewCommandRef.current = null;
+    setViewCommand(null);
+  }, []);
+
+  const commitExpandedLayerKeys = useCallback((keys: string[]) => {
+    const nextKeys = Array.from(new Set(keys));
+    if (isSamePreviewKeySet(expandedLayerKeysRef.current, nextKeys)) {
+      return;
+    }
+    expandedLayerKeysRef.current = nextKeys;
+    setExpandedLayerKeys(nextKeys);
+  }, []);
 
   useEffect(() => {
     const nextState = payload.file?.previewState || null;
     const nextSceneMode = normalizeSceneMode(nextState, payload.type);
+    const nextTransform = normalizeTransformState(nextState, nextSceneMode);
+    const nextSelectedLayerKey = nextState?.selectedLayerKey || null;
+    const nextHiddenLayerKeys = nextState?.hiddenLayerKeys || [];
     setSceneMode(nextSceneMode);
-    setTransform(normalizeTransformState(nextState, nextSceneMode));
-    setSelectedLayerKey(nextState?.selectedLayerKey || null);
-    setHiddenLayerKeys(nextState?.hiddenLayerKeys || []);
-    setExpandedLayerKeys([]);
+    setTransform(nextTransform);
+    setSelectedLayerKey(nextSelectedLayerKey);
+    setHiddenLayerKeys(nextHiddenLayerKeys);
+    transformRef.current = nextTransform;
+    selectedLayerKeyRef.current = nextSelectedLayerKey;
+    meshSearchRevealSelectionRef.current = nextSelectedLayerKey;
+    hiddenLayerKeysRef.current = nextHiddenLayerKeys;
+    latestPreviewSaveRequestSignatureRef.current = "";
+    previewSaveGenerationRef.current += 1;
+    previewSaveInFlightRef.current = false;
+    queuedPreviewSaveRef.current = null;
+    lastPersistedPreviewStateSignatureRef.current = getPreviewStatePersistenceSignature(
+      nextSceneMode,
+      nextTransform,
+      nextSelectedLayerKey,
+      nextHiddenLayerKeys
+    );
+    commitExpandedLayerKeys([]);
     setLayerTree([]);
-    setTransformMode("translate");
-    setViewCommand(null);
-    setPlacementMode(false);
-    setSaveState("idle");
+    setMeshSearchText("");
+    layerTreeSignatureRef.current = "";
+    const nextSideTab = getInitialPreviewSideTab();
+    setActiveSideTab(nextSideTab);
+    setRenderedSideTab(nextSideTab);
+    activeSideTabRef.current = nextSideTab;
+    if (sideTabRenderTimerRef.current) {
+      window.clearTimeout(sideTabRenderTimerRef.current);
+      sideTabRenderTimerRef.current = 0;
+    }
+    const nextMeshViewMode = getInitialPreviewMeshViewMode();
+    meshViewModeRef.current = nextMeshViewMode;
+    setMeshViewMode(nextMeshViewMode);
+    setMaterialList([]);
+    materialListSignatureRef.current = "";
+    selectedMaterialKeyRef.current = null;
+    setSelectedMaterialKey(null);
+    commitTransformMode("translate");
+    clearViewCommand();
+    commitPlacementMode(false);
+    if (placementFeedbackTimerRef.current) {
+      window.clearTimeout(placementFeedbackTimerRef.current);
+      placementFeedbackTimerRef.current = 0;
+    }
+    placementFeedbackRef.current = "";
+    setPlacementFeedback("");
+    commitOperationHelpOpen(false);
+    if (interactionHintTimerRef.current) {
+      window.clearTimeout(interactionHintTimerRef.current);
+      interactionHintTimerRef.current = 0;
+    }
+    interactionHintRef.current = null;
+    setInteractionHint(null);
+    updateSaveState("idle");
     setSaveRevision(0);
     setSceneViewState({});
-    leftPanelTouchedRef.current = false;
-    rightPanelTouchedRef.current = false;
-    setLeftPanelCollapsed(shouldDefaultCollapseLayerPanel());
-    setRightPanelCollapsed(shouldDefaultCollapseInspector());
-  }, [fileKey, payload.type, setSceneViewState]);
+    leftPanelTouchedRef.current = hasStoredPreviewLeftPanelCollapsedPreference();
+    rightPanelTouchedRef.current = hasStoredPreviewRightPanelCollapsedPreference();
+    commitLeftPanelCollapsed(getInitialPreviewLeftPanelCollapsed());
+    commitRightPanelCollapsed(getInitialPreviewRightPanelCollapsed());
+  }, [clearViewCommand, commitExpandedLayerKeys, commitLeftPanelCollapsed, commitOperationHelpOpen, commitPlacementMode, commitRightPanelCollapsed, commitTransformMode, fileKey, payload.type, setSceneViewState, updateSaveState]);
 
   useEffect(() => {
     const syncPreviewResponsiveLayout = () => {
       if (!leftPanelTouchedRef.current) {
-        setLeftPanelCollapsed(shouldDefaultCollapseLayerPanel());
+        commitLeftPanelCollapsed(shouldDefaultCollapseLayerPanel());
       }
       if (!rightPanelTouchedRef.current) {
-        setRightPanelCollapsed(shouldDefaultCollapseInspector());
+        commitRightPanelCollapsed(shouldDefaultCollapseInspector());
       }
     };
     syncPreviewResponsiveLayout();
     window.addEventListener("resize", syncPreviewResponsiveLayout);
     return () => window.removeEventListener("resize", syncPreviewResponsiveLayout);
+  }, [commitLeftPanelCollapsed, commitRightPanelCollapsed]);
+
+  useEffect(() => {
+    return () => {
+      document.body.classList.remove("is-preview-side-resizing");
+      document.body.classList.remove("is-preview-inspector-resizing");
+      cancelPreviewPanelWidthUpdate(leftPanelWidthUpdateRef);
+      cancelPreviewPanelWidthUpdate(rightPanelWidthUpdateRef);
+      if (sideTabRenderTimerRef.current) {
+        window.clearTimeout(sideTabRenderTimerRef.current);
+        sideTabRenderTimerRef.current = 0;
+      }
+      if (interactionHintTimerRef.current) {
+        window.clearTimeout(interactionHintTimerRef.current);
+        interactionHintTimerRef.current = 0;
+      }
+      interactionHintRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
+    const nextSwitchSignature = `${previewEngine}:${threeRenderer}`;
+    if (previewEngineSwitchSignatureRef.current === nextSwitchSignature) {
+      return;
+    }
+    previewEngineSwitchSignatureRef.current = nextSwitchSignature;
     setEngineSwitching(true);
     const timer = window.setTimeout(() => setEngineSwitching(false), 180);
     return () => window.clearTimeout(timer);
@@ -359,74 +1047,421 @@ function PreviewWorkspace({
   }, [setThreeRenderer, threeRenderer, webgpuSupport.checking, webgpuSupport.supported]);
 
   const markDirty = useCallback(() => {
-    setSaveRevision((value) => value + 1);
-  }, []);
+    if (payload.file?.id && isModelPreviewType(payload.type)) {
+      updateSaveState("saving");
+    }
+    setSaveRevision((value) => (value > 0 ? value : 1));
+  }, [payload.file?.id, payload.type, updateSaveState]);
 
   const updateTransform = useCallback((next: PreviewTransform) => {
-    setTransform(normalizeTransformForScene(next, sceneMode));
+    const normalizedTransform = normalizeTransformForScene(next, sceneMode);
+    if (isSamePreviewTransform(sceneMode, transformRef.current, normalizedTransform)) {
+      return;
+    }
+    transformRef.current = normalizedTransform;
+    setTransform(normalizedTransform);
     markDirty();
   }, [markDirty, sceneMode]);
 
+  const commitSelectedMaterialKey = useCallback((key: string | null) => {
+    if (selectedMaterialKeyRef.current === key) {
+      return;
+    }
+    selectedMaterialKeyRef.current = key;
+    setSelectedMaterialKey(key);
+  }, []);
+
   const updateSelectedLayer = useCallback((key: string | null) => {
+    if (!key) {
+      commitSelectedMaterialKey(null);
+    }
+    if (selectedLayerKeyRef.current === key) {
+      return;
+    }
+    selectedLayerKeyRef.current = key;
     setSelectedLayerKey(key);
     markDirty();
-  }, [markDirty]);
+  }, [commitSelectedMaterialKey, markDirty]);
+
+  const clearPreviewSelection = useCallback(() => {
+    updateSelectedLayer(null);
+  }, [updateSelectedLayer]);
+
+  const clearScheduledInteractionHint = useCallback(() => {
+    if (!interactionHintTimerRef.current) {
+      return;
+    }
+    window.clearTimeout(interactionHintTimerRef.current);
+    interactionHintTimerRef.current = 0;
+  }, []);
+
+  const handleInteractionHintChange = useCallback((hint: PreviewInteractionHint | null) => {
+    if (interactionHintRef.current === hint) {
+      return;
+    }
+    clearScheduledInteractionHint();
+    interactionHintRef.current = hint;
+    setInteractionHint(hint);
+  }, [clearScheduledInteractionHint]);
+
+  const showInteractionHint = useCallback((hint: PreviewInteractionHint, durationMs = 900) => {
+    clearScheduledInteractionHint();
+    if (interactionHintRef.current !== hint) {
+      interactionHintRef.current = hint;
+      setInteractionHint(hint);
+    }
+    interactionHintTimerRef.current = window.setTimeout(() => {
+      interactionHintTimerRef.current = 0;
+      interactionHintRef.current = null;
+      setInteractionHint(null);
+    }, durationMs);
+  }, [clearScheduledInteractionHint]);
+
+  const issueViewCommand = useCallback((type: ViewCommand) => {
+    const nextViewCommandSignature = type === "focus-selected"
+      ? `${type}:${selectedLayerKeyRef.current || "scene"}`
+      : type === "reset" || type === "earth-default"
+        ? `${type}:${sceneMode}`
+        : type;
+    const pendingViewCommand = viewCommandRef.current;
+    if (pendingViewCommand?.signature === nextViewCommandSignature) {
+      return;
+    }
+    const hint = type === "cancel-interaction" ? null : viewCommandInteractionHint(type);
+    if (hint) {
+      showInteractionHint(hint);
+    }
+    const nextViewCommand = {
+      type,
+      revision: (viewCommandRef.current?.revision ?? 0) + 1,
+      signature: nextViewCommandSignature
+    };
+    viewCommandRef.current = nextViewCommand;
+    setViewCommand(nextViewCommand);
+  }, [sceneMode, showInteractionHint]);
+
+  const updateTransformMode = useCallback((mode: TransformMode) => {
+    if (!commitTransformMode(mode)) {
+      return;
+    }
+    showInteractionHint(transformModeInteractionHint(mode));
+  }, [commitTransformMode, showInteractionHint]);
+
+  const handleFocusLayer = useCallback((key: string | null) => {
+    updateSelectedLayer(key);
+    issueViewCommand("focus-selected");
+  }, [issueViewCommand, updateSelectedLayer]);
 
   const updateHiddenLayers = useCallback((keys: string[]) => {
-    setHiddenLayerKeys(keys);
-    setSelectedLayerKey((current) => (current && keys.includes(current) ? null : current));
+    const nextKeys = Array.from(new Set(keys));
+    const selectedKey = selectedLayerKeyRef.current;
+    const shouldClearSelection = Boolean(selectedKey && nextKeys.includes(selectedKey));
+    const hiddenKeysUnchanged = isSamePreviewKeySet(hiddenLayerKeysRef.current, nextKeys);
+    if (hiddenKeysUnchanged && !shouldClearSelection) {
+      return;
+    }
+    if (!hiddenKeysUnchanged) {
+      hiddenLayerKeysRef.current = nextKeys;
+      setHiddenLayerKeys(nextKeys);
+    }
+    if (shouldClearSelection) {
+      selectedLayerKeyRef.current = null;
+      setSelectedLayerKey((current) => (current && nextKeys.includes(current) ? null : current));
+      commitSelectedMaterialKey(null);
+    }
     markDirty();
-  }, [markDirty]);
+  }, [commitSelectedMaterialKey, markDirty]);
 
   const updateLayerTree = useCallback((tree: LayerNode[]) => {
+    const nextSignature = getLayerTreeStateSignature(tree);
+    if (nextSignature === layerTreeSignatureRef.current) {
+      return;
+    }
+    layerTreeSignatureRef.current = nextSignature;
     setLayerTree(tree);
-    setExpandedLayerKeys((current) => {
-      if (current.length) return current;
-      return collectExpandableLayerKeys(tree);
-    });
+    if (!expandedLayerKeysRef.current.length) {
+      commitExpandedLayerKeys(collectExpandableLayerKeys(tree));
+    }
+  }, [commitExpandedLayerKeys]);
+
+  const updateMaterialList = useCallback((materials: MaterialNode[]) => {
+    const nextSignature = getMaterialListStateSignature(materials);
+    if (nextSignature === materialListSignatureRef.current) {
+      return;
+    }
+    materialListSignatureRef.current = nextSignature;
+    setMaterialList(materials);
+    if (selectedMaterialKeyRef.current && !materials.some((material) => material.key === selectedMaterialKeyRef.current)) {
+      commitSelectedMaterialKey(null);
+    }
+  }, [commitSelectedMaterialKey]);
+
+  const handleSideTabChange = useCallback((tab: PreviewSideTab) => {
+    if (tab === activeSideTabRef.current) {
+      return;
+    }
+    activeSideTabRef.current = tab;
+    setActiveSideTab(tab);
+    writePreviewSidePanelPreferences({ activeSideTab: tab });
+    if (sideTabRenderTimerRef.current) {
+      window.clearTimeout(sideTabRenderTimerRef.current);
+    }
+    sideTabRenderTimerRef.current = window.setTimeout(() => {
+      sideTabRenderTimerRef.current = 0;
+      setRenderedSideTab(tab);
+    }, 16);
   }, []);
+
+  const handleMeshViewModeChange = useCallback((mode: PreviewMeshViewMode) => {
+    if (mode === meshViewModeRef.current) {
+      return;
+    }
+    meshViewModeRef.current = mode;
+    setMeshViewMode(mode);
+    writePreviewSidePanelPreferences({ meshViewMode: mode });
+  }, []);
+
+  const handleMaterialSelect = useCallback((material: MaterialNode) => {
+    commitSelectedMaterialKey(selectedMaterialKeyRef.current === material.key ? null : material.key);
+    if (material.layerKey) {
+      updateSelectedLayer(material.layerKey);
+    }
+  }, [commitSelectedMaterialKey, updateSelectedLayer]);
+
+  const handleMaterialFocus = useCallback((material: MaterialNode) => {
+    if (!material.layerKey) {
+      return;
+    }
+    commitSelectedMaterialKey(material.key);
+    handleFocusLayer(material.layerKey);
+  }, [commitSelectedMaterialKey, handleFocusLayer]);
 
   const expandLayerPanel = useCallback(() => {
     leftPanelTouchedRef.current = true;
-    setLeftPanelCollapsed(false);
-  }, []);
+    commitLeftPanelCollapsed(false);
+    writePreviewPanelLayoutPreferences({ leftPanelCollapsed: false });
+  }, [commitLeftPanelCollapsed]);
 
   const collapseLayerPanel = useCallback(() => {
     leftPanelTouchedRef.current = true;
-    setLeftPanelCollapsed(true);
-  }, []);
+    commitLeftPanelCollapsed(true);
+    writePreviewPanelLayoutPreferences({ leftPanelCollapsed: true });
+  }, [commitLeftPanelCollapsed]);
+
+  const revealSelectedLayerInMeshList = useCallback(() => {
+    if (!selectedLayerKeyRef.current) {
+      return;
+    }
+    leftPanelTouchedRef.current = true;
+    commitLeftPanelCollapsed(false);
+    writePreviewPanelLayoutPreferences({ leftPanelCollapsed: false });
+    handleSideTabChange("meshes");
+    setMeshSearchText("");
+  }, [commitLeftPanelCollapsed, handleSideTabChange]);
+
+  const handleLeftPanelResizeStart = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (leftPanelCollapsed) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    leftPanelTouchedRef.current = true;
+    leftPanelResizeRef.current = {
+      startX: event.clientX,
+      startWidth: leftPanelWidth,
+      lastWidth: leftPanelWidth
+    };
+
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    try {
+      handle.setPointerCapture?.(pointerId);
+    } catch {
+      // Pointer capture can fail when the browser has already redirected the pointer.
+    }
+    document.body.classList.add("is-preview-side-resizing");
+    let resizeStopped = false;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const resizeState = leftPanelResizeRef.current;
+      if (!resizeState) {
+        return;
+      }
+      const nextWidth = clampPreviewLeftPanelWidth(resizeState.startWidth + moveEvent.clientX - resizeState.startX);
+      resizeState.lastWidth = nextWidth;
+      schedulePreviewPanelWidthUpdate(leftPanelWidthUpdateRef, nextWidth, setLeftPanelWidth);
+    };
+
+    const stopResize = () => {
+      if (resizeStopped) {
+        return;
+      }
+      resizeStopped = true;
+      const finalWidth = leftPanelResizeRef.current?.lastWidth;
+      flushPreviewPanelWidthUpdate(leftPanelWidthUpdateRef, setLeftPanelWidth);
+      leftPanelResizeRef.current = null;
+      if (typeof finalWidth === "number") {
+        writePreviewPanelLayoutPreferences({ leftPanelWidth: finalWidth });
+      }
+      document.body.classList.remove("is-preview-side-resizing");
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+      window.removeEventListener("blur", stopResize);
+      handle.removeEventListener("lostpointercapture", stopResize);
+      try {
+        handle.releasePointerCapture?.(pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+    window.addEventListener("blur", stopResize);
+    handle.addEventListener("lostpointercapture", stopResize);
+  }, [leftPanelCollapsed, leftPanelWidth]);
 
   const expandInspector = useCallback(() => {
     rightPanelTouchedRef.current = true;
-    setRightPanelCollapsed(false);
-  }, []);
+    commitRightPanelCollapsed(false);
+    writePreviewPanelLayoutPreferences({ rightPanelCollapsed: false });
+  }, [commitRightPanelCollapsed]);
 
   const collapseInspector = useCallback(() => {
     rightPanelTouchedRef.current = true;
-    setRightPanelCollapsed(true);
-  }, []);
+    commitRightPanelCollapsed(true);
+    writePreviewPanelLayoutPreferences({ rightPanelCollapsed: true });
+  }, [commitRightPanelCollapsed]);
+
+  const handleRightPanelResizeStart = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (rightPanelCollapsed) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    rightPanelTouchedRef.current = true;
+    rightPanelResizeRef.current = {
+      startX: event.clientX,
+      startWidth: rightPanelWidth,
+      lastWidth: rightPanelWidth
+    };
+
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    try {
+      handle.setPointerCapture?.(pointerId);
+    } catch {
+      // Pointer capture can fail when the browser has already redirected the pointer.
+    }
+    document.body.classList.add("is-preview-inspector-resizing");
+    let resizeStopped = false;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const resizeState = rightPanelResizeRef.current;
+      if (!resizeState) {
+        return;
+      }
+      const nextWidth = clampPreviewRightPanelWidth(resizeState.startWidth + resizeState.startX - moveEvent.clientX);
+      resizeState.lastWidth = nextWidth;
+      schedulePreviewPanelWidthUpdate(rightPanelWidthUpdateRef, nextWidth, setRightPanelWidth);
+    };
+
+    const stopResize = () => {
+      if (resizeStopped) {
+        return;
+      }
+      resizeStopped = true;
+      const finalWidth = rightPanelResizeRef.current?.lastWidth;
+      flushPreviewPanelWidthUpdate(rightPanelWidthUpdateRef, setRightPanelWidth);
+      rightPanelResizeRef.current = null;
+      if (typeof finalWidth === "number") {
+        writePreviewPanelLayoutPreferences({ rightPanelWidth: finalWidth });
+      }
+      document.body.classList.remove("is-preview-inspector-resizing");
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+      window.removeEventListener("blur", stopResize);
+      handle.removeEventListener("lostpointercapture", stopResize);
+      try {
+        handle.releasePointerCapture?.(pointerId);
+      } catch {
+        // Pointer capture may already be released.
+      }
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+    window.addEventListener("blur", stopResize);
+    handle.addEventListener("lostpointercapture", stopResize);
+  }, [rightPanelCollapsed, rightPanelWidth]);
 
   const handleSceneInfoChange = useCallback((info: SceneInfo) => {
-    setSceneInfo((current) => ({
+    const current = sceneInfoRef.current;
+    commitSceneInfo({
       ...info,
-      fps: info.fps ?? current.fps
-    }));
+      fps: normalizePreviewFps(info.fps ?? current.fps),
+      performanceMode: info.performanceMode ?? current.performanceMode ?? "normal"
+    });
+  }, [commitSceneInfo]);
+
+  const clearPlacementFeedback = useCallback(() => {
+    if (placementFeedbackTimerRef.current) {
+      window.clearTimeout(placementFeedbackTimerRef.current);
+      placementFeedbackTimerRef.current = 0;
+    }
+    if (!placementFeedbackRef.current) {
+      return;
+    }
+    placementFeedbackRef.current = "";
+    setPlacementFeedback("");
+  }, []);
+
+  const showPlacementFeedback = useCallback((message: string) => {
+    if (placementFeedbackTimerRef.current) {
+      window.clearTimeout(placementFeedbackTimerRef.current);
+    }
+    if (placementFeedbackRef.current !== message) {
+      placementFeedbackRef.current = message;
+      setPlacementFeedback(message);
+    }
+    placementFeedbackTimerRef.current = window.setTimeout(() => {
+      placementFeedbackTimerRef.current = 0;
+      placementFeedbackRef.current = "";
+      setPlacementFeedback("");
+    }, 1800);
   }, []);
 
   const toggleExpandedLayer = useCallback((key: string) => {
-    setExpandedLayerKeys((current) => (
-      current.includes(key)
-        ? current.filter((item) => item !== key)
-        : [...current, key]
-    ));
-  }, []);
+    const current = expandedLayerKeysRef.current;
+    commitExpandedLayerKeys(current.includes(key)
+      ? current.filter((item) => item !== key)
+      : [...current, key]
+    );
+  }, [commitExpandedLayerKeys]);
 
   const handlePlacementDone = useCallback(() => {
-    setPlacementMode(false);
+    showPlacementFeedback("模型已放置到地表");
+    commitPlacementMode(false);
+  }, [commitPlacementMode, showPlacementFeedback]);
+
+  const handlePlacementCancel = useCallback(() => {
+    clearPlacementFeedback();
+    commitPlacementMode(false);
+  }, [clearPlacementFeedback, commitPlacementMode]);
+
+  useEffect(() => () => {
+    if (placementFeedbackTimerRef.current) {
+      window.clearTimeout(placementFeedbackTimerRef.current);
+      placementFeedbackTimerRef.current = 0;
+    }
   }, []);
 
   useEffect(() => {
-    if (!placementMode) {
+    if (!placementMode || operationHelpOpen) {
       return;
     }
     const handlePlacementKeyDown = (event: KeyboardEvent) => {
@@ -434,20 +1469,145 @@ function PreviewWorkspace({
         return;
       }
       event.preventDefault();
-      setPlacementMode(false);
+      event.stopImmediatePropagation();
+      handlePlacementCancel();
     };
     window.addEventListener("keydown", handlePlacementKeyDown);
     return () => window.removeEventListener("keydown", handlePlacementKeyDown);
-  }, [placementMode]);
+  }, [handlePlacementCancel, operationHelpOpen, placementMode]);
+
+  useEffect(() => {
+    const handlePreviewKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (operationHelpOpen) {
+          event.preventDefault();
+          commitOperationHelpOpen(false);
+          return;
+        }
+        if (placementMode) {
+          event.preventDefault();
+          handlePlacementCancel();
+          return;
+        }
+        if (isEditableKeyboardTarget(event.target)) {
+          return;
+        }
+        if (canEditScene) {
+          event.preventDefault();
+          if (!event.repeat) {
+            issueViewCommand("cancel-interaction");
+          }
+          return;
+        }
+        if (!selectedLayerKeyRef.current && !selectedMaterialKeyRef.current) {
+          return;
+        }
+        event.preventDefault();
+        clearPreviewSelection();
+        return;
+      }
+
+      if (isEditableKeyboardTarget(event.target)) {
+        return;
+      }
+
+      if (isOperationHelpShortcut(event) && canEditScene) {
+        event.preventDefault();
+        if (event.repeat) {
+          return;
+        }
+        toggleOperationHelpOpen();
+        return;
+      }
+
+      if (event.key.toLowerCase() === "f" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        if (event.repeat) {
+          return;
+        }
+        issueViewCommand(selectedLayerKeyRef.current ? "focus-selected" : "fit");
+        return;
+      }
+
+      if (event.key === "Home" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        if (event.repeat) {
+          return;
+        }
+        issueViewCommand(sceneMode === "sphere" ? "earth-default" : "reset");
+        return;
+      }
+
+      const shortcutTransformMode = getTransformModeShortcut(event.key);
+      if (
+        shortcutTransformMode &&
+        canEditScene &&
+        !placementMode &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey
+      ) {
+        event.preventDefault();
+        if (event.repeat) {
+          return;
+        }
+        updateTransformMode(shortcutTransformMode);
+      }
+    };
+    window.addEventListener("keydown", handlePreviewKeyDown);
+    return () => window.removeEventListener("keydown", handlePreviewKeyDown);
+  }, [canEditScene, clearPreviewSelection, commitOperationHelpOpen, handlePlacementCancel, issueViewCommand, operationHelpOpen, placementMode, sceneMode, toggleOperationHelpOpen, updateTransformMode]);
 
   const handleSceneViewStateChange = useCallback((nextState: SceneViewState) => {
     mergeSceneViewState(nextState);
   }, [mergeSceneViewState]);
 
   const handleUnrealStatusChange = useCallback((status: UnrealConnectionStatus, message = "") => {
-    setUnrealStatus(status);
-    setUnrealMessage(message);
-  }, []);
+    commitUnrealStatus(status, message);
+  }, [commitUnrealStatus]);
+
+  const handleViewCommandHandled = useCallback((result?: ViewCommandHandledResult) => {
+    const handledCommand = viewCommandRef.current;
+    clearViewCommand();
+    if (
+      handledCommand?.type !== "cancel-interaction"
+    ) {
+      return;
+    }
+    if (result?.cancelledInteraction) {
+      showInteractionHint("view-cancel-interaction");
+      return;
+    }
+    if (selectedLayerKeyRef.current || selectedMaterialKeyRef.current) {
+      clearPreviewSelection();
+    }
+  }, [clearPreviewSelection, clearViewCommand, showInteractionHint]);
+
+  const handleRendererFallback = useCallback((message: string) => {
+    const current = sceneInfoRef.current;
+    if (
+      current.backend === "WebGL" &&
+      current.status === "loading" &&
+      current.message === message
+    ) {
+      return;
+    }
+    commitSceneInfo({
+      ...current,
+      backend: "WebGL",
+      status: "loading",
+      message
+    });
+    if (threeRenderer !== "webgl") {
+      setThreeRenderer("webgl");
+    }
+  }, [commitSceneInfo, setThreeRenderer, threeRenderer]);
+
+  const handleSwitchToThree = useCallback(() => {
+    if (previewEngine !== "three") {
+      setPreviewEngine("three");
+    }
+  }, [previewEngine, setPreviewEngine]);
 
   const toggleViewOption = useCallback((key: keyof PreviewViewOptions) => {
     setViewOptions((current) => ({
@@ -457,13 +1617,17 @@ function PreviewWorkspace({
   }, []);
 
   useEffect(() => {
+    writePreviewViewOptions(viewOptions);
+  }, [viewOptions]);
+
+  useEffect(() => {
     const syncStageFullscreen = () => {
-      setStageFullscreen(document.fullscreenElement === stageRef.current);
+      commitStageFullscreen(document.fullscreenElement === stageRef.current);
     };
     syncStageFullscreen();
     document.addEventListener("fullscreenchange", syncStageFullscreen);
     return () => document.removeEventListener("fullscreenchange", syncStageFullscreen);
-  }, []);
+  }, [commitStageFullscreen]);
 
   const toggleStageFullscreen = useCallback(() => {
     const stage = stageRef.current;
@@ -471,11 +1635,68 @@ function PreviewWorkspace({
       return;
     }
     if (document.fullscreenElement === stage) {
-      void document.exitFullscreen?.();
+      const exitFullscreenRequest = document.exitFullscreen?.();
+      void exitFullscreenRequest?.catch(() => {
+        commitStageFullscreen(document.fullscreenElement === stage);
+      });
       return;
     }
-    void stage.requestFullscreen?.();
-  }, []);
+    const requestFullscreenRequest = stage.requestFullscreen?.();
+    void requestFullscreenRequest?.catch(() => {
+      commitStageFullscreen(false);
+    });
+  }, [commitStageFullscreen]);
+
+  const flushPreviewStateSaveQueue = useCallback(() => {
+    if (previewSaveInFlightRef.current) {
+      return;
+    }
+    const nextSave = queuedPreviewSaveRef.current;
+    if (!nextSave) {
+      return;
+    }
+    const generation = previewSaveGenerationRef.current;
+    queuedPreviewSaveRef.current = null;
+    previewSaveInFlightRef.current = true;
+    latestPreviewSaveRequestSignatureRef.current = nextSave.signature;
+    updateSaveState("saving");
+    api.updatePreviewState(nextSave.taskId, nextSave.fileId, nextSave.previewState)
+      .then(() => {
+        if (
+          generation !== previewSaveGenerationRef.current ||
+          latestPreviewSaveRequestSignatureRef.current !== nextSave.signature
+        ) {
+          return;
+        }
+        lastPersistedPreviewStateSignatureRef.current = nextSave.signature;
+        if (queuedPreviewSaveRef.current) {
+          updateSaveState("saving");
+        } else {
+          updateSaveState("saved");
+        }
+      })
+      .catch(() => {
+        if (
+          generation !== previewSaveGenerationRef.current ||
+          queuedPreviewSaveRef.current ||
+          latestPreviewSaveRequestSignatureRef.current !== nextSave.signature
+        ) {
+          return;
+        }
+        updateSaveState("error");
+      })
+      .finally(() => {
+        if (generation !== previewSaveGenerationRef.current) {
+          return;
+        }
+        previewSaveInFlightRef.current = false;
+        if (queuedPreviewSaveRef.current) {
+          flushPreviewStateSaveQueue();
+        } else if (latestPreviewSaveRequestSignatureRef.current === nextSave.signature) {
+          latestPreviewSaveRequestSignatureRef.current = "";
+        }
+      });
+  }, [updateSaveState]);
 
   useEffect(() => {
     if (!payload.file?.id || !isModelPreviewType(payload.type) || saveRevision === 0) {
@@ -483,7 +1704,31 @@ function PreviewWorkspace({
     }
 
     const timer = window.setTimeout(() => {
-      setSaveState("saving");
+      const nextSignature = getPreviewStatePersistenceSignature(
+        sceneMode,
+        transform,
+        selectedLayerKey,
+        hiddenLayerKeys
+      );
+      const pendingSaveSignature = latestPreviewSaveRequestSignatureRef.current;
+      const queuedSaveSignature = queuedPreviewSaveRef.current?.signature;
+      if (
+        nextSignature === lastPersistedPreviewStateSignatureRef.current &&
+        !previewSaveInFlightRef.current &&
+        (!queuedSaveSignature || queuedSaveSignature === nextSignature) &&
+        (!pendingSaveSignature || pendingSaveSignature === nextSignature)
+      ) {
+        latestPreviewSaveRequestSignatureRef.current = "";
+        updateSaveState("idle");
+        return;
+      }
+      if (
+        nextSignature === pendingSaveSignature ||
+        nextSignature === queuedSaveSignature
+      ) {
+        updateSaveState("saving");
+        return;
+      }
       const previewState: PreviewState = {
         sceneMode,
         transform: {
@@ -493,31 +1738,97 @@ function PreviewWorkspace({
         selectedLayerKey,
         hiddenLayerKeys
       };
-      api.updatePreviewState(taskId, payload.file!.id, previewState)
-        .then(() => setSaveState("saved"))
-        .catch(() => setSaveState("error"));
+      latestPreviewSaveRequestSignatureRef.current = nextSignature;
+      queuedPreviewSaveRef.current = {
+        taskId,
+        fileId: payload.file!.id,
+        signature: nextSignature,
+        previewState
+      };
+      updateSaveState("saving");
+      flushPreviewStateSaveQueue();
     }, 650);
 
     return () => window.clearTimeout(timer);
-  }, [hiddenLayerKeys, payload.file, payload.type, saveRevision, sceneMode, selectedLayerKey, taskId, transform]);
+  }, [flushPreviewStateSaveQueue, hiddenLayerKeys, payload.file, payload.type, saveRevision, sceneMode, selectedLayerKey, taskId, transform, updateSaveState]);
 
   useEffect(() => {
     if (saveState !== "saved") {
       return;
     }
-    const timer = window.setTimeout(() => setSaveState("idle"), 1600);
+    const timer = window.setTimeout(() => updateSaveState("idle"), 1600);
     return () => window.clearTimeout(timer);
-  }, [saveState]);
+  }, [saveState, updateSaveState]);
 
   const allLayerKeys = useMemo(() => flattenLayerKeys(layerTree), [layerTree]);
+  const hiddenLayerKeySet = useMemo(() => new Set(hiddenLayerKeys), [hiddenLayerKeys]);
   const checkedLayerKeys = useMemo(
-    () => allLayerKeys.filter((key) => !hiddenLayerKeys.includes(key)),
-    [allLayerKeys, hiddenLayerKeys]
+    () => allLayerKeys.filter((key) => !hiddenLayerKeySet.has(key)),
+    [allLayerKeys, hiddenLayerKeySet]
   );
-  const isModel = isModelPreviewType(payload.type);
-  const hasUnrealPreview = Boolean(UE_PIXEL_STREAMING_URL);
-  const activePreviewEngine: PreviewEngine = hasUnrealPreview ? previewEngine : "three";
-  const canEditScene = isModel && activePreviewEngine === "three";
+  const checkedLayerKeySet = useMemo(() => new Set(checkedLayerKeys), [checkedLayerKeys]);
+  const meshLayerTree = useMemo(() => compactMeshLayerTree(layerTree), [layerTree]);
+  const flatMeshLayerList = useMemo(() => collectFlatMeshLayerNodes(layerTree), [layerTree]);
+  const allMeshLayerKeys = useMemo(() => flattenLayerKeys(flatMeshLayerList), [flatMeshLayerList]);
+  const allMeshLayerKeySet = useMemo(() => new Set(allMeshLayerKeys), [allMeshLayerKeys]);
+  const meshSearchQuery = useMemo(() => normalizeLayerSearchQuery(deferredMeshSearchText), [deferredMeshSearchText]);
+  const filteredFlatMeshLayerList = useMemo(
+    () => meshSearchQuery
+      ? flatMeshLayerList.filter((node) => isLayerNodeSearchMatch(node, meshSearchQuery))
+      : flatMeshLayerList,
+    [flatMeshLayerList, meshSearchQuery]
+  );
+  const filteredMeshLayerTree = useMemo(
+    () => meshSearchQuery ? filterLayerTreeBySearchQuery(meshLayerTree, meshSearchQuery) : meshLayerTree,
+    [meshLayerTree, meshSearchQuery]
+  );
+  const meshSearchMatchCount = useMemo(
+    () => meshSearchQuery ? countLayerSearchMatches(meshLayerTree, meshSearchQuery) : 0,
+    [meshLayerTree, meshSearchQuery]
+  );
+  const displayedMeshLayers = meshViewMode === "list" ? filteredFlatMeshLayerList : filteredMeshLayerTree;
+  const displayedMeshKeys = useMemo(() => flattenLayerKeys(displayedMeshLayers), [displayedMeshLayers]);
+  const displayedMeshKeySet = useMemo(() => new Set(displayedMeshKeys), [displayedMeshKeys]);
+  const displayedMeshNodeKeyLookup = useMemo(() => buildLayerNodeKeyLookup(displayedMeshLayers), [displayedMeshLayers]);
+  const displayedMeshVisibilityStates = useMemo(
+    () => buildLayerVisibilityStateMap(displayedMeshLayers, checkedLayerKeySet),
+    [checkedLayerKeySet, displayedMeshLayers]
+  );
+  const selectedLayerTitle = useMemo(
+    () => selectedLayerKey ? findLayerNodeTitle(layerTree, selectedLayerKey) || getLayerKeyFallbackTitle(selectedLayerKey) : "",
+    [layerTree, selectedLayerKey]
+  );
+  const selectedMeshAncestorKeys = useMemo(
+    () => selectedLayerKey ? findLayerAncestorKeys(meshLayerTree, selectedLayerKey) : [],
+    [meshLayerTree, selectedLayerKey]
+  );
+  const meshLayersHidden = displayedMeshKeys.length > 0 && displayedMeshKeys.every((key) => hiddenLayerKeySet.has(key));
+  const allMeshLayersHidden = allMeshLayerKeys.length > 0 && allMeshLayerKeys.every((key) => hiddenLayerKeySet.has(key));
+  const effectiveExpandedLayerKeys = useMemo(() => {
+    if (meshViewMode !== "tree") {
+      return expandedLayerKeys;
+    }
+    return Array.from(new Set([
+      ...expandedLayerKeys,
+      ...selectedMeshAncestorKeys,
+      ...(meshSearchQuery ? collectExpandableLayerKeys(displayedMeshLayers, Number.POSITIVE_INFINITY, 500) : [])
+    ]));
+  }, [displayedMeshLayers, expandedLayerKeys, meshSearchQuery, meshViewMode, selectedMeshAncestorKeys]);
+  const showAllMeshLayers = useCallback(() => {
+    updateHiddenLayers(hiddenLayerKeys.filter((key) => !allMeshLayerKeySet.has(key)));
+  }, [allMeshLayerKeySet, hiddenLayerKeys, updateHiddenLayers]);
+
+  useEffect(() => {
+    if (meshSearchRevealSelectionRef.current === selectedLayerKey) {
+      return;
+    }
+    meshSearchRevealSelectionRef.current = selectedLayerKey;
+    if (!selectedLayerKey || !meshSearchQuery || displayedMeshKeySet.has(selectedLayerKey)) {
+      return;
+    }
+    setMeshSearchText("");
+  }, [displayedMeshKeySet, meshSearchQuery, selectedLayerKey]);
+
   const runtimeStatus: PreviewRuntimeStatus = activePreviewEngine === "three"
     ? {
       engine: "three",
@@ -537,6 +1848,20 @@ function PreviewWorkspace({
     ? Math.round(runtimeStatus.fps)
     : null;
   const fpsLabel = fpsValue ? String(fpsValue) : null;
+  const adaptivePerformanceActive = activePreviewEngine === "three" && isModel && sceneInfo.performanceMode === "adaptive";
+  const showScenePerformanceBadge = Boolean(fpsLabel || adaptivePerformanceActive);
+  const isSphereScene = sceneMode === "sphere";
+  const canUsePlacementMode = canEditScene && isSphereScene;
+  const focusViewCommand: ViewCommand = selectedLayerKey ? "focus-selected" : "fit";
+  const fitViewTooltip = selectedLayerKey ? "聚焦选中对象（F）" : "适配模型（F）";
+  const fitViewAriaLabel = selectedLayerKey ? "聚焦选中对象" : "适配模型";
+  const resetViewTooltip = isSphereScene ? "恢复到地球默认（Home）" : "重置视角（Home）";
+  const placementTooltip = !isSphereScene
+    ? "球面场景支持地表落位"
+    : placementMode
+      ? "退出地表落位（Esc）"
+      : "地表落位：单击地球表面放置";
+  const operationHelpTooltip = operationHelpOpen ? "收起操作说明（Esc / H / ?）" : "操作说明（H / ?）";
 
   useEffect(() => {
     if (!hasUnrealPreview && previewEngine === "unreal") {
@@ -545,19 +1870,38 @@ function PreviewWorkspace({
   }, [hasUnrealPreview, previewEngine, setPreviewEngine]);
 
   useEffect(() => {
-    if (canEditScene) {
+    if (canUsePlacementMode) {
       return;
     }
-    setPlacementMode(false);
-    setTransformMode("translate");
-  }, [canEditScene]);
+    clearScheduledInteractionHint();
+    interactionHintRef.current = null;
+    setInteractionHint(null);
+    clearPlacementFeedback();
+    commitPlacementMode(false);
+    if (!canEditScene) {
+      commitTransformMode("translate");
+      commitOperationHelpOpen(false);
+    }
+  }, [canEditScene, canUsePlacementMode, clearPlacementFeedback, clearScheduledInteractionHint, commitOperationHelpOpen, commitPlacementMode, commitTransformMode]);
   const workspaceClassName = [
     "preview-workspace",
     leftPanelCollapsed ? "is-left-collapsed" : "",
     rightPanelCollapsed ? "is-right-collapsed" : ""
   ].filter(Boolean).join(" ");
+  const workspaceStyle: CSSProperties & {
+    "--preview-left-panel-width": string;
+    "--preview-right-panel-width": string;
+  } = {
+    "--preview-left-panel-width": `${leftPanelWidth}px`,
+    "--preview-right-panel-width": `${rightPanelWidth}px`
+  };
   const showSceneShortcutTools = canEditScene && (rightPanelCollapsed || stageFullscreen);
   const showInspectorShortcutActions = canEditScene && !stageFullscreen;
+  const showStandaloneOperationHelpButton = canEditScene && !showSceneShortcutTools;
+  const showFloatingSelectedObject = Boolean(canEditScene && selectedLayerKey && showSceneShortcutTools);
+  const showHiddenMeshesHint = Boolean(canEditScene && isModel && allMeshLayersHidden);
+  const transformModeControlsDisabled = !canEditScene || placementMode;
+  const sideTabContentPending = activeSideTab !== renderedSideTab;
 
   return (
     <div className="page-stack preview-page">
@@ -584,6 +1928,7 @@ function PreviewWorkspace({
           ) : null}
           {activePreviewEngine === "three" ? (
             <div className="preview-toolbar-control">
+              <span>Three.js 渲染器</span>
               <RendererSelector
                 value={threeRenderer}
                 webgpuSupported={webgpuSupport.supported}
@@ -609,7 +1954,7 @@ function PreviewWorkspace({
         </Space>
       </div>
 
-      <div className={workspaceClassName}>
+      <div className={workspaceClassName} style={workspaceStyle}>
         {leftPanelCollapsed ? (
           <div className="preview-panel preview-rail is-left">
             <Tooltip title="展开成果与图层">
@@ -621,13 +1966,43 @@ function PreviewWorkspace({
             </Tooltip>
           </div>
         ) : (
-        <div className="preview-panel preview-side preview-side-stack">
-          <section className="preview-side-section">
+        <div className="preview-panel preview-side preview-side-tabs">
+          <nav className="preview-side-tab-rail" aria-label="预览资源面板">
+            {([
+              { key: "files" as const, label: "文件列表", icon: <FileOutlined /> },
+              { key: "materials" as const, label: "材质列表", icon: <BgColorsOutlined /> },
+              { key: "meshes" as const, label: "网格列表", icon: <NodeIndexOutlined /> }
+            ]).map((tab) => (
+              <Tooltip title={tab.label} placement="right" key={tab.key}>
+                <button
+                  aria-label={tab.label}
+                  aria-pressed={activeSideTab === tab.key}
+                  className={`preview-side-tab-button${activeSideTab === tab.key ? " is-active" : ""}`}
+                  type="button"
+                  onPointerDown={(event) => {
+                    if (event.button === 0) {
+                      handleSideTabChange(tab.key);
+                    }
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) {
+                      handleSideTabChange(tab.key);
+                    }
+                  }}
+                >
+                  {tab.icon}
+                </button>
+              </Tooltip>
+            ))}
+          </nav>
+          <section className="preview-side-tab-content" aria-busy={sideTabContentPending}>
             <div className="preview-panel-header">
-              <Typography.Title level={5}>成果文件</Typography.Title>
-              <Tooltip title="收起成果与图层">
+              <Typography.Title level={5}>
+                {activeSideTab === "files" ? "文件列表" : activeSideTab === "materials" ? "材质列表" : "网格列表"}
+              </Typography.Title>
+              <Tooltip title="收起资源面板">
                 <Button
-                  aria-label="收起成果与图层"
+                  aria-label="收起资源面板"
                   icon={<MenuFoldOutlined />}
                   size="small"
                   type="text"
@@ -635,47 +2010,167 @@ function PreviewWorkspace({
                 />
               </Tooltip>
             </div>
-            <PreviewFileList
-              files={payload.files}
-              selectedFileId={payload.file?.id || null}
-              onSelectFile={onSelectFile}
-            />
-          </section>
 
-          <Divider />
+            {sideTabContentPending ? (
+              <div className="preview-side-tab-loading">
+                <Spin size="small" />
+                <span>正在切换面板…</span>
+              </div>
+            ) : null}
 
-          <section className="preview-side-section preview-layer-section">
-            <Space className="preview-section-heading">
-              <NodeIndexOutlined />
-              <Typography.Title level={5}>模型图层</Typography.Title>
-            </Space>
-            {layerTree.length ? (
-              <LayerTreeView
-                nodes={layerTree}
-                checkedKeys={checkedLayerKeys}
-                expandedKeys={expandedLayerKeys}
-                selectedKey={selectedLayerKey}
-                onSelect={updateSelectedLayer}
-                onFocusLayer={updateSelectedLayer}
-                onToggleExpanded={toggleExpandedLayer}
-                onToggle={(node) => {
-                  const nodeKeys = collectNodeKeys(node);
-                  const checkedSet = new Set(checkedLayerKeys);
-                  const shouldHide = nodeKeys.every((key) => checkedSet.has(key));
-                  nodeKeys.forEach((key) => {
-                    if (shouldHide) {
-                      checkedSet.delete(key);
-                    } else {
-                      checkedSet.add(key);
-                    }
-                  });
-                  updateHiddenLayers(allLayerKeys.filter((key) => !checkedSet.has(key)));
-                }}
+            {!sideTabContentPending && renderedSideTab === "files" ? (
+              <PreviewFileList
+                files={payload.files}
+                selectedFileId={payload.file?.id || null}
+                onSelectFile={onSelectFile}
               />
-            ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={isModel ? "模型加载后显示层级" : "当前文件无图层树"} />
-            )}
+            ) : null}
+
+            {!sideTabContentPending && renderedSideTab === "materials" ? (
+              <MaterialList
+                materials={materialList}
+                selectedKey={selectedMaterialKey}
+                onSelect={handleMaterialSelect}
+                onFocus={handleMaterialFocus}
+              />
+            ) : null}
+
+            {!sideTabContentPending && renderedSideTab === "meshes" ? (
+              <div className="preview-mesh-list-panel">
+                {layerTree.length ? (
+                  <div className="preview-mesh-toolbar" aria-label="网格列表工具栏">
+                    <Tooltip title="网格列表">
+                      <Button
+                        aria-label="网格列表"
+                        aria-pressed={meshViewMode === "list"}
+                        className={meshViewMode === "list" ? "is-active" : ""}
+                        icon={<MenuUnfoldOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => handleMeshViewModeChange("list")}
+                      />
+                    </Tooltip>
+                    <Tooltip title="树形层级">
+                      <Button
+                        aria-label="树形层级"
+                        aria-pressed={meshViewMode === "tree"}
+                        className={meshViewMode === "tree" ? "is-active" : ""}
+                        icon={<NodeIndexOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => handleMeshViewModeChange("tree")}
+                      />
+                    </Tooltip>
+                    <span className="preview-mesh-toolbar-divider" aria-hidden="true" />
+                    <Tooltip title="展开全部">
+                      <Button
+                        aria-label="展开全部网格"
+                        disabled={meshViewMode !== "tree" || !displayedMeshKeys.length}
+                        icon={<DownOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => commitExpandedLayerKeys(collectExpandableLayerKeys(displayedMeshLayers, Number.POSITIVE_INFINITY, 500))}
+                      />
+                    </Tooltip>
+                    <Tooltip title="收起全部">
+                      <Button
+                        aria-label="收起全部网格"
+                        disabled={meshViewMode !== "tree" || !effectiveExpandedLayerKeys.length}
+                        icon={<UpOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => commitExpandedLayerKeys([])}
+                      />
+                    </Tooltip>
+                    <span className="preview-mesh-toolbar-spacer" aria-hidden="true" />
+                    <Tooltip title="定位模型">
+                      <Button
+                        aria-label="定位模型"
+                        disabled={!displayedMeshKeys.length}
+                        icon={<FullscreenOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => issueViewCommand("fit")}
+                      />
+                    </Tooltip>
+                    <Tooltip title={meshLayersHidden ? "全部显示" : "全部隐藏"}>
+                      <Button
+                        aria-label={meshLayersHidden ? "全部显示网格" : "全部隐藏网格"}
+                        disabled={!displayedMeshKeys.length}
+                        icon={meshLayersHidden ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+                        size="small"
+                        type="text"
+                        onClick={() => {
+                          updateHiddenLayers(meshLayersHidden
+                            ? hiddenLayerKeys.filter((key) => !displayedMeshKeySet.has(key))
+                            : Array.from(new Set([...hiddenLayerKeys, ...displayedMeshKeys]))
+                          );
+                        }}
+                      />
+                    </Tooltip>
+                  </div>
+                ) : null}
+                {layerTree.length ? (
+                  <div className="preview-mesh-search-row">
+                    <Input
+                      allowClear
+                      aria-label="搜索网格"
+                      className="preview-layer-search"
+                      placeholder="搜索网格名称 / ID"
+                      prefix={<SearchOutlined />}
+                      size="small"
+                      value={meshSearchText}
+                      onChange={(event) => setMeshSearchText(event.target.value)}
+                    />
+                    {meshSearchQuery ? (
+                      <Typography.Text className="preview-mesh-search-count" type="secondary">
+                        {meshSearchMatchCount} / {allMeshLayerKeys.length}
+                      </Typography.Text>
+                    ) : null}
+                  </div>
+                ) : null}
+                {displayedMeshLayers.length ? (
+                    <LayerTreeView
+                      nodes={displayedMeshLayers}
+                      checkedSet={checkedLayerKeySet}
+                      expandedKeys={effectiveExpandedLayerKeys}
+                      selectedKey={selectedLayerKey}
+                      visibilityStates={displayedMeshVisibilityStates}
+                      virtualized={meshViewMode === "list"}
+                      onSelect={updateSelectedLayer}
+                      onFocusLayer={handleFocusLayer}
+                      onToggleExpanded={toggleExpandedLayer}
+                      onToggle={(node) => {
+                        const nodeKeys = displayedMeshNodeKeyLookup.get(node.key) || [node.key];
+                        const checkedSet = new Set(checkedLayerKeySet);
+                        const shouldHide = nodeKeys.every((key) => checkedSet.has(key));
+                        nodeKeys.forEach((key) => {
+                          if (shouldHide) {
+                            checkedSet.delete(key);
+                          } else {
+                            checkedSet.add(key);
+                          }
+                        });
+                        updateHiddenLayers(allLayerKeys.filter((key) => !checkedSet.has(key)));
+                      }}
+                    />
+                ) : (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description={meshSearchQuery
+                      ? `未找到匹配“${meshSearchText.trim()}”的网格`
+                      : isModel ? "模型加载后显示网格" : "当前文件无网格列表"}
+                  />
+                )}
+              </div>
+            ) : null}
           </section>
+          <button
+            aria-label="拖拽调整资源面板宽度"
+            className="preview-side-resize-handle"
+            type="button"
+            onPointerDown={handleLeftPanelResizeStart}
+          />
         </div>
         )}
 
@@ -690,30 +2185,31 @@ function PreviewWorkspace({
             selectedLayerKey={selectedLayerKey}
             hiddenLayerKeys={hiddenLayerKeys}
             placementMode={placementMode}
+            placementFeedback={placementFeedback}
             canEditScene={canEditScene}
             viewOptions={viewOptions}
             viewCommand={viewCommand}
             sceneViewState={sceneViewState}
             onLayerTreeChange={updateLayerTree}
+            onMaterialListChange={updateMaterialList}
             onSceneInfoChange={handleSceneInfoChange}
             onSceneViewStateChange={handleSceneViewStateChange}
             onSelectLayer={updateSelectedLayer}
             onTransformChange={updateTransform}
             onPlacementDone={handlePlacementDone}
-            onPlacementCancel={() => setPlacementMode(false)}
-            onViewCommandHandled={() => setViewCommand(null)}
-            onRendererFallback={(message) => {
-              setSceneInfo((current) => ({
-                ...current,
-                backend: "WebGL",
-                status: "loading",
-                message
-              }));
-              setThreeRenderer("webgl");
-            }}
-            onSwitchToThree={() => setPreviewEngine("three")}
+            onPlacementCancel={handlePlacementCancel}
+            onPlacementMiss={showPlacementFeedback}
+            onViewCommandHandled={handleViewCommandHandled}
+            onInteractionHintChange={handleInteractionHintChange}
+            onRendererFallback={handleRendererFallback}
+            onSwitchToThree={handleSwitchToThree}
             onUnrealStatusChange={handleUnrealStatusChange}
           />
+          {canEditScene && interactionHint ? (
+            <div className="preview-interaction-hint" role="status" aria-live="polite">
+              {previewInteractionHintLabel(interactionHint)}
+            </div>
+          ) : null}
           {engineSwitching ? (
             <div className="preview-switch-mask">
               <Spin />
@@ -722,41 +2218,65 @@ function PreviewWorkspace({
           ) : null}
           {showSceneShortcutTools ? (
             <div className="preview-scene-tools" aria-label="场景快捷工具">
-              <Tooltip title="聚焦模型">
+              <Tooltip title={fitViewTooltip}>
                 <Button
-                  aria-label="聚焦模型"
+                  aria-label={fitViewAriaLabel}
                   icon={<AimOutlined />}
-                  onClick={() => setViewCommand("fit")}
+                  onClick={() => issueViewCommand(focusViewCommand)}
                 />
               </Tooltip>
-              <Tooltip title="重置视角">
-                <Button
-                  aria-label="重置视角"
-                  icon={<HomeOutlined />}
-                  onClick={() => setViewCommand("reset")}
-                />
-              </Tooltip>
-              <Tooltip title={placementMode ? "退出地表落位" : "地表落位"}>
+              {!isSphereScene ? (
+                <Tooltip title={resetViewTooltip}>
+                  <Button
+                    aria-label="重置视角"
+                    icon={<HomeOutlined />}
+                    onClick={() => issueViewCommand("reset")}
+                  />
+                </Tooltip>
+              ) : null}
+              {isSphereScene ? (
+                <Tooltip title={resetViewTooltip}>
+                  <Button
+                    aria-label="恢复到地球默认"
+                    icon={<GlobalOutlined />}
+                    onClick={() => issueViewCommand("earth-default")}
+                  />
+                </Tooltip>
+              ) : null}
+              <Tooltip title={placementTooltip}>
                 <Button
                   aria-label="地表落位"
-                  aria-pressed={placementMode}
-                  type={placementMode ? "primary" : "default"}
+                  aria-pressed={canUsePlacementMode && placementMode}
+                  type={canUsePlacementMode && placementMode ? "primary" : "default"}
                   icon={<EnvironmentOutlined />}
-                  onClick={() => setPlacementMode((value) => !value)}
+                  disabled={!canUsePlacementMode}
+                  onClick={togglePlacementMode}
                 />
               </Tooltip>
-              <Tooltip title="回正姿态">
+              <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "回正姿态"}>
                 <Button
                   aria-label="回正姿态"
                   icon={<ColumnHeightOutlined />}
-                  onClick={() => updateTransform(normalizeUprightTransform(transform, sceneMode))}
+                  disabled={placementMode}
+                  onClick={() => {
+                    if (placementMode) {
+                      return;
+                    }
+                    updateTransform(normalizeUprightTransform(transform, sceneMode));
+                  }}
                 />
               </Tooltip>
-              <Tooltip title="重置变换">
+              <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "重置变换"}>
                 <Button
                   aria-label="重置变换"
                   icon={<UndoOutlined />}
-                  onClick={() => updateTransform(normalizeResetTransform(transform, sceneMode))}
+                  disabled={placementMode}
+                  onClick={() => {
+                    if (placementMode) {
+                      return;
+                    }
+                    updateTransform(normalizeResetTransform(transform, sceneMode));
+                  }}
                 />
               </Tooltip>
               <Tooltip title={stageFullscreen ? "退出全屏" : "全屏"}>
@@ -767,23 +2287,195 @@ function PreviewWorkspace({
                   onClick={toggleStageFullscreen}
                 />
               </Tooltip>
+              <Tooltip title={operationHelpTooltip}>
+                <Button
+                  aria-label="操作说明"
+                  aria-pressed={operationHelpOpen}
+                  icon={<QuestionCircleOutlined />}
+                  type={operationHelpOpen ? "primary" : "default"}
+                  onClick={toggleOperationHelpOpen}
+                />
+              </Tooltip>
               <div className="preview-scene-mode-switch" aria-label="模型变换模式">
                 {TRANSFORM_MODE_OPTIONS.map((mode) => (
-                  <Tooltip title={mode.tooltip} key={mode.value}>
+                  <Tooltip title={placementMode ? "退出地表落位后可切换变换模式" : mode.tooltip} key={mode.value}>
                     <Button
                       aria-label={mode.tooltip}
                       aria-pressed={transformMode === mode.value}
                       className={transformMode === mode.value ? "is-active" : undefined}
+                      disabled={placementMode}
                       icon={mode.icon}
                       type={transformMode === mode.value ? "primary" : "default"}
-                      onClick={() => setTransformMode(mode.value)}
+                      onClick={() => {
+                        if (placementMode) {
+                          return;
+                        }
+                        updateTransformMode(mode.value);
+                      }}
                     />
                   </Tooltip>
                 ))}
               </div>
             </div>
           ) : null}
-          {fpsLabel ? <div className="preview-scene-fps">FPS：{fpsLabel}</div> : null}
+          {showHiddenMeshesHint ? (
+            <div className="preview-hidden-meshes-hint" role="status" aria-live="polite">
+              <strong>模型图层已全部隐藏</strong>
+              <span>画布为空不是加载失败，可以一键恢复所有网格。</span>
+              <Button
+                icon={<EyeOutlined />}
+                size="small"
+                type="primary"
+                onClick={showAllMeshLayers}
+              >
+                显示全部网格
+              </Button>
+            </div>
+          ) : null}
+          {showFloatingSelectedObject ? (
+            <div className="preview-selected-object-floating" aria-live="polite">
+              <span className="preview-selected-object-floating-label">当前选中</span>
+              <span className="preview-selected-object-floating-name" title={selectedLayerTitle}>
+                {selectedLayerTitle}
+              </span>
+              <span className="preview-selected-object-floating-actions">
+                <Tooltip title="聚焦选中对象（F）">
+                  <Button
+                    aria-label={`聚焦选中对象：${selectedLayerTitle}`}
+                    icon={<AimOutlined />}
+                    size="small"
+                    type="text"
+                    onClick={() => issueViewCommand("focus-selected")}
+                  />
+                </Tooltip>
+                <Tooltip title="在图层列表中显示">
+                  <Button
+                    aria-label={`在图层列表中显示：${selectedLayerTitle}`}
+                    icon={<NodeIndexOutlined />}
+                    size="small"
+                    type="text"
+                    onClick={revealSelectedLayerInMeshList}
+                  />
+                </Tooltip>
+                <Tooltip title="清除选中（Esc）">
+                  <Button
+                    aria-label={`清除选中对象：${selectedLayerTitle}`}
+                    icon={<CloseOutlined />}
+                    size="small"
+                    type="text"
+                    onClick={clearPreviewSelection}
+                  />
+                </Tooltip>
+              </span>
+            </div>
+          ) : null}
+          {showStandaloneOperationHelpButton ? (
+            <Tooltip title={operationHelpTooltip}>
+              <Button
+                aria-label="操作说明"
+                aria-pressed={operationHelpOpen}
+                className="preview-operation-help-toggle"
+                icon={<QuestionCircleOutlined />}
+                type={operationHelpOpen ? "primary" : "default"}
+                onClick={toggleOperationHelpOpen}
+              />
+            </Tooltip>
+          ) : null}
+          {operationHelpOpen && canEditScene ? (
+            <aside className="preview-operation-help" aria-label="三维预览操作说明">
+              <div className="preview-operation-help-header">
+                <strong>三维操作说明</strong>
+                <Button
+                  aria-label="关闭操作说明"
+                  icon={<CloseOutlined />}
+                  size="small"
+                  type="text"
+                  onClick={() => commitOperationHelpOpen(false)}
+                />
+              </div>
+              <div className="preview-operation-help-section">
+                <span>浏览场景</span>
+                <dl>
+                  <div>
+                    <dt>左键拖动</dt>
+                    <dd>{sceneMode === "sphere" ? "旋转 / 拖动地球" : "旋转视角"}</dd>
+                  </div>
+                  <div>
+                    <dt>Shift/Ctrl/⌘ + 左键</dt>
+                    <dd>平移视角</dd>
+                  </div>
+                  <div>
+                    <dt>滚轮</dt>
+                    <dd>以鼠标位置缩放</dd>
+                  </div>
+                  <div>
+                    <dt>右键上下拖动</dt>
+                    <dd>快速缩放</dd>
+                  </div>
+                  <div>
+                    <dt>中键拖动</dt>
+                    <dd>俯仰观察</dd>
+                  </div>
+                  <div>
+                    <dt>双击左键</dt>
+                    <dd>{isSphereScene ? "地球区域放大；Shift + 双击缩小" : "双击模型时选中并聚焦对象"}</dd>
+                  </div>
+                </dl>
+              </div>
+              <div className="preview-operation-help-section">
+                <span>模型操作</span>
+                <dl>
+                  <div>
+                    <dt>单击模型</dt>
+                    <dd>选中网格 / 图层</dd>
+                  </div>
+                  <div>
+                    <dt>双击模型</dt>
+                    <dd>选中并聚焦该对象</dd>
+                  </div>
+                  <div>
+                    <dt>双击列表行</dt>
+                    <dd>在网格或材质列表中快速聚焦对象</dd>
+                  </div>
+                  <div>
+                    <dt>W / E / R</dt>
+                    <dd>切换平移 / 旋转 / 缩放变换模式</dd>
+                  </div>
+                  <div>
+                    <dt>地表落位</dt>
+                    <dd>{isSphereScene ? "开启后单击地球表面放置模型；落位期间暂停变换编辑" : "仅球面场景支持地表落位"}</dd>
+                  </div>
+                </dl>
+              </div>
+              <div className="preview-operation-help-section">
+                <span>快捷恢复</span>
+                <dl>
+                  <div>
+                    <dt>F</dt>
+                    <dd>聚焦选中对象；未选中时适配整个模型</dd>
+                  </div>
+                  <div>
+                    <dt>Home</dt>
+                    <dd>{sceneMode === "sphere" ? "恢复到地球默认视角" : "恢复默认视角"}</dd>
+                  </div>
+                  <div>
+                    <dt>H / ?</dt>
+                    <dd>打开或收起这份操作说明</dd>
+                  </div>
+                  <div>
+                    <dt>Esc</dt>
+                    <dd>关闭说明、退出落位、清除选中或停止视角惯性</dd>
+                  </div>
+                </dl>
+              </div>
+            </aside>
+          ) : null}
+          {showScenePerformanceBadge ? (
+            <div className="preview-scene-fps" role="status" aria-live="polite">
+              {fpsLabel ? <span>FPS：{fpsLabel}</span> : null}
+              {adaptivePerformanceActive ? <span className="preview-scene-fps-badge">性能保护中</span> : null}
+            </div>
+          ) : null}
           {runtimeStatus.status === "loading" ? (
             <div className="preview-scene-status is-loading">
               <Spin size="small" />
@@ -793,6 +2485,15 @@ function PreviewWorkspace({
           {runtimeStatus.status === "error" ? (
             <div className="preview-scene-status is-error">
               <span>{runtimeStatus.message || "场景加载失败"}</span>
+            </div>
+          ) : null}
+          {canEditScene && saveState !== "idle" ? (
+            <div
+              className={`preview-stage-save-status is-${saveState}`}
+              role="status"
+              aria-live="polite"
+            >
+              {saveLabel(saveState)}
             </div>
           ) : null}
         </div>
@@ -809,6 +2510,12 @@ function PreviewWorkspace({
           </div>
         ) : (
         <div className="preview-panel preview-side preview-inspector-panel">
+          <button
+            aria-label="拖拽调整场景控制宽度"
+            className="preview-inspector-resize-handle"
+            type="button"
+            onPointerDown={handleRightPanelResizeStart}
+          />
           <div className="preview-panel-header">
             <Typography.Title level={5}>场景控制</Typography.Title>
             <Tooltip title="收起场景控制">
@@ -822,25 +2529,74 @@ function PreviewWorkspace({
             </Tooltip>
           </div>
           <Space direction="vertical" size={12} className="preview-control-stack">
+            {selectedLayerKey ? (
+              <div className="preview-selected-object-card" aria-live="polite">
+                <span className="preview-selected-object-label">当前选中</span>
+                <span className="preview-selected-object-name" title={selectedLayerTitle}>
+                  {selectedLayerTitle}
+                </span>
+                <span className="preview-selected-object-actions">
+                  <Tooltip title="聚焦选中对象（F）">
+                    <Button
+                      aria-label={`聚焦选中对象：${selectedLayerTitle}`}
+                      icon={<AimOutlined />}
+                      size="small"
+                      type="text"
+                      onClick={() => issueViewCommand("focus-selected")}
+                    />
+                  </Tooltip>
+                  <Tooltip title="在图层列表中显示">
+                    <Button
+                      aria-label={`在图层列表中显示：${selectedLayerTitle}`}
+                      icon={<NodeIndexOutlined />}
+                      size="small"
+                      type="text"
+                      onClick={revealSelectedLayerInMeshList}
+                    />
+                  </Tooltip>
+                  <Tooltip title="清除选中（Esc）">
+                    <Button
+                      aria-label={`清除选中对象：${selectedLayerTitle}`}
+                      icon={<CloseOutlined />}
+                      size="small"
+                      type="text"
+                      onClick={clearPreviewSelection}
+                    />
+                  </Tooltip>
+                </span>
+              </div>
+            ) : null}
             <Space wrap className="preview-tool-row">
               {showInspectorShortcutActions ? (
                 <>
-                  <Tooltip title="聚焦模型">
+                  <Tooltip title={fitViewTooltip}>
                     <Button
-                      aria-label="聚焦模型"
+                      aria-label={fitViewAriaLabel}
                       icon={<AimOutlined />}
                       disabled={!canEditScene}
-                      onClick={() => setViewCommand("fit")}
+                      onClick={() => issueViewCommand(focusViewCommand)}
                     />
                   </Tooltip>
-                  <Tooltip title="重置视角">
-                    <Button
-                      aria-label="重置视角"
-                      icon={<HomeOutlined />}
-                      disabled={!canEditScene}
-                      onClick={() => setViewCommand("reset")}
-                    />
-                  </Tooltip>
+                  {!isSphereScene ? (
+                    <Tooltip title={resetViewTooltip}>
+                      <Button
+                        aria-label="重置视角"
+                        icon={<HomeOutlined />}
+                        disabled={!canEditScene}
+                        onClick={() => issueViewCommand("reset")}
+                      />
+                    </Tooltip>
+                  ) : null}
+                  {isSphereScene ? (
+                    <Tooltip title={resetViewTooltip}>
+                      <Button
+                        aria-label="恢复到地球默认"
+                        icon={<GlobalOutlined />}
+                        disabled={!canEditScene}
+                        onClick={() => issueViewCommand("earth-default")}
+                      />
+                    </Tooltip>
+                  ) : null}
                   <Tooltip title={stageFullscreen ? "退出全屏" : "全屏"}>
                     <Button
                       aria-label={stageFullscreen ? "退出全屏" : "全屏"}
@@ -863,30 +2619,40 @@ function PreviewWorkspace({
               </Tooltip>
               {showInspectorShortcutActions ? (
                 <>
-                  <Tooltip title={placementMode ? "退出地表落位" : "地表落位"}>
+                  <Tooltip title={placementTooltip}>
                     <Button
                       aria-label="地表落位"
-                      aria-pressed={canEditScene && placementMode}
-                      type={canEditScene && placementMode ? "primary" : "default"}
+                      aria-pressed={canUsePlacementMode && placementMode}
+                      type={canUsePlacementMode && placementMode ? "primary" : "default"}
                       icon={<EnvironmentOutlined />}
-                      disabled={!canEditScene}
-                      onClick={() => setPlacementMode((value) => !value)}
+                      disabled={!canUsePlacementMode}
+                      onClick={togglePlacementMode}
                     />
                   </Tooltip>
-                  <Tooltip title="回正姿态">
+                  <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "回正姿态"}>
                     <Button
                       aria-label="回正姿态"
                       icon={<ColumnHeightOutlined />}
-                      disabled={!canEditScene}
-                      onClick={() => updateTransform(normalizeUprightTransform(transform, sceneMode))}
+                      disabled={transformModeControlsDisabled}
+                      onClick={() => {
+                        if (transformModeControlsDisabled) {
+                          return;
+                        }
+                        updateTransform(normalizeUprightTransform(transform, sceneMode));
+                      }}
                     />
                   </Tooltip>
-                  <Tooltip title="重置变换">
+                  <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "重置变换"}>
                     <Button
                       aria-label="重置变换"
                       icon={<UndoOutlined />}
-                      disabled={!canEditScene}
-                      onClick={() => updateTransform(normalizeResetTransform(transform, sceneMode))}
+                      disabled={transformModeControlsDisabled}
+                      onClick={() => {
+                        if (transformModeControlsDisabled) {
+                          return;
+                        }
+                        updateTransform(normalizeResetTransform(transform, sceneMode));
+                      }}
                     />
                   </Tooltip>
                 </>
@@ -898,10 +2664,20 @@ function PreviewWorkspace({
               optionType="button"
               buttonStyle="solid"
               value={transformMode}
-              disabled={!canEditScene}
+              disabled={transformModeControlsDisabled}
               options={TRANSFORM_MODE_OPTIONS.map(({ label, value }) => ({ label, value }))}
-              onChange={(event) => setTransformMode(event.target.value)}
+              onChange={(event) => {
+                if (transformModeControlsDisabled) {
+                  return;
+                }
+                updateTransformMode(event.target.value);
+              }}
             />
+            {placementMode ? (
+              <div className="preview-control-mode-hint" role="status">
+                地表落位中：单击地球表面放置，或按 Esc 退出；变换编辑已暂停。
+              </div>
+            ) : null}
           </Space>
 
           <Divider />
@@ -910,7 +2686,7 @@ function PreviewWorkspace({
             transform={transform}
             sceneMode={sceneMode}
             transformMode={transformMode}
-            disabled={!canEditScene}
+            disabled={transformModeControlsDisabled}
             onChange={updateTransform}
           />
         </div>
@@ -920,32 +2696,7 @@ function PreviewWorkspace({
   );
 }
 
-function PreviewStage({
-  payload,
-  activeEngine,
-  threeRenderer,
-  sceneMode,
-  transform,
-  transformMode,
-  selectedLayerKey,
-  hiddenLayerKeys,
-  placementMode,
-  canEditScene,
-  viewOptions,
-  viewCommand,
-  sceneViewState,
-  onLayerTreeChange,
-  onSceneInfoChange,
-  onSceneViewStateChange,
-  onSelectLayer,
-  onTransformChange,
-  onPlacementDone,
-  onPlacementCancel,
-  onViewCommandHandled,
-  onRendererFallback,
-  onSwitchToThree,
-  onUnrealStatusChange
-}: {
+type PreviewStageProps = {
   payload: PreviewPayload;
   activeEngine: PreviewEngine;
   threeRenderer: ThreeRendererPreference;
@@ -955,22 +2706,76 @@ function PreviewStage({
   selectedLayerKey: string | null;
   hiddenLayerKeys: string[];
   placementMode: boolean;
+  placementFeedback: string;
   canEditScene: boolean;
   viewOptions: PreviewViewOptions;
-  viewCommand: ViewCommand;
+  viewCommand: ViewCommandRequest | null;
   sceneViewState: SceneViewState;
   onLayerTreeChange: (tree: LayerNode[]) => void;
+  onMaterialListChange: (materials: MaterialNode[]) => void;
   onSceneInfoChange: (info: SceneInfo) => void;
   onSceneViewStateChange: (state: SceneViewState) => void;
   onSelectLayer: (key: string | null) => void;
   onTransformChange: (transform: PreviewTransform) => void;
   onPlacementDone: () => void;
   onPlacementCancel: () => void;
-  onViewCommandHandled: () => void;
+  onPlacementMiss: (message: string) => void;
+  onViewCommandHandled: (result?: ViewCommandHandledResult) => void;
+  onInteractionHintChange: (hint: PreviewInteractionHint | null) => void;
   onRendererFallback: (message: string) => void;
   onSwitchToThree: () => void;
   onUnrealStatusChange: (status: UnrealConnectionStatus, message?: string) => void;
-}) {
+};
+
+function arePreviewPropsShallowEqual<T extends object>(previous: T, next: T): boolean {
+  const previousKeys = Object.keys(previous) as Array<keyof T>;
+  const nextKeys = Object.keys(next) as Array<keyof T>;
+  return previousKeys.length === nextKeys.length &&
+    previousKeys.every((key) => (
+      Object.prototype.hasOwnProperty.call(next, key) &&
+      Object.is(previous[key], next[key])
+    ));
+}
+
+function arePreviewStagePropsEqual(previous: PreviewStageProps, next: PreviewStageProps): boolean {
+  const { sceneViewState: previousSceneViewState, ...previousRest } = previous;
+  const { sceneViewState: nextSceneViewState, ...nextRest } = next;
+  if (!arePreviewPropsShallowEqual(previousRest, nextRest)) {
+    return false;
+  }
+  return next.activeEngine !== "unreal" || previousSceneViewState === nextSceneViewState;
+}
+
+const PreviewStage = memo(function PreviewStage({
+  payload,
+  activeEngine,
+  threeRenderer,
+  sceneMode,
+  transform,
+  transformMode,
+  selectedLayerKey,
+  hiddenLayerKeys,
+  placementMode,
+  placementFeedback,
+  canEditScene,
+  viewOptions,
+  viewCommand,
+  sceneViewState,
+  onLayerTreeChange,
+  onMaterialListChange,
+  onSceneInfoChange,
+  onSceneViewStateChange,
+  onSelectLayer,
+  onTransformChange,
+  onPlacementDone,
+  onPlacementCancel,
+  onPlacementMiss,
+  onViewCommandHandled,
+  onInteractionHintChange,
+  onRendererFallback,
+  onSwitchToThree,
+  onUnrealStatusChange
+}: PreviewStageProps) {
   const url = api.absoluteUrl(payload.url);
   const contextTilesUrl = resolveContextTilesUrl(payload);
 
@@ -1019,18 +2824,31 @@ function PreviewStage({
         viewCommand={viewCommand}
         sceneViewState={sceneViewState}
         onLayerTreeChange={onLayerTreeChange}
+        onMaterialListChange={onMaterialListChange}
         onSceneInfoChange={onSceneInfoChange}
         onSceneViewStateChange={onSceneViewStateChange}
         onSelectLayer={onSelectLayer}
         onTransformChange={onTransformChange}
         onPlacementDone={onPlacementDone}
+        onPlacementMiss={onPlacementMiss}
         onViewCommandHandled={onViewCommandHandled}
+        onInteractionHintChange={onInteractionHintChange}
         onRendererFallback={onRendererFallback}
       />
       {placementMode ? (
-        <div className="preview-placement-hint" role="status" aria-label="地表落位模式：单击地球表面完成落位，Esc 退出">
+        <div
+          className="preview-placement-hint"
+          role="status"
+          aria-label="地表落位模式：单击地球表面完成落位，Esc 退出"
+        >
           <AimOutlined className="preview-placement-hint-icon" />
-          <strong>落位中</strong>
+          <span className="preview-placement-hint-copy">
+            <strong>落位中</strong>
+            <span>单击地球表面放置 · Esc 退出</span>
+            {placementFeedback ? (
+              <span className="preview-placement-feedback">{placementFeedback}</span>
+            ) : null}
+          </span>
           <Tooltip title="退出地表落位">
             <Button
               aria-label="退出地表落位"
@@ -1041,10 +2859,22 @@ function PreviewStage({
             />
           </Tooltip>
         </div>
+      ) : placementFeedback ? (
+        <div
+          className="preview-placement-hint"
+          role="status"
+          aria-label="地表落位完成"
+        >
+          <AimOutlined className="preview-placement-hint-icon" />
+          <span className="preview-placement-hint-copy">
+            <strong>落位完成</strong>
+            <span>{placementFeedback}</span>
+          </span>
+        </div>
       ) : null}
     </div>
   );
-}
+}, arePreviewStagePropsEqual);
 
 function PreviewFileList({
   files,
@@ -1122,29 +2952,307 @@ function PreviewFileList({
   );
 }
 
+function MaterialList({
+  materials,
+  selectedKey,
+  onSelect,
+  onFocus
+}: {
+  materials: MaterialNode[];
+  selectedKey: string | null;
+  onSelect: (material: MaterialNode) => void;
+  onFocus: (material: MaterialNode) => void;
+}) {
+  if (!materials.length) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="模型加载后显示材质" />;
+  }
+
+  if (materials.length > PREVIEW_MATERIAL_VIRTUAL_THRESHOLD) {
+    return (
+      <VirtualizedMaterialList
+        materials={materials}
+        selectedKey={selectedKey}
+        onSelect={onSelect}
+        onFocus={onFocus}
+      />
+    );
+  }
+
+  return (
+    <div className="preview-material-list" role="list" aria-label="材质列表">
+      {materials.map((material) => (
+        <Tooltip title={materialListTooltip(material)} key={material.key}>
+          <button
+            aria-current={selectedKey === material.key}
+            className={`preview-material-row${selectedKey === material.key ? " is-active" : ""}`}
+            type="button"
+            onClick={() => onSelect(material)}
+            onDoubleClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onFocus(material);
+            }}
+          >
+            <span
+              className="preview-material-swatch"
+              style={{ background: material.color || "#d7dee8" }}
+              aria-hidden="true"
+            />
+            <span className="preview-material-row-main">
+              <span>{material.title}</span>
+              <small>{materialListMeta(material)}</small>
+            </span>
+          </button>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+function MaterialListRow({
+  material,
+  selectedKey,
+  onSelect,
+  onFocus
+}: {
+  material: MaterialNode;
+  selectedKey: string | null;
+  onSelect: (material: MaterialNode) => void;
+  onFocus: (material: MaterialNode) => void;
+}) {
+  return (
+    <Tooltip title={materialListTooltip(material)} key={material.key}>
+      <button
+        aria-current={selectedKey === material.key}
+        className={`preview-material-row${selectedKey === material.key ? " is-active" : ""}`}
+        type="button"
+        onClick={() => onSelect(material)}
+        onDoubleClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onFocus(material);
+        }}
+      >
+        <span
+          className="preview-material-swatch"
+          style={{ background: material.color || "#d7dee8" }}
+          aria-hidden="true"
+        />
+        <span className="preview-material-row-main">
+          <span>{material.title}</span>
+          <small>{materialListMeta(material)}</small>
+        </span>
+      </button>
+    </Tooltip>
+  );
+}
+
+function materialListTooltip(material: MaterialNode): string {
+  return `${material.title} · ${materialListMeta(material)}`;
+}
+
+function materialListMeta(material: MaterialNode): string {
+  return `${material.objectCount} 个对象 · ${material.layerKey ? "双击聚焦" : "仅材质选择"}`;
+}
+
+function useVirtualListMetrics(itemCount: number, rowHeight: number) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef(0);
+  const [metrics, setMetrics] = useState({ scrollTop: 0, viewportHeight: 0 });
+
+  const updateMetrics = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const nextMetrics = {
+      scrollTop: container.scrollTop,
+      viewportHeight: container.clientHeight
+    };
+    setMetrics((current) => (
+      current.scrollTop === nextMetrics.scrollTop &&
+      current.viewportHeight === nextMetrics.viewportHeight
+        ? current
+        : nextMetrics
+    ));
+  }, []);
+
+  const scheduleMetricsUpdate = useCallback(() => {
+    if (frameRef.current) {
+      return;
+    }
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = 0;
+      updateMetrics();
+    });
+  }, [updateMetrics]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    updateMetrics();
+    const observer = new ResizeObserver(scheduleMetricsUpdate);
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+      if (frameRef.current) {
+        window.cancelAnimationFrame(frameRef.current);
+        frameRef.current = 0;
+      }
+    };
+  }, [scheduleMetricsUpdate, updateMetrics]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const maxScrollTop = Math.max(itemCount * rowHeight - container.clientHeight, 0);
+    if (container.scrollTop > maxScrollTop) {
+      container.scrollTop = maxScrollTop;
+      updateMetrics();
+      return;
+    }
+    scheduleMetricsUpdate();
+  }, [itemCount, rowHeight, scheduleMetricsUpdate, updateMetrics]);
+
+  return {
+    containerRef,
+    scrollTop: metrics.scrollTop,
+    viewportHeight: metrics.viewportHeight,
+    onScroll: scheduleMetricsUpdate
+  };
+}
+
+function VirtualizedMaterialList({
+  materials,
+  selectedKey,
+  onSelect,
+  onFocus
+}: {
+  materials: MaterialNode[];
+  selectedKey: string | null;
+  onSelect: (material: MaterialNode) => void;
+  onFocus: (material: MaterialNode) => void;
+}) {
+  const {
+    containerRef,
+    scrollTop,
+    viewportHeight,
+    onScroll
+  } = useVirtualListMetrics(materials.length, PREVIEW_MATERIAL_ROW_HEIGHT);
+
+  const totalHeight = materials.length * PREVIEW_MATERIAL_ROW_HEIGHT;
+  const startIndex = Math.max(
+    Math.floor(scrollTop / PREVIEW_MATERIAL_ROW_HEIGHT) - PREVIEW_MATERIAL_VIRTUAL_OVERSCAN,
+    0
+  );
+  const endIndex = Math.min(
+    Math.ceil((scrollTop + viewportHeight) / PREVIEW_MATERIAL_ROW_HEIGHT) + PREVIEW_MATERIAL_VIRTUAL_OVERSCAN,
+    materials.length
+  );
+  const visibleMaterials = materials.slice(startIndex, endIndex);
+
+  return (
+    <div
+      ref={containerRef}
+      className="preview-material-list preview-material-list-virtual"
+      role="list"
+      aria-label="材质列表"
+      onScroll={onScroll}
+    >
+      <div className="preview-material-list-virtual-spacer" style={{ height: totalHeight }}>
+        <div
+          className="preview-material-list-virtual-window"
+          style={{ transform: `translateY(${startIndex * PREVIEW_MATERIAL_ROW_HEIGHT}px)` }}
+        >
+          {visibleMaterials.map((material) => (
+            <MaterialListRow
+              key={material.key}
+              material={material}
+              selectedKey={selectedKey}
+              onSelect={onSelect}
+              onFocus={onFocus}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LayerTreeView({
   nodes,
-  checkedKeys,
+  checkedSet,
   expandedKeys,
   selectedKey,
+  visibilityStates,
+  virtualized = false,
   onSelect,
   onFocusLayer,
   onToggleExpanded,
   onToggle
 }: {
   nodes: LayerNode[];
-  checkedKeys: string[];
+  checkedSet: Set<string>;
   expandedKeys: string[];
   selectedKey: string | null;
+  visibilityStates: Map<string, LayerVisibilityState>;
+  virtualized?: boolean;
   onSelect: (key: string | null) => void;
   onFocusLayer: (key: string | null) => void;
   onToggleExpanded: (key: string) => void;
   onToggle: (node: LayerNode) => void;
 }) {
-  const checkedSet = new Set(checkedKeys);
-  const expandedSet = new Set(expandedKeys);
+  const expandedSet = useMemo(() => new Set(expandedKeys), [expandedKeys]);
+  const treeRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (virtualized || !selectedKey) {
+      return;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      const tree = treeRef.current;
+      const selectedRow = tree?.querySelector<HTMLElement>('[data-layer-selected="true"]');
+      if (!tree || !selectedRow) {
+        return;
+      }
+      const treeRect = tree.getBoundingClientRect();
+      const rowRect = selectedRow.getBoundingClientRect();
+      const rowTop = rowRect.top - treeRect.top + tree.scrollTop;
+      const rowBottom = rowTop + rowRect.height;
+      const viewTop = tree.scrollTop;
+      const viewBottom = viewTop + tree.clientHeight;
+      if (rowTop < viewTop) {
+        tree.scrollTop = Math.max(rowTop - PREVIEW_LAYER_ROW_HEIGHT, 0);
+        return;
+      }
+      if (rowBottom > viewBottom) {
+        tree.scrollTop = Math.max(rowBottom - tree.clientHeight + PREVIEW_LAYER_ROW_HEIGHT, 0);
+      }
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [expandedKeys, nodes, selectedKey, virtualized]);
+
+  if (virtualized && nodes.length > PREVIEW_LAYER_VIRTUAL_THRESHOLD) {
+    return (
+      <VirtualizedLayerTree
+        nodes={nodes}
+        checkedSet={checkedSet}
+        expandedSet={expandedSet}
+        selectedKey={selectedKey}
+        visibilityStates={visibilityStates}
+        onSelect={onSelect}
+        onFocusLayer={onFocusLayer}
+        onToggleExpanded={onToggleExpanded}
+        onToggle={onToggle}
+      />
+    );
+  }
   return (
-    <div className="preview-layer-tree" role="tree" aria-label="模型图层">
+    <div ref={treeRef} className="preview-layer-tree" role="tree" aria-label="模型图层">
       {nodes.map((node) => (
         <LayerTreeItem
           key={node.key}
@@ -1153,6 +3261,7 @@ function LayerTreeView({
           checkedSet={checkedSet}
           expandedSet={expandedSet}
           selectedKey={selectedKey}
+          visibilityStates={visibilityStates}
           onSelect={onSelect}
           onFocusLayer={onFocusLayer}
           onToggleExpanded={onToggleExpanded}
@@ -1163,12 +3272,106 @@ function LayerTreeView({
   );
 }
 
+function VirtualizedLayerTree({
+  nodes,
+  checkedSet,
+  expandedSet,
+  selectedKey,
+  visibilityStates,
+  onSelect,
+  onFocusLayer,
+  onToggleExpanded,
+  onToggle
+}: {
+  nodes: LayerNode[];
+  checkedSet: Set<string>;
+  expandedSet: Set<string>;
+  selectedKey: string | null;
+  visibilityStates: Map<string, LayerVisibilityState>;
+  onSelect: (key: string | null) => void;
+  onFocusLayer: (key: string | null) => void;
+  onToggleExpanded: (key: string) => void;
+  onToggle: (node: LayerNode) => void;
+}) {
+  const {
+    containerRef,
+    scrollTop,
+    viewportHeight,
+    onScroll
+  } = useVirtualListMetrics(nodes.length, PREVIEW_LAYER_ROW_HEIGHT);
+
+  const totalHeight = nodes.length * PREVIEW_LAYER_ROW_HEIGHT;
+  const startIndex = Math.max(
+    Math.floor(scrollTop / PREVIEW_LAYER_ROW_HEIGHT) - PREVIEW_LAYER_VIRTUAL_OVERSCAN,
+    0
+  );
+  const endIndex = Math.min(
+    Math.ceil((scrollTop + viewportHeight) / PREVIEW_LAYER_ROW_HEIGHT) + PREVIEW_LAYER_VIRTUAL_OVERSCAN,
+    nodes.length
+  );
+  const visibleNodes = nodes.slice(startIndex, endIndex);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !selectedKey) {
+      return;
+    }
+    const selectedIndex = nodes.findIndex((node) => node.key === selectedKey);
+    if (selectedIndex < 0) {
+      return;
+    }
+    const rowTop = selectedIndex * PREVIEW_LAYER_ROW_HEIGHT;
+    const rowBottom = rowTop + PREVIEW_LAYER_ROW_HEIGHT;
+    const viewTop = container.scrollTop;
+    const viewBottom = viewTop + container.clientHeight;
+    if (rowTop >= viewTop && rowBottom <= viewBottom) {
+      return;
+    }
+    const centeredTop = rowTop - Math.max((container.clientHeight - PREVIEW_LAYER_ROW_HEIGHT) / 2, 0);
+    container.scrollTop = Math.max(0, Math.min(centeredTop, totalHeight));
+  }, [containerRef, nodes, selectedKey, totalHeight]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="preview-layer-tree preview-layer-tree-virtual"
+      role="tree"
+      aria-label="模型图层"
+      onScroll={onScroll}
+    >
+      <div className="preview-layer-tree-virtual-spacer" style={{ height: totalHeight }}>
+        <div
+          className="preview-layer-tree-virtual-window"
+          style={{ transform: `translateY(${startIndex * PREVIEW_LAYER_ROW_HEIGHT}px)` }}
+        >
+          {visibleNodes.map((node) => (
+            <LayerTreeItem
+              key={node.key}
+              node={node}
+              depth={0}
+              checkedSet={checkedSet}
+              expandedSet={expandedSet}
+              selectedKey={selectedKey}
+              visibilityStates={visibilityStates}
+              onSelect={onSelect}
+              onFocusLayer={onFocusLayer}
+              onToggleExpanded={onToggleExpanded}
+              onToggle={onToggle}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LayerTreeItem({
   node,
   depth,
   checkedSet,
   expandedSet,
   selectedKey,
+  visibilityStates,
   onSelect,
   onFocusLayer,
   onToggleExpanded,
@@ -1179,24 +3382,30 @@ function LayerTreeItem({
   checkedSet: Set<string>;
   expandedSet: Set<string>;
   selectedKey: string | null;
+  visibilityStates: Map<string, LayerVisibilityState>;
   onSelect: (key: string | null) => void;
   onFocusLayer: (key: string | null) => void;
   onToggleExpanded: (key: string) => void;
   onToggle: (node: LayerNode) => void;
 }) {
-  const visibilityState = getLayerVisibilityState(node, checkedSet);
+  const visibilityState = visibilityStates.get(node.key) || (checkedSet.has(node.key) ? "visible" : "hidden");
   const checked = visibilityState !== "hidden";
   const fullyVisible = visibilityState === "visible";
   const hasChildren = Boolean(node.children?.length);
   const expanded = !hasChildren || expandedSet.has(node.key);
+  const selected = selectedKey === node.key;
+  const selectLayerLabel = selected ? `当前选中：${node.title}，双击聚焦` : `选择 ${node.title}`;
+  const focusLayerLabel = selected ? `定位当前选中图层：${node.title}` : `定位 ${node.title}`;
+  const layerNameTooltip = `${selected ? "当前选中 · " : ""}${node.title} · 双击聚焦`;
   return (
     <div className="preview-layer-branch">
       <div
-        className={`preview-layer-row${selectedKey === node.key ? " is-active" : ""}${visibilityState === "hidden" ? " is-hidden" : ""}${visibilityState === "partial" ? " is-partial" : ""}`}
+        className={`preview-layer-row${selected ? " is-active" : ""}${visibilityState === "hidden" ? " is-hidden" : ""}${visibilityState === "partial" ? " is-partial" : ""}`}
         role="treeitem"
         aria-level={depth + 1}
-        aria-selected={selectedKey === node.key}
+        aria-selected={selected}
         aria-expanded={hasChildren ? expanded : undefined}
+        data-layer-selected={selected ? "true" : undefined}
         style={{ paddingLeft: 4 + depth * 14 }}
       >
         {hasChildren ? (
@@ -1225,19 +3434,27 @@ function LayerTreeItem({
             {visibilityState === "hidden" ? <EyeInvisibleOutlined /> : <EyeOutlined />}
           </button>
         </Tooltip>
-        <button
-          aria-label={`选择 ${node.title}`}
-          className="preview-layer-name-button"
-          disabled={!checked}
-          type="button"
-          onClick={() => onSelect(node.key)}
-        >
-          <NodeIndexOutlined />
-          <span>{node.title}</span>
-        </button>
-        <Tooltip title="定位图层">
+        <Tooltip title={layerNameTooltip}>
           <button
-            aria-label={`定位 ${node.title}`}
+            aria-label={selectLayerLabel}
+            className="preview-layer-name-button"
+            disabled={!checked}
+            title={layerNameTooltip}
+            type="button"
+            onClick={() => onSelect(node.key)}
+            onDoubleClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onFocusLayer(node.key);
+            }}
+          >
+            <NodeIndexOutlined />
+            <span>{node.title}</span>
+          </button>
+        </Tooltip>
+        <Tooltip title={selected ? "定位当前选中图层" : "定位图层"}>
+          <button
+            aria-label={focusLayerLabel}
             className="preview-layer-icon-button"
             disabled={!checked}
             type="button"
@@ -1255,6 +3472,7 @@ function LayerTreeItem({
           checkedSet={checkedSet}
           expandedSet={expandedSet}
           selectedKey={selectedKey}
+          visibilityStates={visibilityStates}
           onSelect={onSelect}
           onFocusLayer={onFocusLayer}
           onToggleExpanded={onToggleExpanded}
@@ -1265,7 +3483,41 @@ function LayerTreeItem({
   );
 }
 
-function ThreeScene({
+type ThreeSceneProps = {
+  url: string;
+  contextTilesUrl?: string;
+  type: string;
+  layerRootTitle?: string;
+  rendererPreference: ThreeRendererPreference;
+  sceneMode: PreviewSceneMode;
+  transform: PreviewTransform;
+  transformMode: TransformMode;
+  selectedLayerKey: string | null;
+  hiddenLayerKeys: string[];
+  placementMode: boolean;
+  viewOptions: PreviewViewOptions;
+  viewCommand: ViewCommandRequest | null;
+  sceneViewState: SceneViewState;
+  onLayerTreeChange: (tree: LayerNode[]) => void;
+  onMaterialListChange: (materials: MaterialNode[]) => void;
+  onSceneInfoChange: (info: SceneInfo) => void;
+  onSceneViewStateChange: (state: SceneViewState) => void;
+  onSelectLayer: (key: string | null) => void;
+  onTransformChange: (transform: PreviewTransform) => void;
+  onPlacementDone: () => void;
+  onPlacementMiss: (message: string) => void;
+  onViewCommandHandled: (result?: ViewCommandHandledResult) => void;
+  onInteractionHintChange: (hint: PreviewInteractionHint | null) => void;
+  onRendererFallback: (message: string) => void;
+};
+
+function areThreeScenePropsEqual(previous: ThreeSceneProps, next: ThreeSceneProps): boolean {
+  const { sceneViewState: _previousSceneViewState, ...previousRest } = previous;
+  const { sceneViewState: _nextSceneViewState, ...nextRest } = next;
+  return arePreviewPropsShallowEqual(previousRest, nextRest);
+}
+
+const ThreeScene = memo(function ThreeScene({
   url,
   contextTilesUrl,
   type,
@@ -1281,37 +3533,17 @@ function ThreeScene({
   viewCommand,
   sceneViewState,
   onLayerTreeChange,
+  onMaterialListChange,
   onSceneInfoChange,
   onSceneViewStateChange,
   onSelectLayer,
   onTransformChange,
   onPlacementDone,
+  onPlacementMiss,
   onViewCommandHandled,
+  onInteractionHintChange,
   onRendererFallback
-}: {
-  url: string;
-  contextTilesUrl?: string;
-  type: string;
-  layerRootTitle?: string;
-  rendererPreference: ThreeRendererPreference;
-  sceneMode: PreviewSceneMode;
-  transform: PreviewTransform;
-  transformMode: TransformMode;
-  selectedLayerKey: string | null;
-  hiddenLayerKeys: string[];
-  placementMode: boolean;
-  viewOptions: PreviewViewOptions;
-  viewCommand: ViewCommand;
-  sceneViewState: SceneViewState;
-  onLayerTreeChange: (tree: LayerNode[]) => void;
-  onSceneInfoChange: (info: SceneInfo) => void;
-  onSceneViewStateChange: (state: SceneViewState) => void;
-  onSelectLayer: (key: string | null) => void;
-  onTransformChange: (transform: PreviewTransform) => void;
-  onPlacementDone: () => void;
-  onViewCommandHandled: () => void;
-  onRendererFallback: (message: string) => void;
-}) {
+}: ThreeSceneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const modelRootRef = useRef<THREE.Object3D | null>(null);
   const transformHandleRef = useRef<THREE.Object3D | null>(null);
@@ -1322,6 +3554,8 @@ function ThreeScene({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<PreviewRenderer | null>(null);
   const objectsByLayerKeyRef = useRef<Map<string, THREE.Object3D>>(new Map());
+  const pickableObjectsRef = useRef<THREE.Object3D[]>([]);
+  const layerVisibilityRevisionRef = useRef(0);
   const ellipsoidContextRef = useRef<EllipsoidContext>(createDefaultEllipsoidContext());
   const applyingTransformRef = useRef(false);
   const latestTransformRef = useRef(transform);
@@ -1331,6 +3565,32 @@ function ThreeScene({
   const latestSelectedLayerKeyRef = useRef(selectedLayerKey);
   const latestSceneViewStateRef = useRef(sceneViewState);
   const latestViewOptionsRef = useRef(viewOptions);
+  const latestHiddenLayerKeysRef = useRef(hiddenLayerKeys);
+  const hiddenLayerKeysSignatureRef = useRef<string | null>(null);
+  const notifySceneRefreshRef = useRef<(options?: { syncCamera?: boolean }) => void>(() => undefined);
+
+  const applyHiddenLayerVisibility = useCallback((keys: string[], options: { force?: boolean } = {}) => {
+    latestHiddenLayerKeysRef.current = keys;
+    const nextSignature = normalizePreviewKeyList(keys).join("\u0000");
+    if (!options.force && hiddenLayerKeysSignatureRef.current === nextSignature) {
+      return false;
+    }
+    hiddenLayerKeysSignatureRef.current = nextSignature;
+    const hidden = new Set(keys);
+    let visibilityChanged = false;
+    objectsByLayerKeyRef.current.forEach((object, key) => {
+      const nextVisible = !hidden.has(key);
+      if (object.visible === nextVisible) {
+        return;
+      }
+      object.visible = nextVisible;
+      visibilityChanged = true;
+    });
+    if (visibilityChanged) {
+      layerVisibilityRevisionRef.current += 1;
+    }
+    return visibilityChanged;
+  }, []);
 
   useEffect(() => {
     latestTransformRef.current = transform;
@@ -1342,18 +3602,33 @@ function ThreeScene({
     if (!camera) return;
     setInitialCamera(camera, sceneMode, ellipsoidContextRef.current);
     globeControlsRef.current?.update(0);
+    notifySceneRefreshRef.current({ syncCamera: true });
   }, [sceneMode]);
 
   useEffect(() => {
     latestPlacementModeRef.current = placementMode;
     const controls = transformControlsRef.current;
     if (controls) {
-      controls.getHelper().visible = !placementMode;
+      controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        placementMode
+      );
     }
+    notifySceneRefreshRef.current();
   }, [placementMode]);
 
   useEffect(() => {
     latestSelectedLayerKeyRef.current = selectedLayerKey;
+    const controls = transformControlsRef.current;
+    if (controls) {
+      controls.getHelper().visible = shouldShowTransformControlHelper(
+        selectedLayerKey,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
+      );
+    }
+    notifySceneRefreshRef.current();
   }, [selectedLayerKey]);
 
   useEffect(() => {
@@ -1362,6 +3637,7 @@ function ThreeScene({
 
   useEffect(() => {
     latestViewOptionsRef.current = viewOptions;
+    notifySceneRefreshRef.current();
   }, [viewOptions]);
 
   useEffect(() => {
@@ -1379,7 +3655,15 @@ function ThreeScene({
       ellipsoidContextRef.current,
       latestTransformModeRef.current
     );
+    if (transformControlsRef.current) {
+      transformControlsRef.current.getHelper().visible = shouldShowTransformControlHelper(
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
+      );
+    }
     applyingTransformRef.current = false;
+    notifySceneRefreshRef.current();
   }, [transform, type]);
 
   useEffect(() => {
@@ -1399,69 +3683,235 @@ function ThreeScene({
         transformMode
       );
     }
+    if (controls) {
+      controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
+      );
+    }
+    notifySceneRefreshRef.current();
   }, [transformMode]);
 
   useEffect(() => {
-    const hidden = new Set(hiddenLayerKeys);
-    objectsByLayerKeyRef.current.forEach((object, key) => {
-      object.visible = !hidden.has(key);
-    });
-  }, [hiddenLayerKeys]);
-
-  useEffect(() => {
-    const object = selectedLayerKey ? objectsByLayerKeyRef.current.get(selectedLayerKey) : modelRootRef.current;
-    if (object && cameraRef.current) {
-      focusObject(
-        object,
-        cameraRef.current,
-        latestSceneModeRef.current,
-        globeControlsRef.current,
-        ellipsoidContextRef.current
+    const visibilityChanged = applyHiddenLayerVisibility(hiddenLayerKeys);
+    if (!visibilityChanged) {
+      return;
+    }
+    const controls = transformControlsRef.current;
+    if (controls) {
+      controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
       );
     }
-  }, [selectedLayerKey]);
+    notifySceneRefreshRef.current();
+  }, [applyHiddenLayerVisibility, hiddenLayerKeys]);
 
   useEffect(() => {
     if (!viewCommand) return;
+    const viewCommandType = viewCommand.type;
     const camera = cameraRef.current;
     const modelRoot = modelRootRef.current;
+    const globeControls = globeControlsRef.current as RuntimeGlobeControls | null;
+    let handledCameraCommand = false;
+    if (viewCommandType === "cancel-interaction") {
+      const cancelledInteraction = globeControls?._cancelInteractionMomentum?.({ clearHint: false }) ?? false;
+      if (!cancelledInteraction) {
+        onInteractionHintChange(null);
+      }
+      if (cancelledInteraction) {
+        notifySceneRefreshRef.current();
+      }
+      onViewCommandHandled({ cancelledInteraction });
+      return;
+    }
     if (camera) {
-      if (viewCommand === "fit" && modelRoot) {
+      globeControls?._cancelInteractionMomentum?.({ clearHint: false });
+      if (viewCommandType === "fit" && modelRoot) {
         focusObject(
           modelRoot,
           camera,
           latestSceneModeRef.current,
-          globeControlsRef.current,
+          globeControls,
           ellipsoidContextRef.current
         );
+        handledCameraCommand = true;
       }
-      if (viewCommand === "reset") {
+      if (viewCommandType === "focus-selected") {
+        const target = selectedLayerKey ? objectsByLayerKeyRef.current.get(selectedLayerKey) : modelRoot;
+        if (target) {
+          focusObject(
+            target,
+            camera,
+            latestSceneModeRef.current,
+            globeControls,
+            ellipsoidContextRef.current
+          );
+          handledCameraCommand = true;
+        }
+      }
+      if (viewCommandType === "reset" || viewCommandType === "earth-default") {
         setInitialCamera(camera, latestSceneModeRef.current, ellipsoidContextRef.current);
-        globeControlsRef.current?.update(0);
+        globeControls?.update(0);
+        handledCameraCommand = true;
       }
     }
+    if (handledCameraCommand) {
+      notifySceneRefreshRef.current({ syncCamera: true });
+    }
     onViewCommandHandled();
-  }, [onViewCommandHandled, viewCommand]);
+  }, [onInteractionHintChange, onViewCommandHandled, selectedLayerKey, viewCommand]);
 
   useEffect(() => {
     let disposed = false;
     let resizeObserver: ResizeObserver | null = null;
     let frameId = 0;
+    let frameTimerId = 0;
+    let animateLoop: (() => void) | null = null;
+    let resizeFrameId = 0;
     let starField: THREE.Points | null = null;
+    let fallbackEarth: THREE.Group | null = null;
     let selectionBox: THREE.Box3Helper | null = null;
+    let selectionBoxSignature = "";
+    let selectionBoxBoundsSignature = "";
+    let lastSelectionBoxTime = 0;
     let renderer: PreviewRenderer | null = null;
     const loadedObjects: LoadedPreviewObject[] = [];
+    const tileEventCleanups: Array<() => void> = [];
     let hasCriticalSceneError = false;
-    let frameCounter = 0;
     let layerSignature = "";
     let statsSignature = "";
+    let cachedStats: { meshes: number; vertices: number } = { meshes: 0, vertices: 0 };
     let framedLoadedTiles = false;
     let statusMessage = "";
     let lastFpsTime = performance.now();
+    let lastRenderTime = 0;
+    let lastSummaryTime = 0;
+    let lastTilesUpdateTime = 0;
+    let sceneVisualDirtyUntil = 0;
+    let tilesVisualDirtyUntil = 0;
+    let pendingDeferredSummary = false;
+    let tilesContentRevision = 0;
+    let summarizedTilesContentRevision = -1;
+    let lastViewStateSyncTime = 0;
+    let pendingDeferredViewStateSync = false;
+    let deferredViewStateSyncReadyAt = 0;
+    let sceneViewStateSignature = "";
+    let visibleLayerIdsCacheSource: Map<string, THREE.Object3D> | null = null;
+    let visibleLayerIdsCacheVisibilityRevision = -1;
+    let visibleLayerIdsCache: string[] = [];
     let fpsFrameCount = 0;
     let currentFps: number | undefined;
+    let fpsLabelVisible = false;
+    let lastFpsInfoEmitTime = 0;
+    let lastFpsInfoValue: number | undefined;
+    let lastFpsInfoPerformanceMode: PreviewPerformanceMode = "normal";
     let renderFailed = false;
+    let globeInteractionQualityUntil = 0;
+    let lowFpsRecoveryUntil = 0;
+    let lastPreviewInteractionMarkTime = 0;
+    let previewDocumentHidden = document.visibilityState === "hidden";
+    let activeRendererPixelRatio = getPreviewPixelRatio();
+    let pendingTransformChange: PreviewTransform | null = null;
+    let pendingTransformChangeTimer = 0;
+    let lastTransformChangeEmitTime = 0;
     const plainBackground = new THREE.Color(0x071422);
+    const cancelScheduledPreviewResize = () => {
+      if (!resizeFrameId) {
+        return;
+      }
+      window.cancelAnimationFrame(resizeFrameId);
+      resizeFrameId = 0;
+    };
+    const cancelScheduledPreviewAnimation = () => {
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+        frameId = 0;
+      }
+      if (frameTimerId) {
+        window.clearTimeout(frameTimerId);
+        frameTimerId = 0;
+      }
+    };
+    const schedulePreviewAnimation = (delayMs = 0) => {
+      if (disposed || !animateLoop) {
+        return;
+      }
+      if (delayMs <= 0) {
+        if (frameTimerId) {
+          window.clearTimeout(frameTimerId);
+          frameTimerId = 0;
+        }
+        if (!frameId) {
+          frameId = window.requestAnimationFrame(animateLoop);
+        }
+        return;
+      }
+      if (frameId || frameTimerId) {
+        return;
+      }
+      frameTimerId = window.setTimeout(() => {
+        frameTimerId = 0;
+        if (!disposed && animateLoop && !frameId) {
+          frameId = window.requestAnimationFrame(animateLoop);
+        }
+      }, delayMs);
+    };
+    const markPreviewInteraction = () => {
+      const now = performance.now();
+      const wasInteractionActive = now < globeInteractionQualityUntil;
+      if (wasInteractionActive && now - lastPreviewInteractionMarkTime < PREVIEW_INTERACTION_MARK_INTERVAL_MS) {
+        return;
+      }
+      lastPreviewInteractionMarkTime = now;
+      globeInteractionQualityUntil = now + GLOBE_INTERACTION_QUALITY_RECOVERY_MS;
+      if (!wasInteractionActive) {
+        fpsFrameCount = 0;
+        lastFpsTime = now;
+        currentFps = undefined;
+      }
+      pendingDeferredViewStateSync = true;
+      deferredViewStateSyncReadyAt = globeInteractionQualityUntil + PREVIEW_DEFERRED_VIEW_STATE_SYNC_DELAY_MS;
+      schedulePreviewAnimation();
+    };
+    const flushPendingTransformChange = () => {
+      if (pendingTransformChangeTimer) {
+        window.clearTimeout(pendingTransformChangeTimer);
+        pendingTransformChangeTimer = 0;
+      }
+      if (!pendingTransformChange || disposed) {
+        return;
+      }
+      const nextTransform = pendingTransformChange;
+      pendingTransformChange = null;
+      lastTransformChangeEmitTime = performance.now();
+      onTransformChange(nextTransform);
+    };
+    const scheduleTransformChange = (nextTransform: PreviewTransform, force = false) => {
+      if (isSamePreviewTransform(latestSceneModeRef.current, latestTransformRef.current, nextTransform)) {
+        if (force && pendingTransformChange) {
+          flushPendingTransformChange();
+        }
+        return;
+      }
+      latestTransformRef.current = nextTransform;
+      pendingTransformChange = nextTransform;
+      if (force) {
+        flushPendingTransformChange();
+        return;
+      }
+      const now = performance.now();
+      const remaining = PREVIEW_TRANSFORM_CHANGE_THROTTLE_MS - (now - lastTransformChangeEmitTime);
+      if (remaining <= 0) {
+        flushPendingTransformChange();
+        return;
+      }
+      if (!pendingTransformChangeTimer) {
+        pendingTransformChangeTimer = window.setTimeout(flushPendingTransformChange, remaining);
+      }
+    };
 
     const container = containerRef.current;
     if (!container) return;
@@ -1484,6 +3934,8 @@ function ThreeScene({
       geospatialEllipsoid: GEOSPATIAL_WGS84,
       group: ellipsoidAnchor
     };
+    fallbackEarth = createFallbackEarth();
+    ellipsoidAnchor.add(fallbackEarth);
 
     const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 120_000_000);
     if (!restoreCameraView(camera, latestSceneViewStateRef.current, ellipsoidContextRef.current)) {
@@ -1496,7 +3948,8 @@ function ThreeScene({
       status: "loading",
       message: "正在初始化渲染器",
       meshes: 0,
-      vertices: 0
+      vertices: 0,
+      performanceMode: "normal"
     });
 
     const run = async () => {
@@ -1507,7 +3960,8 @@ function ThreeScene({
           message: "正在加载模型",
           meshes: 0,
           vertices: 0,
-          fps: currentFps
+          fps: currentFps,
+          performanceMode: "normal"
         });
       });
       renderer = rendererResult.renderer;
@@ -1537,13 +3991,100 @@ function ThreeScene({
       globeControls.setEllipsoid(WGS84_ELLIPSOID, ellipsoidAnchor);
       globeControlsRef.current = globeControls;
       const rendererElement = renderer.domElement;
+      const pointer = new THREE.Vector2();
+      const raycaster = new THREE.Raycaster();
+      let pickableObjectsRevision = 0;
+      let modelHitCache: {
+        x: number;
+        y: number;
+        at: number;
+        modelRoot: THREE.Object3D;
+        pickableObjectsRevision: number;
+        layerVisibilityRevision: number;
+        cameraX: number;
+        cameraY: number;
+        cameraZ: number;
+        cameraQx: number;
+        cameraQy: number;
+        cameraQz: number;
+        cameraQw: number;
+        hit: THREE.Intersection<THREE.Object3D> | null;
+      } | null = null;
+      const setRaycasterFromClientPoint = (clientX: number, clientY: number) => {
+        const rect = rendererElement.getBoundingClientRect();
+        pointer.x = ((clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1;
+        pointer.y = -((clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1;
+        raycaster.setFromCamera(pointer, camera);
+      };
+      const setRaycasterFromEvent = (event: MouseEvent | PointerEvent) => {
+        setRaycasterFromClientPoint(event.clientX, event.clientY);
+      };
+      const getModelHitFromClientPoint = (clientX: number, clientY: number) => {
+        const modelRoot = modelRootRef.current;
+        if (!modelRoot) {
+          return null;
+        }
+        const now = performance.now();
+        if (
+          modelHitCache &&
+          modelHitCache.modelRoot === modelRoot &&
+          modelHitCache.pickableObjectsRevision === pickableObjectsRevision &&
+          modelHitCache.layerVisibilityRevision === layerVisibilityRevisionRef.current &&
+          modelHitCache.cameraX === camera.position.x &&
+          modelHitCache.cameraY === camera.position.y &&
+          modelHitCache.cameraZ === camera.position.z &&
+          modelHitCache.cameraQx === camera.quaternion.x &&
+          modelHitCache.cameraQy === camera.quaternion.y &&
+          modelHitCache.cameraQz === camera.quaternion.z &&
+          modelHitCache.cameraQw === camera.quaternion.w &&
+          now - modelHitCache.at <= PREVIEW_MODEL_HIT_CACHE_MS &&
+          Math.hypot(clientX - modelHitCache.x, clientY - modelHitCache.y) <= 4
+        ) {
+          return modelHitCache.hit && isPickableObject(modelHitCache.hit.object)
+            ? modelHitCache.hit
+            : null;
+        }
+        setRaycasterFromClientPoint(clientX, clientY);
+        const pickableObjects = pickableObjectsRef.current;
+        const intersections = pickableObjects.length
+          ? raycaster.intersectObjects(pickableObjects, false)
+          : raycaster.intersectObject(modelRoot, true);
+        const hit = intersections.find((item) => isPickableObject(item.object)) || null;
+        modelHitCache = {
+          x: clientX,
+          y: clientY,
+          at: now,
+          modelRoot,
+          pickableObjectsRevision,
+          layerVisibilityRevision: layerVisibilityRevisionRef.current,
+          cameraX: camera.position.x,
+          cameraY: camera.position.y,
+          cameraZ: camera.position.z,
+          cameraQx: camera.quaternion.x,
+          cameraQy: camera.quaternion.y,
+          cameraQz: camera.quaternion.z,
+          cameraQw: camera.quaternion.w,
+          hit
+        };
+        return hit;
+      };
+      const getModelHitFromEvent = (event: MouseEvent | PointerEvent) => getModelHitFromClientPoint(
+        event.clientX,
+        event.clientY
+      );
       const detachCesiumLikeInteractions = attachCesiumLikeGlobeInteractions(
         globeControls,
         rendererElement,
         () => latestSceneModeRef.current === "sphere" &&
           !transformControlsRef.current?.dragging &&
           !latestPlacementModeRef.current,
-        (event) => isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
+        (event) => isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement) ||
+          (!isGlobePanModifier(event) && Boolean(getModelHitFromEvent(event))),
+        markPreviewInteraction,
+        (event) => isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement) ||
+          Boolean(getModelHitFromEvent(event)),
+        () => onSelectLayer(null),
+        onInteractionHintChange
       );
 
       const updateNavigationMode = (dragging = false) => {
@@ -1561,36 +4102,129 @@ function ThreeScene({
       scene.add(starField);
       scene.background = null;
 
+      let lastLoadProgressPercent = -1;
+      let lastLoadProgressEmitTime = 0;
       const handleLoadProgress = (percent: number) => {
         if (!renderer) return;
+        const nextPercent = THREE.MathUtils.clamp(Math.round(percent), 0, 100);
+        const now = performance.now();
+        if (nextPercent === lastLoadProgressPercent) {
+          return;
+        }
+        const progressChangedEnough = lastLoadProgressPercent < 0 ||
+          Math.abs(nextPercent - lastLoadProgressPercent) >= PREVIEW_LOAD_PROGRESS_STEP ||
+          nextPercent === 100;
+        const intervalElapsed = now - lastLoadProgressEmitTime >= PREVIEW_LOAD_PROGRESS_INTERVAL_MS;
+        if (!progressChangedEnough && !intervalElapsed) {
+          return;
+        }
+        lastLoadProgressPercent = nextPercent;
+        lastLoadProgressEmitTime = now;
         onSceneInfoChange({
           backend: getRendererBackend(renderer),
           status: "loading",
-          message: `正在加载模型 ${percent}%`,
+          message: `正在加载模型 ${nextPercent}%`,
           meshes: 0,
           vertices: 0,
-          fps: currentFps
+          fps: currentFps,
+          performanceMode: "normal"
         });
+      };
+      const markSceneVisualDirty = () => {
+        if (disposed) {
+          return;
+        }
+        sceneVisualDirtyUntil = performance.now() + PREVIEW_SCENE_VISUAL_DIRTY_MS;
+        schedulePreviewAnimation();
+      };
+      const markTilesVisualDirty = () => {
+        if (disposed) {
+          return;
+        }
+        tilesVisualDirtyUntil = performance.now() + PREVIEW_TILES_VISUAL_DIRTY_MS;
+        schedulePreviewAnimation();
+      };
+      notifySceneRefreshRef.current = (options) => {
+        markSceneVisualDirty();
+        markTilesVisualDirty();
+        if (options?.syncCamera) {
+          lastViewStateSyncTime = performance.now();
+          lastTilesUpdateTime = 0;
+          pendingDeferredViewStateSync = false;
+          deferredViewStateSyncReadyAt = 0;
+          syncSceneViewState();
+        }
+      };
+      const handlePreviewVisibilityChange = () => {
+        previewDocumentHidden = document.visibilityState === "hidden";
+        if (previewDocumentHidden) {
+          return;
+        }
+        const now = performance.now();
+        fpsFrameCount = 0;
+        currentFps = undefined;
+        lowFpsRecoveryUntil = 0;
+        lastFpsTime = now;
+        lastRenderTime = 0;
+        lastTilesUpdateTime = 0;
+        pendingDeferredViewStateSync = true;
+        deferredViewStateSyncReadyAt = now + PREVIEW_DEFERRED_VIEW_STATE_SYNC_DELAY_MS;
+        markSceneVisualDirty();
+        markTilesVisualDirty();
+      };
+      document.addEventListener("visibilitychange", handlePreviewVisibilityChange);
+      const markTilesContentChanged = () => {
+        if (disposed) {
+          return;
+        }
+        markTilesVisualDirty();
+        tilesContentRevision += 1;
+        pendingDeferredSummary = true;
+      };
+      const addTilesEventListener = (
+        tiles: TilesRenderer,
+        type: string,
+        listener: (event: any) => void
+      ) => {
+        tiles.addEventListener(type, listener);
+        tileEventCleanups.push(() => tiles.removeEventListener(type, listener));
+      };
+      const trackTilesContentChanges = (tiles: TilesRenderer) => {
+        addTilesEventListener(tiles, "needs-render", markTilesVisualDirty);
+        addTilesEventListener(tiles, "needs-update", markTilesVisualDirty);
+        addTilesEventListener(tiles, "tiles-load-start", markTilesVisualDirty);
+        addTilesEventListener(tiles, "tiles-load-end", markTilesVisualDirty);
+        addTilesEventListener(tiles, "load-model", markTilesContentChanged);
+        addTilesEventListener(tiles, "dispose-model", markTilesContentChanged);
+        addTilesEventListener(tiles, "tile-visibility-change", markTilesVisualDirty);
+        addTilesEventListener(tiles, "load-error", markTilesVisualDirty);
       };
 
       const watchPhotorealisticGlobe = (loaded: LoadedPreviewObject) => {
         if (!loaded.tiles || !loaded.isPhotorealisticGlobe) return;
         let hasContent = false;
-        loaded.tiles.addEventListener("load-model", () => {
+        addTilesEventListener(loaded.tiles, "load-model", () => {
           hasContent = true;
+          if (fallbackEarth) {
+            fallbackEarth.visible = false;
+          }
         });
-        loaded.tiles.addEventListener("load-error", (event) => {
+        addTilesEventListener(loaded.tiles, "load-error", (event) => {
           if (hasContent || !renderer) return;
+          markTilesVisualDirty();
+          if (fallbackEarth) {
+            fallbackEarth.visible = true;
+          }
           const message = getTilesLoadErrorMessage(event);
           statusMessage = `Cesium ion 真实地球加载失败${message ? `：${message}` : ""}`;
           hasCriticalSceneError = true;
-          const stats = modelRootRef.current ? collectSceneStats(modelRootRef.current) : { meshes: 0, vertices: 0 };
           onSceneInfoChange({
             backend: getRendererBackend(renderer),
             status: "error",
             message: statusMessage,
-            meshes: stats.meshes,
-            vertices: stats.vertices
+            meshes: cachedStats.meshes,
+            vertices: cachedStats.vertices,
+            performanceMode: "normal"
           });
         });
       };
@@ -1600,7 +4234,12 @@ function ThreeScene({
       transformControls.setSpace("local");
       transformControls.setSize(0.85);
       transformControls.addEventListener("dragging-changed", (event) => {
-        updateNavigationMode(Boolean(event.value));
+        const dragging = Boolean(event.value);
+        markPreviewInteraction();
+        updateNavigationMode(dragging);
+        if (!dragging) {
+          flushPendingTransformChange();
+        }
       });
       transformControls.addEventListener("objectChange", () => {
         const modelRoot = modelRootRef.current;
@@ -1616,15 +4255,22 @@ function ThreeScene({
         );
         if (controlledObject !== modelRoot) {
           applyingTransformRef.current = true;
-          applyTransformToObject(modelRoot, nextTransform, type, latestSceneModeRef.current, ellipsoidContextRef.current);
-          applyingTransformRef.current = false;
+          try {
+            applyTransformToObject(modelRoot, nextTransform, type, latestSceneModeRef.current, ellipsoidContextRef.current);
+          } finally {
+            applyingTransformRef.current = false;
+          }
         }
-        onTransformChange(nextTransform);
+        scheduleTransformChange(nextTransform, !transformControls.dragging);
       });
       transformControlsRef.current = transformControls;
       const transformControlsHelper = transformControls.getHelper();
       removeTransformControlHelperLines(transformControlsHelper);
-      transformControlsHelper.visible = !latestPlacementModeRef.current;
+      transformControlsHelper.visible = shouldShowTransformControlHelper(
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
+      );
       scene.add(transformControlsHelper);
 
       try {
@@ -1642,6 +4288,7 @@ function ThreeScene({
             if (contextTiles.tiles) {
               registerTilesRenderer(contextTiles.tiles, camera, renderer, container);
               tilesRef.current.push(contextTiles.tiles);
+              trackTilesContentChanges(contextTiles.tiles);
               ellipsoidContextRef.current = setEllipsoidContextFromTiles(contextTiles.tiles, globeControls, ellipsoidAnchor);
               if (contextTiles.isPhotorealisticGlobe) {
                 watchPhotorealisticGlobe(contextTiles);
@@ -1668,6 +4315,7 @@ function ThreeScene({
           sceneContentRoot.add(modelRoot);
           registerTilesRenderer(loaded.tiles, camera, renderer, container);
           tilesRef.current.push(loaded.tiles);
+          trackTilesContentChanges(loaded.tiles);
           if (!contextTilesUrl) {
             ellipsoidContextRef.current = setEllipsoidContextFromTiles(loaded.tiles, globeControls, ellipsoidAnchor);
           }
@@ -1707,7 +4355,11 @@ function ThreeScene({
             ellipsoidContextRef.current,
             latestTransformModeRef.current
           );
-          transformControls.getHelper().visible = !latestPlacementModeRef.current;
+          transformControls.getHelper().visible = shouldShowTransformControlHelper(
+            latestSelectedLayerKeyRef.current,
+            objectsByLayerKeyRef.current,
+            latestPlacementModeRef.current
+          );
           if (!restoreCameraView(camera, latestSceneViewStateRef.current, ellipsoidContextRef.current)) {
             setInitialCamera(camera, latestSceneModeRef.current, ellipsoidContextRef.current);
           }
@@ -1722,6 +4374,8 @@ function ThreeScene({
           statusMessage = contextWarning;
         }
         refreshSceneSummary(true);
+        markSceneVisualDirty();
+        markTilesVisualDirty();
 
       } catch (error) {
         onSceneInfoChange({
@@ -1729,17 +4383,170 @@ function ThreeScene({
           status: "error",
           message: error instanceof Error ? error.message : "模型加载失败",
           meshes: 0,
-          vertices: 0
+          vertices: 0,
+          performanceMode: "normal"
         });
       }
 
-      const pointer = new THREE.Vector2();
-      const raycaster = new THREE.Raycaster();
       let canvasPointerIntent: CanvasPointerIntent | null = null;
+      let pendingCanvasPickFrame = 0;
+      let pendingCanvasPickRequest: CanvasPickRequest | null = null;
+      let pendingCanvasHoverFrame = 0;
+      let pendingCanvasHoverRequest: CanvasHoverRequest | null = null;
+      let lastCanvasHoverPickTime = 0;
+      let lastCanvasHoverPickX = Number.NaN;
+      let lastCanvasHoverPickY = Number.NaN;
+      let canvasHoverCursorActive = false;
+
+      const clearCanvasHoverCursor = () => {
+        if (!pendingCanvasHoverRequest && !pendingCanvasHoverFrame && !canvasHoverCursorActive) {
+          return;
+        }
+        pendingCanvasHoverRequest = null;
+        if (pendingCanvasHoverFrame) {
+          window.cancelAnimationFrame(pendingCanvasHoverFrame);
+          pendingCanvasHoverFrame = 0;
+        }
+        if (canvasHoverCursorActive && renderer?.domElement.style.cursor === "pointer") {
+          renderer.domElement.style.cursor = "";
+        }
+        canvasHoverCursorActive = false;
+      };
+
+      const setCanvasHoverCursor = (active: boolean) => {
+        if (!renderer) return;
+        if (active) {
+          if (canvasHoverCursorActive && renderer.domElement.style.cursor === "pointer") {
+            return;
+          }
+          if (renderer.domElement.style.cursor !== "pointer") {
+            renderer.domElement.style.cursor = "pointer";
+          }
+          canvasHoverCursorActive = true;
+          return;
+        }
+        clearCanvasHoverCursor();
+      };
+
+      const cancelPendingCanvasPick = () => {
+        if (pendingCanvasPickFrame) {
+          window.cancelAnimationFrame(pendingCanvasPickFrame);
+          pendingCanvasPickFrame = 0;
+        }
+        pendingCanvasPickRequest = null;
+      };
+
+      const scheduleCanvasPick = (clientX: number, clientY: number) => {
+        const modelRoot = modelRootRef.current;
+        if (!modelRoot) {
+          return;
+        }
+        cancelPendingCanvasPick();
+        pendingCanvasPickRequest = {
+          clientX,
+          clientY,
+          modelRoot
+        };
+        pendingCanvasPickFrame = window.requestAnimationFrame(() => {
+          pendingCanvasPickFrame = 0;
+          const request = pendingCanvasPickRequest;
+          pendingCanvasPickRequest = null;
+          if (
+            !request ||
+            disposed ||
+            !renderer ||
+            transformControls.dragging ||
+            latestPlacementModeRef.current ||
+            modelRootRef.current !== request.modelRoot
+          ) {
+            return;
+          }
+          const hit = getModelHitFromClientPoint(request.clientX, request.clientY);
+          if (hit) {
+            const key = findLayerKeyForObject(hit.object);
+            onSelectLayer(key);
+          } else {
+            onSelectLayer(null);
+          }
+        });
+      };
+
+      const shouldThrottleCanvasHoverPick = (clientX: number, clientY: number, now: number) => {
+        const movedEnough = !Number.isFinite(lastCanvasHoverPickX) ||
+          Math.hypot(clientX - lastCanvasHoverPickX, clientY - lastCanvasHoverPickY) >= PREVIEW_HOVER_PICK_MOVE_THRESHOLD_PX;
+        return !movedEnough && now - lastCanvasHoverPickTime < PREVIEW_HOVER_PICK_INTERVAL_MS;
+      };
+
+      const scheduleCanvasHoverPick = (event: PointerEvent) => {
+        if (
+          !renderer ||
+          !modelRootRef.current ||
+          event.buttons ||
+          transformControls.dragging ||
+          latestPlacementModeRef.current ||
+          isGlobePanModifier(event) ||
+          performance.now() < lowFpsRecoveryUntil
+        ) {
+          clearCanvasHoverCursor();
+          return;
+        }
+        const now = performance.now();
+        if (shouldThrottleCanvasHoverPick(event.clientX, event.clientY, now) && !pendingCanvasHoverFrame) {
+          return;
+        }
+        pendingCanvasHoverRequest = {
+          clientX: event.clientX,
+          clientY: event.clientY,
+          shiftKey: event.shiftKey,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey
+        };
+        if (pendingCanvasHoverFrame) {
+          return;
+        }
+        pendingCanvasHoverFrame = window.requestAnimationFrame(() => {
+          pendingCanvasHoverFrame = 0;
+          const request = pendingCanvasHoverRequest;
+          pendingCanvasHoverRequest = null;
+          if (
+            !request ||
+            disposed ||
+            !renderer ||
+            !modelRootRef.current ||
+            transformControls.dragging ||
+            latestPlacementModeRef.current ||
+            isGlobePanModifier(request) ||
+            performance.now() < lowFpsRecoveryUntil
+          ) {
+            clearCanvasHoverCursor();
+            return;
+          }
+          const now = performance.now();
+          if (shouldThrottleCanvasHoverPick(request.clientX, request.clientY, now)) {
+            return;
+          }
+          lastCanvasHoverPickTime = now;
+          lastCanvasHoverPickX = request.clientX;
+          lastCanvasHoverPickY = request.clientY;
+          if (isTransformControlPointerHit(request, transformControlsRef.current, camera, rendererElement)) {
+            clearCanvasHoverCursor();
+            return;
+          }
+          setCanvasHoverCursor(Boolean(getModelHitFromClientPoint(request.clientX, request.clientY)));
+        });
+      };
 
       const handlePointerDown = (event: PointerEvent) => {
+        cancelPendingCanvasPick();
+        clearCanvasHoverCursor();
         canvasPointerIntent = null;
-        if (!renderer || !modelRootRef.current || transformControls.dragging || event.button !== 0) {
+        if (
+          !renderer ||
+          !modelRootRef.current ||
+          transformControls.dragging ||
+          event.button !== 0 ||
+          isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
+        ) {
           return;
         }
         canvasPointerIntent = {
@@ -1750,27 +4557,34 @@ function ThreeScene({
       };
 
       const handlePointerCancel = (event: PointerEvent) => {
+        cancelPendingCanvasPick();
+        clearCanvasHoverCursor();
         if (canvasPointerIntent?.id === event.pointerId) {
           canvasPointerIntent = null;
         }
       };
 
       const handlePointerUp = (event: PointerEvent) => {
-        if (!renderer || !modelRootRef.current || transformControls.dragging || event.button !== 0) {
+        if (
+          !renderer ||
+          !modelRootRef.current ||
+          transformControls.dragging ||
+          event.button !== 0 ||
+          isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
+        ) {
+          cancelPendingCanvasPick();
           canvasPointerIntent = null;
           return;
         }
         if (!canvasPointerIntent || canvasPointerIntent.id !== event.pointerId || hasPointerMoved(canvasPointerIntent, event)) {
+          cancelPendingCanvasPick();
           canvasPointerIntent = null;
           return;
         }
         canvasPointerIntent = null;
-        const rect = renderer.domElement.getBoundingClientRect();
-        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-        raycaster.setFromCamera(pointer, camera);
 
         if (latestPlacementModeRef.current) {
+          setRaycasterFromEvent(event);
           const placement = getSurfacePlacement(
             raycaster,
             latestSceneModeRef.current,
@@ -1788,45 +4602,140 @@ function ThreeScene({
               geo: scenePositionToGeo(placement.point.toArray(), latestSceneModeRef.current, ellipsoidContextRef.current)
             });
             onPlacementDone();
+          } else {
+            onPlacementMiss("未命中地球表面，请点击可见地表区域");
           }
           return;
         }
 
-        const intersections = raycaster.intersectObject(modelRootRef.current, true);
-        const hit = intersections.find((item) => isPickableObject(item.object));
-        if (hit) {
-          const key = findLayerKeyForObject(hit.object);
-          onSelectLayer(key);
+        scheduleCanvasPick(event.clientX, event.clientY);
+      };
+      const handleCanvasDoubleClick = (event: MouseEvent) => {
+        if (
+          !renderer ||
+          transformControls.dragging ||
+          latestPlacementModeRef.current ||
+          event.button !== 0 ||
+          isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
+        ) {
+          return;
+        }
+        cancelPendingCanvasPick();
+        const hit = getModelHitFromEvent(event);
+        if (!hit) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        markPreviewInteraction();
+        const key = findLayerKeyForObject(hit.object);
+        onSelectLayer(key);
+        const focusTarget = key ? objectsByLayerKeyRef.current.get(key) || hit.object : hit.object;
+        focusObject(
+          focusTarget,
+          camera,
+          latestSceneModeRef.current,
+          globeControls,
+          ellipsoidContextRef.current
+        );
+      };
+      const handlePreviewPointerMove = (event: PointerEvent) => {
+        if (event.buttons) {
+          cancelPendingCanvasPick();
+          clearCanvasHoverCursor();
+          markPreviewInteraction();
+          return;
+        }
+        scheduleCanvasHoverPick(event);
+      };
+      const handlePreviewPointerLeave = (event: PointerEvent) => {
+        clearCanvasHoverCursor();
+        if (event.buttons) {
+          cancelPendingCanvasPick();
+          canvasPointerIntent = null;
         }
       };
+      const handlePreviewWheel = (event: WheelEvent) => {
+        if (!hasNonZeroWheelDelta(event)) {
+          return;
+        }
+        cancelPendingCanvasPick();
+        clearCanvasHoverCursor();
+        markPreviewInteraction();
+      };
       renderer.domElement.addEventListener("pointerdown", handlePointerDown);
+      renderer.domElement.addEventListener("pointermove", handlePreviewPointerMove, { passive: true });
+      renderer.domElement.addEventListener("pointerleave", handlePreviewPointerLeave);
       renderer.domElement.addEventListener("pointerup", handlePointerUp);
       renderer.domElement.addEventListener("pointercancel", handlePointerCancel);
+      renderer.domElement.addEventListener("dblclick", handleCanvasDoubleClick);
+      renderer.domElement.addEventListener("wheel", handlePreviewWheel, { passive: true });
 
-      resizeObserver = new ResizeObserver(() => {
-        if (!renderer) return;
-        resizeRenderer(container, renderer, camera);
-        tilesRef.current.forEach((tiles) => tiles.setResolution(camera, container.clientWidth, container.clientHeight));
-      });
+      const runPreviewResize = () => {
+        if (!renderer || disposed) return;
+        const activeRenderer = renderer;
+        resizeRenderer(container, activeRenderer, camera);
+        tilesRef.current.forEach((tiles) => setTilesPreviewResolution(tiles, camera, activeRenderer, container, "normal", true));
+        markTilesVisualDirty();
+      };
+      const schedulePreviewResize = () => {
+        if (resizeFrameId) {
+          return;
+        }
+        resizeFrameId = window.requestAnimationFrame(() => {
+          resizeFrameId = 0;
+          runPreviewResize();
+        });
+      };
+      resizeObserver = new ResizeObserver(schedulePreviewResize);
       resizeObserver.observe(container);
-      resizeRenderer(container, renderer, camera);
+      runPreviewResize();
 
       function refreshSceneSummary(force = false) {
         const modelRoot = modelRootRef.current;
         if (!modelRoot || !renderer) return;
 
-        const nextLayerSignature = collectLayerSignature(modelRoot);
+        const isDynamicTilesScene = type === "3dtiles";
+        const nextLayerSignature = collectLayerSignature(
+          modelRoot,
+          isDynamicTilesScene ? PREVIEW_DYNAMIC_LAYER_SIGNATURE_LIMIT : 800
+        );
         if (force || nextLayerSignature !== layerSignature) {
           layerSignature = nextLayerSignature;
           const layerResult = buildLayerTree(modelRoot, {
-            rootTitle: type === "3dtiles" ? layerRootTitle || "tileset.json" : undefined,
-            shallow: type === "3dtiles"
+            rootTitle: isDynamicTilesScene ? layerRootTitle || "tileset.json" : undefined,
+            shallow: isDynamicTilesScene
           });
           objectsByLayerKeyRef.current = layerResult.objectsByKey;
+          pickableObjectsRef.current = collectPickableObjects(
+            modelRoot,
+            isDynamicTilesScene ? layerResult.tree[0]?.key || null : null,
+            {
+              maxObjects: isDynamicTilesScene ? PREVIEW_DYNAMIC_PICKABLE_SCAN_LIMIT : Number.POSITIVE_INFINITY,
+              maxPickableObjects: isDynamicTilesScene ? PREVIEW_DYNAMIC_PICKABLE_OBJECT_LIMIT : Number.POSITIVE_INFINITY
+            }
+          );
+          pickableObjectsRevision += 1;
+          modelHitCache = null;
+          applyHiddenLayerVisibility(latestHiddenLayerKeysRef.current, { force: true });
           onLayerTreeChange(layerResult.tree);
+          onMaterialListChange(collectMaterialList(
+            modelRoot,
+            isDynamicTilesScene ? PREVIEW_DYNAMIC_MATERIAL_SCAN_LIMIT : Number.POSITIVE_INFINITY
+          ));
+          transformControls.getHelper().visible = shouldShowTransformControlHelper(
+            latestSelectedLayerKeyRef.current,
+            objectsByLayerKeyRef.current,
+            latestPlacementModeRef.current
+          );
         }
 
-        const stats = collectSceneStats(modelRoot);
+        const stats = collectSceneStats(
+          modelRoot,
+          isDynamicTilesScene ? PREVIEW_DYNAMIC_STATS_SCAN_LIMIT : Number.POSITIVE_INFINITY
+        );
+        cachedStats = stats;
         const nextStatsSignature = `${stats.meshes}:${stats.vertices}`;
         if (force || nextStatsSignature !== statsSignature) {
           statsSignature = nextStatsSignature;
@@ -1840,82 +4749,348 @@ function ThreeScene({
             message: hasCriticalSceneError ? statusMessage : "",
             meshes: stats.meshes,
             vertices: stats.vertices,
-            fps: currentFps
+            fps: currentFps,
+            performanceMode: "normal"
           });
         }
+        summarizedTilesContentRevision = tilesContentRevision;
+        pendingDeferredSummary = false;
       }
 
       function syncSceneViewState() {
-        const visibleLayerIds = [...objectsByLayerKeyRef.current.entries()]
-          .filter(([, object]) => object.visible)
-          .map(([key]) => key);
-        onSceneViewStateChange({
+        const objectsByLayerKey = objectsByLayerKeyRef.current;
+        const visibilityRevision = layerVisibilityRevisionRef.current;
+        if (
+          visibleLayerIdsCacheSource !== objectsByLayerKey ||
+          visibleLayerIdsCacheVisibilityRevision !== visibilityRevision
+        ) {
+          visibleLayerIdsCacheSource = objectsByLayerKey;
+          visibleLayerIdsCacheVisibilityRevision = visibilityRevision;
+          visibleLayerIdsCache = [];
+          objectsByLayerKey.forEach((object, key) => {
+            if (object.visible) {
+              visibleLayerIdsCache.push(key);
+            }
+          });
+        }
+        const nextState: SceneViewState = {
           camera: readCameraView(camera, globeControls),
           selectedObjectId: latestSelectedLayerKeyRef.current || undefined,
-          visibleLayerIds
-        });
+          visibleLayerIds: visibleLayerIdsCache
+        };
+        const nextSignature = getSceneViewStateSignature(nextState);
+        if (nextSignature === sceneViewStateSignature) {
+          return;
+        }
+        sceneViewStateSignature = nextSignature;
+        latestSceneViewStateRef.current = nextState;
+        onSceneViewStateChange(nextState);
+      }
+
+      function clearSelectionBox() {
+        if (!selectionBox) return;
+        scene.remove(selectionBox);
+        selectionBox.geometry.dispose();
+        if (Array.isArray(selectionBox.material)) {
+          selectionBox.material.forEach(disposeMaterial);
+        } else {
+          disposeMaterial(selectionBox.material);
+        }
+        selectionBox = null;
+        selectionBoxBoundsSignature = "";
+      }
+
+      function updateSelectionBox(selected: THREE.Object3D | null, signature: string, force = false) {
+        if (!signature || !selected || !isObjectVisibleInHierarchy(selected)) {
+          if (selectionBox || selectionBoxSignature) {
+            clearSelectionBox();
+            selectionBoxSignature = "";
+            return true;
+          }
+          return false;
+        }
+
+        const selectedBox = getVisibleObjectBox(selected);
+        if (!selectedBox) {
+          if (selectionBox) {
+            clearSelectionBox();
+            selectionBoxSignature = signature;
+            return true;
+          }
+          selectionBoxSignature = signature;
+          return false;
+        }
+
+        const nextBoundsSignature = getBox3Signature(selectedBox);
+        if (
+          !force &&
+          selectionBox &&
+          selectionBoxSignature === signature &&
+          selectionBoxBoundsSignature === nextBoundsSignature
+        ) {
+          return false;
+        }
+
+        if (!selectionBox || selectionBoxSignature !== signature) {
+          clearSelectionBox();
+          selectionBox = new THREE.Box3Helper(selectedBox.clone(), 0x5fd3ff);
+          scene.add(selectionBox);
+        } else {
+          selectionBox.box.copy(selectedBox);
+          selectionBox.updateMatrixWorld(true);
+        }
+        selectionBoxSignature = signature;
+        selectionBoxBoundsSignature = nextBoundsSignature;
+        return true;
       }
 
       const animate = () => {
-        if (!renderer) return;
-        frameCounter += 1;
-        fpsFrameCount += 1;
+        frameId = 0;
+        if (!renderer || disposed) return;
+        const activeRenderer = renderer;
         const now = performance.now();
-        if (now - lastFpsTime >= 1000) {
-          currentFps = (fpsFrameCount * 1000) / (now - lastFpsTime);
-          fpsFrameCount = 0;
-          lastFpsTime = now;
-          if (renderer) {
-            const stats = modelRootRef.current ? collectSceneStats(modelRootRef.current) : { meshes: 0, vertices: 0 };
+        if (previewDocumentHidden) {
+          if (fpsLabelVisible && renderer) {
+            fpsLabelVisible = false;
+            lastFpsInfoEmitTime = now;
+            lastFpsInfoValue = undefined;
+            lastFpsInfoPerformanceMode = "normal";
             onSceneInfoChange({
               backend: getRendererBackend(renderer),
               status: hasCriticalSceneError ? "error" : modelRootRef.current ? "ready" : "loading",
               message: hasCriticalSceneError || !modelRootRef.current ? statusMessage : "",
-              meshes: stats.meshes,
-              vertices: stats.vertices,
-              fps: currentFps
+              meshes: cachedStats.meshes,
+              vertices: cachedStats.vertices,
+              fps: 0,
+              performanceMode: "normal"
             });
           }
+          fpsFrameCount = 0;
+          lastFpsTime = now;
+          lastRenderTime = now;
+          schedulePreviewAnimation(PREVIEW_BACKGROUND_RENDER_INTERVAL_MS);
+          return;
+        }
+        const interactionActive = now < globeInteractionQualityUntil || transformControls.dragging;
+        const tilesRenderBurstActive = now < tilesVisualDirtyUntil;
+        let lowFpsActive = now < lowFpsRecoveryUntil;
+        const shouldDisplayLiveFps = interactionActive || !modelRootRef.current;
+        if (!shouldDisplayLiveFps && fpsLabelVisible && renderer) {
+          fpsLabelVisible = false;
+          lastFpsInfoEmitTime = now;
+          lastFpsInfoValue = undefined;
+          lastFpsInfoPerformanceMode = lowFpsActive ? "adaptive" : "normal";
+          onSceneInfoChange({
+            backend: getRendererBackend(renderer),
+            status: hasCriticalSceneError ? "error" : modelRootRef.current ? "ready" : "loading",
+            message: hasCriticalSceneError || !modelRootRef.current ? statusMessage : "",
+            meshes: cachedStats.meshes,
+            vertices: cachedStats.vertices,
+            fps: 0,
+            performanceMode: lowFpsActive ? "adaptive" : "normal"
+          });
+        }
+        if (now - lastFpsTime >= 1000) {
+          currentFps = (fpsFrameCount * 1000) / (now - lastFpsTime);
+          fpsFrameCount = 0;
+          lastFpsTime = now;
+          if (interactionActive || tilesRenderBurstActive) {
+            if (currentFps < PREVIEW_LOW_FPS_THRESHOLD) {
+              lowFpsRecoveryUntil = now + PREVIEW_LOW_FPS_RECOVERY_MS;
+            } else if (currentFps < PREVIEW_LOW_FPS_RECOVER_THRESHOLD && now < lowFpsRecoveryUntil) {
+              lowFpsRecoveryUntil = Math.max(lowFpsRecoveryUntil, now + PREVIEW_LOW_FPS_RECOVERY_MS / 2);
+            } else if (currentFps >= PREVIEW_LOW_FPS_RECOVER_THRESHOLD && now > lowFpsRecoveryUntil) {
+              lowFpsRecoveryUntil = 0;
+            }
+          } else if (now > lowFpsRecoveryUntil) {
+            lowFpsRecoveryUntil = 0;
+          }
+          lowFpsActive = now < lowFpsRecoveryUntil;
+          if (renderer) {
+            const shouldDisplayFps = interactionActive || !modelRootRef.current;
+            const nextFpsLabelVisible = shouldDisplayFps && typeof currentFps === "number" && currentFps > 0;
+            const nextFpsValue = nextFpsLabelVisible ? normalizePreviewFps(currentFps) : undefined;
+            const nextPerformanceMode: PreviewPerformanceMode = lowFpsActive ? "adaptive" : "normal";
+            const shouldThrottleFpsInfo =
+              fpsLabelVisible &&
+              nextFpsLabelVisible &&
+              lastFpsInfoPerformanceMode === nextPerformanceMode &&
+              typeof nextFpsValue === "number" &&
+              typeof lastFpsInfoValue === "number" &&
+              now - lastFpsInfoEmitTime < PREVIEW_LOW_FPS_INFO_INTERVAL_MS &&
+              Math.abs(nextFpsValue - lastFpsInfoValue) < PREVIEW_FPS_SIGNIFICANT_CHANGE;
+            if (!shouldThrottleFpsInfo) {
+              fpsLabelVisible = nextFpsLabelVisible;
+              lastFpsInfoEmitTime = now;
+              lastFpsInfoValue = nextFpsValue;
+              lastFpsInfoPerformanceMode = nextPerformanceMode;
+              onSceneInfoChange({
+                backend: getRendererBackend(renderer),
+                status: hasCriticalSceneError ? "error" : modelRootRef.current ? "ready" : "loading",
+                message: hasCriticalSceneError || !modelRootRef.current ? statusMessage : "",
+                meshes: cachedStats.meshes,
+                vertices: cachedStats.vertices,
+                fps: nextFpsLabelVisible ? currentFps : 0,
+                performanceMode: nextPerformanceMode
+              });
+            }
+          }
+        }
+        let sceneVisualDirty = false;
+        const hasDynamicTiles = tilesRef.current.length > 0;
+        const targetPixelRatio = getPreviewPixelRatio(
+          interactionActive ? "interactive" : lowFpsActive ? "low-fps" : "normal"
+        );
+        if (Math.abs(targetPixelRatio - activeRendererPixelRatio) > 0.01) {
+          activeRendererPixelRatio = targetPixelRatio;
+          activeRenderer.setPixelRatio(activeRendererPixelRatio);
+          resizeRenderer(container, activeRenderer, camera);
+          sceneVisualDirty = true;
+        }
+        const sceneRefreshDirty = now < sceneVisualDirtyUntil;
+        const runtimeGlobeControls = globeControls as RuntimeGlobeControls;
+        const globeControlsPending = Boolean(
+          runtimeGlobeControls.needsUpdate ||
+          runtimeGlobeControls._inertiaNeedsUpdate?.()
+        );
+        const viewStateSyncReady = pendingDeferredViewStateSync &&
+          !lowFpsActive &&
+          now >= deferredViewStateSyncReadyAt;
+        const canSkipStaticIdleWork = Boolean(
+          modelRootRef.current &&
+          !hasDynamicTiles &&
+          !interactionActive &&
+          !lowFpsActive &&
+          !sceneVisualDirty &&
+          !sceneRefreshDirty &&
+          !globeControlsPending &&
+          !viewStateSyncReady
+        );
+        if (canSkipStaticIdleWork) {
+          schedulePreviewAnimation(PREVIEW_IDLE_RENDER_INTERVAL_MS);
+          return;
         }
         updateNavigationMode(transformControls.dragging);
         globeControls.update();
         applyCloseZoomCameraClipping(camera, ellipsoidContextRef.current);
         if (starField) starField.visible = latestViewOptionsRef.current.stars;
         scene.background = latestViewOptionsRef.current.stars ? null : plainBackground;
-        modelRootRef.current?.updateMatrixWorld(true);
         tilesRef.current.forEach((tiles) => {
           if (tiles.group.name === "上下文 3D Tiles") {
             tiles.group.visible = true;
           }
         });
-        tilesRef.current.forEach((tiles) => {
-          tiles.setCamera(camera);
-          tiles.setResolution(camera, container.clientWidth, container.clientHeight);
-          tiles.update();
-        });
-        if (frameCounter % 30 === 0) {
-          refreshSceneSummary();
-          syncSceneViewState();
+        const tilesUpdateInterval = lowFpsActive
+          ? PREVIEW_LOW_FPS_TILES_UPDATE_INTERVAL_MS
+          : PREVIEW_IDLE_RENDER_INTERVAL_MS;
+        const shouldUpdateTiles = hasDynamicTiles && (
+          interactionActive ||
+          now - lastTilesUpdateTime >= tilesUpdateInterval
+        );
+        if (shouldUpdateTiles) {
+          lastTilesUpdateTime = now;
+          const tilesQuality: PreviewTilesQuality = interactionActive ? "interactive" : lowFpsActive ? "balanced" : "normal";
+          tilesRef.current.forEach((tiles) => {
+            ensureTilesCamera(tiles, camera);
+            if (setTilesPreviewResolution(tiles, camera, activeRenderer, container, tilesQuality)) {
+              sceneVisualDirty = true;
+            }
+            tiles.update();
+          });
         }
-        if (selectionBox) {
-          scene.remove(selectionBox);
-          selectionBox.geometry.dispose();
-          if (Array.isArray(selectionBox.material)) {
-            selectionBox.material.forEach(disposeMaterial);
+        const tilesVisualDirty = hasDynamicTiles && now < tilesVisualDirtyUntil;
+        const tilesSummaryDirty = hasDynamicTiles && tilesContentRevision !== summarizedTilesContentRevision;
+        if (tilesSummaryDirty && now - lastSummaryTime >= PREVIEW_DYNAMIC_SUMMARY_INTERVAL_MS) {
+          if (interactionActive || lowFpsActive) {
+            pendingDeferredSummary = true;
+            lastSummaryTime = now;
           } else {
-            disposeMaterial(selectionBox.material);
+            lastSummaryTime = now;
+            refreshSceneSummary();
           }
-          selectionBox = null;
+        }
+        if (
+          tilesSummaryDirty &&
+          pendingDeferredSummary &&
+          !interactionActive &&
+          !lowFpsActive &&
+          now - lastSummaryTime >= PREVIEW_DEFERRED_SUMMARY_DELAY_MS
+        ) {
+          pendingDeferredSummary = false;
+          lastSummaryTime = now;
+          refreshSceneSummary();
+        }
+        if (now - lastViewStateSyncTime >= PREVIEW_VIEW_STATE_SYNC_INTERVAL_MS) {
+          lastViewStateSyncTime = now;
+          if (interactionActive || lowFpsActive) {
+            pendingDeferredViewStateSync = true;
+            deferredViewStateSyncReadyAt = Math.max(
+              deferredViewStateSyncReadyAt,
+              now + PREVIEW_DEFERRED_VIEW_STATE_SYNC_DELAY_MS
+            );
+          } else {
+            pendingDeferredViewStateSync = false;
+            deferredViewStateSyncReadyAt = 0;
+            syncSceneViewState();
+          }
+        } else if (
+          pendingDeferredViewStateSync &&
+          !interactionActive &&
+          !lowFpsActive &&
+          now >= deferredViewStateSyncReadyAt
+        ) {
+          pendingDeferredViewStateSync = false;
+          deferredViewStateSyncReadyAt = 0;
+          lastViewStateSyncTime = now;
+          syncSceneViewState();
         }
         const latestSelectedLayerKey = latestSelectedLayerKeyRef.current;
         const selected = latestSelectedLayerKey ? objectsByLayerKeyRef.current.get(latestSelectedLayerKey) : null;
+        let selectedVisible = false;
         if (selected?.visible) {
-          const selectedBox = getVisibleObjectBox(selected);
-          if (selectedBox) {
-            selectionBox = new THREE.Box3Helper(selectedBox, 0x5fd3ff);
-            scene.add(selectionBox);
-          }
+          selectedVisible = isObjectVisibleInHierarchy(selected);
         }
+        const selectedSignature = selectedVisible && selected
+          ? [
+            latestSelectedLayerKey,
+            latestTransformRef.current.position.join(","),
+            latestTransformRef.current.rotation.join(","),
+            latestTransformRef.current.scale.join(","),
+            latestTransformRef.current.geo
+              ? `${latestTransformRef.current.geo.longitude},${latestTransformRef.current.geo.latitude},${latestTransformRef.current.geo.height}`
+              : ""
+          ].join("|")
+          : "";
+        if (selectedSignature !== selectionBoxSignature) {
+          lastSelectionBoxTime = now;
+          sceneVisualDirty = updateSelectionBox(selectedVisible ? selected || null : null, selectedSignature, true) || sceneVisualDirty;
+        } else if (
+          selectionBox &&
+          selected &&
+          isObjectInTilesRendererHierarchy(selected) &&
+          now - lastSelectionBoxTime >= 1000
+        ) {
+          lastSelectionBoxTime = now;
+          sceneVisualDirty = updateSelectionBox(selectedVisible ? selected || null : null, selectedSignature) || sceneVisualDirty;
+        }
+        const shouldRenderIdleHeartbeat = (!modelRootRef.current || hasDynamicTiles) &&
+          now - lastRenderTime >= PREVIEW_IDLE_RENDER_INTERVAL_MS;
+        const shouldRenderTilesVisual = tilesVisualDirty && (
+          !lowFpsActive ||
+          interactionActive ||
+          now - lastRenderTime >= PREVIEW_IDLE_RENDER_INTERVAL_MS
+        );
+        const shouldRenderFrame = sceneRefreshDirty ||
+          shouldRenderTilesVisual ||
+          interactionActive ||
+          sceneVisualDirty ||
+          shouldRenderIdleHeartbeat;
+        if (!shouldRenderFrame) {
+          schedulePreviewAnimation(PREVIEW_IDLE_RENDER_INTERVAL_MS);
+          return;
+        }
+        lastRenderTime = now;
+        fpsFrameCount += 1;
         try {
           renderer.render(scene, camera);
         } catch (error) {
@@ -1926,15 +5101,25 @@ function ThreeScene({
           }
           throw error;
         }
-        frameId = window.requestAnimationFrame(animate);
+        schedulePreviewAnimation();
       };
-      animate();
+      animateLoop = animate;
+      schedulePreviewAnimation();
 
       return () => {
         detachCesiumLikeInteractions();
+        cancelPendingCanvasPick();
+        clearCanvasHoverCursor();
+        cancelScheduledPreviewAnimation();
+        cancelScheduledPreviewResize();
+        document.removeEventListener("visibilitychange", handlePreviewVisibilityChange);
         renderer?.domElement.removeEventListener("pointerdown", handlePointerDown);
+        renderer?.domElement.removeEventListener("pointermove", handlePreviewPointerMove);
+        renderer?.domElement.removeEventListener("pointerleave", handlePreviewPointerLeave);
         renderer?.domElement.removeEventListener("pointerup", handlePointerUp);
         renderer?.domElement.removeEventListener("pointercancel", handlePointerCancel);
+        renderer?.domElement.removeEventListener("dblclick", handleCanvasDoubleClick);
+        renderer?.domElement.removeEventListener("wheel", handlePreviewWheel);
       };
     };
 
@@ -1945,12 +5130,20 @@ function ThreeScene({
 
     return () => {
       disposed = true;
-      window.cancelAnimationFrame(frameId);
+      notifySceneRefreshRef.current = () => undefined;
+      if (pendingTransformChangeTimer) {
+        window.clearTimeout(pendingTransformChangeTimer);
+        pendingTransformChangeTimer = 0;
+      }
+      pendingTransformChange = null;
+      cancelScheduledPreviewAnimation();
+      cancelScheduledPreviewResize();
       removePointerHandler?.();
       resizeObserver?.disconnect();
       transformControlsRef.current?.detach();
       transformControlsRef.current?.dispose();
       globeControlsRef.current?.dispose();
+      tileEventCleanups.splice(0).forEach((cleanup) => cleanup());
       loadedObjects.forEach(disposeLoaded);
       rendererRef.current = null;
       cameraRef.current = null;
@@ -1962,17 +5155,37 @@ function ThreeScene({
       globeControlsRef.current = null;
       ellipsoidContextRef.current = createDefaultEllipsoidContext();
       objectsByLayerKeyRef.current = new Map();
+      pickableObjectsRef.current = [];
       onLayerTreeChange([]);
+      onMaterialListChange([]);
       scene.traverse((object) => disposeObject(object));
       renderer?.dispose();
       if (renderer?.domElement.parentElement === container) {
         container.removeChild(renderer.domElement);
       }
     };
-  }, [contextTilesUrl, onLayerTreeChange, onPlacementDone, onSceneInfoChange, onSelectLayer, onTransformChange, type, url]);
+  }, [applyHiddenLayerVisibility, contextTilesUrl, onInteractionHintChange, onLayerTreeChange, onMaterialListChange, onPlacementDone, onPlacementMiss, onSceneInfoChange, onSelectLayer, onTransformChange, type, url]);
 
-  return <div ref={containerRef} className={`preview-three-canvas${placementMode ? " is-placement-mode" : ""}`} />;
-}
+  const canvasInteractionDescription = placementMode
+    ? "地表落位模式：单击地球表面放置模型，按 Esc 退出"
+    : sceneMode === "sphere"
+      ? "三维操作：左键拖动地球，Shift、Ctrl 或 ⌘ 加左键平移，滚轮按鼠标位置缩放，右键上下拖动快速缩放，中键俯仰观察，双击地球放大，Shift 加双击缩小，双击模型聚焦"
+      : "三维操作：左键旋转，Shift、Ctrl 或 ⌘ 加左键平移，滚轮缩放，右键上下拖动缩放，中键俯仰观察，双击模型聚焦";
+  const canvasInteractionTitle = placementMode
+    ? "地表落位：单击地球表面放置 · Esc 退出"
+    : sceneMode === "sphere"
+      ? "左键拖动地球 · Shift/Ctrl/⌘+左键平移 · 滚轮按鼠标缩放 · 右键快速缩放 · 中键俯仰 · 双击地球缩放 / 双击模型聚焦"
+      : "左键旋转 · Shift/Ctrl/⌘+左键平移 · 滚轮缩放 · 右键拖动缩放 · 中键俯仰 · 双击模型聚焦";
+
+  return (
+    <div
+      ref={containerRef}
+      aria-label={canvasInteractionDescription}
+      className={`preview-three-canvas${placementMode ? " is-placement-mode" : ""}`}
+      title={canvasInteractionTitle}
+    />
+  );
+}, areThreeScenePropsEqual);
 
 function TransformInspector({
   transform,
@@ -2072,15 +5285,40 @@ function TransformInspector({
         <Typography.Title level={5}>位置</Typography.Title>
         <div className="preview-control-row">
         <span>经度</span>
-        <InputNumber aria-label="经度" disabled={disabled} value={geo.longitude} min={-180} max={180} step={0.000001} onChange={(value) => setGeo("longitude", value)} />
+        <InputNumber
+          aria-label="经度"
+          disabled={disabled}
+          value={geo.longitude}
+          min={-180}
+          max={180}
+          step={0.000001}
+          formatter={(value, info) => formatPreviewNumberInput(value, info, 6)}
+          onChange={(value) => setGeo("longitude", value)}
+        />
         </div>
         <div className="preview-control-row">
         <span>纬度</span>
-        <InputNumber aria-label="纬度" disabled={disabled} value={geo.latitude} min={-90} max={90} step={0.000001} onChange={(value) => setGeo("latitude", value)} />
+        <InputNumber
+          aria-label="纬度"
+          disabled={disabled}
+          value={geo.latitude}
+          min={-90}
+          max={90}
+          step={0.000001}
+          formatter={(value, info) => formatPreviewNumberInput(value, info, 6)}
+          onChange={(value) => setGeo("latitude", value)}
+        />
         </div>
         <div className="preview-control-row">
         <span>高程</span>
-        <InputNumber aria-label="高程" disabled={disabled} value={geo.height} step={1} onChange={(value) => setGeo("height", value)} />
+        <InputNumber
+          aria-label="高程"
+          disabled={disabled}
+          value={geo.height}
+          step={1}
+          formatter={(value, info) => formatPreviewNumberInput(value, info, 2)}
+          onChange={(value) => setGeo("height", value)}
+        />
         </div>
       </div>
     </div>
@@ -2111,9 +5349,10 @@ function ControlScalar({
         <InputNumber
           aria-label={label}
           disabled={disabled}
-          value={roundDisplay(value)}
+          value={value}
           min={min}
           step={step}
+          formatter={(nextValue, info) => formatPreviewNumberInput(nextValue, info)}
           onChange={onChange}
         />
         {suffix ? <em>{suffix}</em> : null}
@@ -2150,9 +5389,10 @@ function ControlTriplet({
           <InputNumber
             aria-label={`${label} ${axis}`}
             disabled={disabled}
-            value={roundDisplay(values[index])}
+            value={values[index]}
             min={min}
             step={step}
+            formatter={(nextValue, info) => formatPreviewNumberInput(nextValue, info)}
             onChange={(value) => onChange(index, value)}
           />
           {suffix ? <em>{suffix}</em> : null}
@@ -2182,7 +5422,7 @@ async function createRenderer(
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.AgXToneMapping;
       renderer.toneMappingExposure = 1.25;
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setPixelRatio(getPreviewPixelRatio());
       resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
       const backend = getRendererBackend(renderer);
       onBackend(backend);
@@ -2194,12 +5434,13 @@ async function createRenderer(
 
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
-    alpha: true
+    alpha: true,
+    powerPreference: "high-performance"
   });
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.AgXToneMapping;
   renderer.toneMappingExposure = 1.25;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(getPreviewPixelRatio());
   resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
   onBackend("WebGL");
   return {
@@ -2313,28 +5554,97 @@ function resizeRenderer(container: HTMLDivElement, renderer: PreviewRenderer, ca
   renderer.setSize(width, height, false);
 }
 
+function getPreviewPixelRatio(mode: "normal" | "interactive" | "low-fps" = "normal"): number {
+  const devicePixelRatio = Math.max(window.devicePixelRatio || 1, 0.5);
+  const normalPixelRatio = Math.min(devicePixelRatio, PREVIEW_MAX_PIXEL_RATIO);
+  if (mode === "interactive") {
+    return Math.min(normalPixelRatio, PREVIEW_INTERACTIVE_PIXEL_RATIO);
+  }
+  if (mode === "low-fps") {
+    return Math.min(normalPixelRatio, PREVIEW_LOW_FPS_PIXEL_RATIO);
+  }
+  return normalPixelRatio;
+}
+
 type RuntimeGlobeControls = GlobeControls & {
   needsUpdate: boolean;
   zoomDelta: number;
   zoomDirectionSet: boolean;
   zoomPointSet: boolean;
+  _cancelInteractionMomentum?: (options?: { clearHint?: boolean }) => boolean;
+  _inertiaNeedsUpdate?: () => boolean;
   _applyRotation?: (x: number, y: number, pivotPoint: THREE.Vector3) => void;
   pointerTracker?: {
     setHoverEvent: (event: unknown) => void;
   };
 };
 
+type GlobeDragMode = "rotate" | "pan" | "tilt";
+
+interface GlobeLeftDragCandidate {
+  id: number;
+  mode: GlobeDragMode;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  anchor: THREE.Vector3 | null;
+  pivot: THREE.Vector3;
+  previousCursor: string;
+}
+
+interface GlobeOrbitDrag {
+  id: number;
+  mode: GlobeDragMode;
+  lastX: number;
+  lastY: number;
+  lastTime: number;
+  velocityX: number;
+  velocityY: number;
+  anchor: THREE.Vector3 | null;
+  pivot: THREE.Vector3;
+  previousCursor: string;
+}
+
+interface GlobeMiddleDrag {
+  id: number;
+  lastX: number;
+  lastY: number;
+  lastTime: number;
+  velocityX: number;
+  velocityY: number;
+  anchor: THREE.Vector3;
+  previousCursor: string;
+}
+
+interface GlobeOrbitInertia {
+  frameId: number;
+  pivot: THREE.Vector3;
+  previousTime: number;
+  velocityX: number;
+  velocityY: number;
+}
+
 function attachCesiumLikeGlobeInteractions(
   controls: GlobeControls,
   element: HTMLElement,
   isActive: () => boolean,
-  shouldBypassLeftDrag: (event: PointerEvent) => boolean = () => false
+  shouldBypassLeftDrag: (event: PointerEvent) => boolean = () => false,
+  onInteraction: () => void = () => undefined,
+  shouldBypassDoubleClick: (event: MouseEvent) => boolean = () => false,
+  onEmptyLeftClick: () => void = () => undefined,
+  onInteractionHintChange: (hint: PreviewInteractionHint | null) => void = () => undefined
 ) {
   const runtimeControls = controls as RuntimeGlobeControls;
-  let leftCandidate: { id: number; startX: number; startY: number; lastX: number; lastY: number; pivot: THREE.Vector3; previousCursor: string } | null = null;
-  let leftDrag: { id: number; lastX: number; lastY: number; pivot: THREE.Vector3; previousCursor: string } | null = null;
+  let leftCandidate: GlobeLeftDragCandidate | null = null;
+  let leftDrag: GlobeOrbitDrag | null = null;
   let rightDrag: { id: number; lastY: number; previousCursor: string } | null = null;
-  let middleDrag: { id: number; lastX: number; lastY: number; anchor: THREE.Vector3; previousCursor: string } | null = null;
+  let middleDrag: GlobeMiddleDrag | null = null;
+  let orbitInertia: GlobeOrbitInertia | null = null;
+  let pointerHoveringElement = false;
+  let panPreviewCursorPrevious: string | null = null;
+  let panPreviewHintActive = false;
+  let currentInteractionHint: PreviewInteractionHint | null = null;
   const pointer = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
   const localRay = new THREE.Ray();
@@ -2342,8 +5652,30 @@ function attachCesiumLikeGlobeInteractions(
   const tmpVector = new THREE.Vector3();
   const tmpRight = new THREE.Vector3();
   const tmpUp = new THREE.Vector3();
+  let interactionHintClearTimer = 0;
 
   const canHandle = () => controls.enabled && isActive();
+  const emitInteractionHint = (hint: PreviewInteractionHint | null) => {
+    if (currentInteractionHint === hint) {
+      return;
+    }
+    currentInteractionHint = hint;
+    onInteractionHintChange(hint);
+  };
+  const setInteractionHint = (hint: PreviewInteractionHint | null, autoClearMs = 0) => {
+    if (interactionHintClearTimer) {
+      window.clearTimeout(interactionHintClearTimer);
+      interactionHintClearTimer = 0;
+    }
+    emitInteractionHint(hint);
+    if (hint && autoClearMs > 0) {
+      interactionHintClearTimer = window.setTimeout(() => {
+        interactionHintClearTimer = 0;
+        emitInteractionHint(null);
+      }, autoClearMs);
+    }
+  };
+  const clearInteractionHint = () => setInteractionHint(null);
   const blockEvent = (event: Event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -2351,12 +5683,17 @@ function attachCesiumLikeGlobeInteractions(
   };
   const setHoverPoint = (event: PointerEvent | MouseEvent) => {
     runtimeControls.pointerTracker?.setHoverEvent({
-      type: "pointermove",
-      pointerType: "mouse",
+      type: event.type || "pointermove",
+      pointerType: "pointerType" in event ? event.pointerType || "mouse" : "mouse",
       target: event.target,
       clientX: event.clientX,
       clientY: event.clientY
     });
+  };
+  const clearQueuedZoom = () => {
+    runtimeControls.zoomDelta = 0;
+    runtimeControls.zoomDirectionSet = false;
+    runtimeControls.zoomPointSet = false;
   };
   const releasePointer = (event?: PointerEvent) => {
     if (!event) return;
@@ -2396,29 +5733,114 @@ function attachCesiumLikeGlobeInteractions(
   };
   const queueZoom = (delta: number) => {
     if (!delta || !canHandle()) return;
-    runtimeControls.zoomDelta += delta;
+    if (
+      runtimeControls.zoomDelta &&
+      Math.sign(runtimeControls.zoomDelta) !== Math.sign(delta)
+    ) {
+      runtimeControls.zoomDelta = 0;
+    }
+    runtimeControls.zoomDelta = THREE.MathUtils.clamp(
+      runtimeControls.zoomDelta + delta,
+      -CESIUM_MAX_QUEUED_ZOOM_DELTA,
+      CESIUM_MAX_QUEUED_ZOOM_DELTA
+    );
     runtimeControls.zoomDirectionSet = false;
     runtimeControls.zoomPointSet = false;
     runtimeControls.needsUpdate = true;
+    onInteraction();
   };
   const orbitAroundPivot = (deltaX: number, deltaY: number, pivot: THREE.Vector3) => {
     if (!runtimeControls._applyRotation) return;
     const scale = 2 * Math.PI / Math.max(element.clientHeight, 1);
     runtimeControls._applyRotation.call(runtimeControls, deltaX * scale, deltaY * scale, pivot);
     runtimeControls.needsUpdate = true;
+    onInteraction();
   };
-  const panToKeepSurfacePointUnderPointer = (event: PointerEvent) => {
-    if (!middleDrag) return;
+  const cancelOrbitInertia = () => {
+    if (orbitInertia) {
+      window.cancelAnimationFrame(orbitInertia.frameId);
+      orbitInertia = null;
+    }
+  };
+  const updateOrbitVelocity = (
+    drag: { lastTime: number; velocityX: number; velocityY: number },
+    deltaX: number,
+    deltaY: number,
+    now = performance.now()
+  ) => {
+    const elapsed = Math.max(now - drag.lastTime, 8);
+    const frameScale = 16.67 / elapsed;
+    drag.velocityX = THREE.MathUtils.clamp(
+      drag.velocityX * 0.38 + deltaX * frameScale * 0.62,
+      -GLOBE_INERTIA_MAX_DELTA,
+      GLOBE_INERTIA_MAX_DELTA
+    );
+    drag.velocityY = THREE.MathUtils.clamp(
+      drag.velocityY * 0.38 + deltaY * frameScale * 0.62,
+      -GLOBE_INERTIA_MAX_DELTA,
+      GLOBE_INERTIA_MAX_DELTA
+    );
+    drag.lastTime = now;
+  };
+  const startOrbitInertia = (velocityX: number, velocityY: number, pivot: THREE.Vector3) => {
+    cancelOrbitInertia();
+    if (!runtimeControls._applyRotation || Math.hypot(velocityX, velocityY) < GLOBE_INERTIA_MIN_DELTA) {
+      return;
+    }
+    const inertia: GlobeOrbitInertia = {
+      frameId: 0,
+      pivot: pivot.clone(),
+      previousTime: performance.now(),
+      velocityX,
+      velocityY
+    };
+    const step = (now: number) => {
+      if (orbitInertia !== inertia || !canHandle() || !runtimeControls._applyRotation) {
+        orbitInertia = null;
+        return;
+      }
+      const elapsedFrames = THREE.MathUtils.clamp((now - inertia.previousTime) / 16.67, 0.35, 2.5);
+      inertia.previousTime = now;
+      orbitAroundPivot(inertia.velocityX * elapsedFrames, inertia.velocityY * elapsedFrames, inertia.pivot);
+      const decay = Math.pow(GLOBE_INERTIA_DECAY, elapsedFrames);
+      inertia.velocityX *= decay;
+      inertia.velocityY *= decay;
+      if (Math.hypot(inertia.velocityX, inertia.velocityY) < GLOBE_INERTIA_MIN_DELTA) {
+        orbitInertia = null;
+        return;
+      }
+      inertia.frameId = window.requestAnimationFrame(step);
+    };
+    orbitInertia = inertia;
+    inertia.frameId = window.requestAnimationFrame(step);
+    onInteraction();
+  };
+  const moveCameraToKeepSurfacePointUnderPointer = (
+    anchor: THREE.Vector3 | null,
+    event: PointerEvent,
+    lastX: number,
+    lastY: number,
+    pivot: THREE.Vector3 | null,
+    allowOrbitFallback = false
+  ) => {
     const camera = controls.camera;
     if (!camera) return;
-    const currentPoint = getSurfacePoint(event.clientX, event.clientY);
-    if (currentPoint) {
-      tmpVector.subVectors(middleDrag.anchor, currentPoint);
+    const currentPoint = anchor ? getSurfacePoint(event.clientX, event.clientY) : null;
+    if (anchor && currentPoint) {
+      tmpVector.subVectors(anchor, currentPoint);
       camera.position.add(tmpVector);
+      camera.updateMatrixWorld();
+      runtimeControls.needsUpdate = true;
+      onInteraction();
+      return;
+    }
+    const deltaX = event.clientX - lastX;
+    const deltaY = event.clientY - lastY;
+    if (allowOrbitFallback && pivot && runtimeControls._applyRotation) {
+      orbitAroundPivot(deltaX, deltaY, pivot);
     } else {
-      const deltaX = event.clientX - middleDrag.lastX;
-      const deltaY = event.clientY - middleDrag.lastY;
-      const distance = Math.max(camera.position.distanceTo(middleDrag.anchor), MIN_GLOBE_ZOOM_DISTANCE);
+      const reference = anchor || pivot || getControlsPivotPoint() || camera.position;
+      const distance = Math.max(camera.position.distanceTo(reference), MIN_GLOBE_ZOOM_DISTANCE);
       const worldUnitsPerPixel = camera instanceof THREE.PerspectiveCamera
         ? 2 * distance * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / Math.max(element.clientHeight, 1)
         : 1;
@@ -2427,41 +5849,111 @@ function attachCesiumLikeGlobeInteractions(
       camera.position
         .addScaledVector(tmpRight, -deltaX * worldUnitsPerPixel)
         .addScaledVector(tmpUp, deltaY * worldUnitsPerPixel);
+      camera.updateMatrixWorld();
+      runtimeControls.needsUpdate = true;
+      onInteraction();
     }
-    camera.updateMatrixWorld();
-    runtimeControls.needsUpdate = true;
   };
-  const endLeftDrag = (event?: PointerEvent) => {
+  const endLeftDrag = (event?: PointerEvent, clearHint = true) => {
     if (!leftDrag && !leftCandidate) return;
     element.style.cursor = (leftDrag || leftCandidate)?.previousCursor || "";
     releasePointer(event);
     leftDrag = null;
     leftCandidate = null;
+    if (clearHint) {
+      clearInteractionHint();
+    }
   };
-  const endRightDrag = (event?: PointerEvent) => {
+  const endRightDrag = (event?: PointerEvent, clearHint = true) => {
     if (!rightDrag) return;
     element.style.cursor = rightDrag.previousCursor;
     releasePointer(event);
     rightDrag = null;
+    if (clearHint) {
+      clearInteractionHint();
+    }
   };
-  const endMiddleDrag = (event?: PointerEvent) => {
+  const endMiddleDrag = (event?: PointerEvent, clearHint = true) => {
     if (!middleDrag) return;
     element.style.cursor = middleDrag.previousCursor;
     releasePointer(event);
     middleDrag = null;
+    if (clearHint) {
+      clearInteractionHint();
+    }
+  };
+  const hasActivePointerGesture = () => Boolean(leftCandidate || leftDrag || middleDrag || rightDrag);
+  const hasCancelableInteraction = () => Boolean(
+    orbitInertia ||
+    runtimeControls.zoomDelta ||
+    runtimeControls._inertiaNeedsUpdate?.() ||
+    hasActivePointerGesture()
+  );
+  const clearPanCursorPreview = (clearHint = true) => {
+    if (panPreviewCursorPrevious === null) {
+      return;
+    }
+    element.style.cursor = panPreviewCursorPrevious;
+    panPreviewCursorPrevious = null;
+    if (panPreviewHintActive && clearHint) {
+      clearInteractionHint();
+    }
+    panPreviewHintActive = false;
+  };
+  const updatePanCursorPreview = (modifierActive: boolean) => {
+    if (
+      !pointerHoveringElement ||
+      !modifierActive ||
+      hasActivePointerGesture() ||
+      !canHandle()
+    ) {
+      clearPanCursorPreview();
+      return;
+    }
+    if (panPreviewCursorPrevious !== null) {
+      return;
+    }
+    panPreviewCursorPrevious = element.style.cursor;
+    element.style.cursor = "move";
+    panPreviewHintActive = true;
+    setInteractionHint("globe-pan");
+  };
+  const cancelStalePointerGesture = (event: PointerEvent, endGesture: (event: PointerEvent) => void) => {
+    endGesture(event);
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    controls.resetState();
+    runtimeControls.needsUpdate = true;
+    updatePanCursorPreview(isGlobePanModifier(event));
+    onInteraction();
   };
   const handlePointerDown = (event: PointerEvent) => {
     if (!canHandle()) return;
+    if (hasActivePointerGesture()) {
+      blockEvent(event);
+      return;
+    }
+    clearPanCursorPreview();
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    clearInteractionHint();
     if (event.button === 0) {
       if (!runtimeControls._applyRotation || shouldBypassLeftDrag(event)) return;
-      const pivot = getScreenCenterPivot();
+      const anchor = getSurfacePoint(event.clientX, event.clientY);
+      const mode: GlobeDragMode = isGlobePanModifier(event) ? "pan" : "rotate";
+      const pivot = mode === "rotate" ? anchor || getScreenCenterPivot() : anchor || getScreenCenterPivot();
       if (!pivot) return;
+      blockEvent(event);
+      controls.resetState();
+      onInteraction();
       leftCandidate = {
         id: event.pointerId,
+        mode,
         startX: event.clientX,
         startY: event.clientY,
         lastX: event.clientX,
         lastY: event.clientY,
+        anchor: mode === "pan" ? anchor : null,
         pivot,
         previousCursor: element.style.cursor
       };
@@ -2472,21 +5964,27 @@ function attachCesiumLikeGlobeInteractions(
       if (!anchor) return;
       blockEvent(event);
       controls.resetState();
+      onInteraction();
       middleDrag = {
         id: event.pointerId,
         lastX: event.clientX,
         lastY: event.clientY,
+        lastTime: performance.now(),
+        velocityX: 0,
+        velocityY: 0,
         anchor,
         previousCursor: element.style.cursor
       };
-      element.style.cursor = "move";
+      element.style.cursor = "all-scroll";
       element.focus();
       capturePointer(event);
+      setInteractionHint("globe-tilt");
       return;
     }
     if (event.button !== 2) return;
     blockEvent(event);
     controls.resetState();
+    onInteraction();
     setHoverPoint(event);
     rightDrag = {
       id: event.pointerId,
@@ -2496,56 +5994,95 @@ function attachCesiumLikeGlobeInteractions(
     element.style.cursor = "ns-resize";
     element.focus();
     capturePointer(event);
+    setInteractionHint("globe-zoom");
   };
   const handlePointerMove = (event: PointerEvent) => {
+    if (!hasActivePointerGesture()) {
+      updatePanCursorPreview(isGlobePanModifier(event));
+    }
     if (leftDrag && leftDrag.id === event.pointerId) {
       blockEvent(event);
       if (!canHandle() || !runtimeControls._applyRotation) {
-        endLeftDrag(event);
+        cancelStalePointerGesture(event, endLeftDrag);
         return;
       }
-      const deltaX = event.clientX - leftDrag.lastX;
-      const deltaY = event.clientY - leftDrag.lastY;
+      const previousX = leftDrag.lastX;
+      const previousY = leftDrag.lastY;
+      const deltaX = event.clientX - previousX;
+      const deltaY = event.clientY - previousY;
       leftDrag.lastX = event.clientX;
       leftDrag.lastY = event.clientY;
-      orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
+      updateOrbitVelocity(leftDrag, deltaX, deltaY);
+      if (leftDrag.mode === "pan") {
+        moveCameraToKeepSurfacePointUnderPointer(
+          leftDrag.anchor,
+          event,
+          previousX,
+          previousY,
+          leftDrag.pivot
+        );
+      } else {
+        orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
+      }
       return;
     }
     if (leftCandidate && leftCandidate.id === event.pointerId) {
       if (!canHandle()) {
-        endLeftDrag(event);
+        cancelStalePointerGesture(event, endLeftDrag);
         return;
       }
       const moved = Math.hypot(event.clientX - leftCandidate.startX, event.clientY - leftCandidate.startY);
-      if (moved <= 4) {
+      if (moved <= GLOBE_DRAG_THRESHOLD_PX) {
         return;
       }
       blockEvent(event);
       controls.resetState();
       leftDrag = {
         id: leftCandidate.id,
+        mode: leftCandidate.mode,
         lastX: leftCandidate.lastX,
         lastY: leftCandidate.lastY,
+        lastTime: performance.now(),
+        velocityX: 0,
+        velocityY: 0,
+        anchor: leftCandidate.anchor,
         pivot: leftCandidate.pivot,
         previousCursor: leftCandidate.previousCursor
       };
       leftCandidate = null;
-      element.style.cursor = "grabbing";
+      element.style.cursor = leftDrag.mode === "pan" ? "move" : "grabbing";
       capturePointer(event);
-      const deltaX = event.clientX - leftDrag.lastX;
-      const deltaY = event.clientY - leftDrag.lastY;
+      setInteractionHint(leftDrag.mode === "pan" ? "globe-pan" : "globe-rotate");
+      const previousX = leftDrag.lastX;
+      const previousY = leftDrag.lastY;
+      const deltaX = event.clientX - previousX;
+      const deltaY = event.clientY - previousY;
       leftDrag.lastX = event.clientX;
       leftDrag.lastY = event.clientY;
-      orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
+      updateOrbitVelocity(leftDrag, deltaX, deltaY);
+      if (leftDrag.mode === "pan") {
+        moveCameraToKeepSurfacePointUnderPointer(
+          leftDrag.anchor,
+          event,
+          previousX,
+          previousY,
+          leftDrag.pivot
+        );
+      } else {
+        orbitAroundPivot(deltaX, deltaY, leftDrag.pivot);
+      }
       return;
     }
     if (middleDrag && middleDrag.id === event.pointerId) {
       blockEvent(event);
       if (!canHandle()) {
-        endMiddleDrag(event);
+        cancelStalePointerGesture(event, endMiddleDrag);
         return;
       }
-      panToKeepSurfacePointUnderPointer(event);
+      const deltaX = (event.clientX - middleDrag.lastX) * 0.45;
+      const deltaY = (event.clientY - middleDrag.lastY) * 1.1;
+      updateOrbitVelocity(middleDrag, deltaX, deltaY);
+      orbitAroundPivot(deltaX, deltaY, middleDrag.anchor);
       middleDrag.lastX = event.clientX;
       middleDrag.lastY = event.clientY;
       return;
@@ -2553,68 +6090,322 @@ function attachCesiumLikeGlobeInteractions(
     if (!rightDrag || rightDrag.id !== event.pointerId) return;
     blockEvent(event);
     if (!canHandle()) {
-      endRightDrag(event);
+      cancelStalePointerGesture(event, endRightDrag);
       return;
     }
     const deltaY = rightDrag.lastY - event.clientY;
     rightDrag.lastY = event.clientY;
     setHoverPoint(event);
-    queueZoom(deltaY * CESIUM_RIGHT_DRAG_ZOOM_SPEED);
+    queueZoom(normalizeGlobeDragZoomDelta(deltaY, element));
   };
   const handlePointerEnd = (event: PointerEvent) => {
     if (leftDrag && leftDrag.id === event.pointerId) {
       blockEvent(event);
+      if (!canHandle()) {
+        cancelStalePointerGesture(event, endLeftDrag);
+        return;
+      }
+      const inertiaVelocity = leftDrag.mode === "rotate"
+        ? { x: leftDrag.velocityX, y: leftDrag.velocityY, pivot: leftDrag.pivot }
+        : null;
       endLeftDrag(event);
+      if (inertiaVelocity) {
+        startOrbitInertia(inertiaVelocity.x, inertiaVelocity.y, inertiaVelocity.pivot);
+      }
+      updatePanCursorPreview(isGlobePanModifier(event));
       return;
     }
     if (leftCandidate && leftCandidate.id === event.pointerId) {
+      blockEvent(event);
+      if (!canHandle()) {
+        cancelStalePointerGesture(event, endLeftDrag);
+        return;
+      }
+      const shouldClearSelection = leftCandidate.mode !== "pan";
       leftCandidate = null;
+      if (shouldClearSelection) {
+        onEmptyLeftClick();
+      }
+      updatePanCursorPreview(isGlobePanModifier(event));
       return;
     }
     if (middleDrag && middleDrag.id === event.pointerId) {
       blockEvent(event);
+      if (!canHandle()) {
+        cancelStalePointerGesture(event, endMiddleDrag);
+        return;
+      }
+      const inertiaVelocity = {
+        x: middleDrag.velocityX,
+        y: middleDrag.velocityY,
+        pivot: middleDrag.anchor
+      };
       endMiddleDrag(event);
+      startOrbitInertia(inertiaVelocity.x, inertiaVelocity.y, inertiaVelocity.pivot);
+      updatePanCursorPreview(isGlobePanModifier(event));
       return;
     }
     if (!rightDrag || rightDrag.id !== event.pointerId) return;
     blockEvent(event);
+    if (!canHandle()) {
+      cancelStalePointerGesture(event, endRightDrag);
+      return;
+    }
     endRightDrag(event);
+    updatePanCursorPreview(isGlobePanModifier(event));
+  };
+  const handlePointerCancel = (event: PointerEvent) => {
+    if (
+      leftDrag?.id !== event.pointerId &&
+      leftCandidate?.id !== event.pointerId &&
+      middleDrag?.id !== event.pointerId &&
+      rightDrag?.id !== event.pointerId
+    ) {
+      return;
+    }
+    blockEvent(event);
+    endLeftDrag(event);
+    endMiddleDrag(event);
+    endRightDrag(event);
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    controls.resetState();
+    runtimeControls.needsUpdate = true;
+    updatePanCursorPreview(isGlobePanModifier(event));
+    onInteraction();
+  };
+  const handleLostPointerCapture = (event: PointerEvent) => {
+    let hadActiveDrag = false;
+    if (leftDrag?.id === event.pointerId) {
+      hadActiveDrag = true;
+      endLeftDrag(event);
+    }
+    if (leftCandidate?.id === event.pointerId) {
+      hadActiveDrag = true;
+      endLeftDrag(event);
+    }
+    if (middleDrag?.id === event.pointerId) {
+      hadActiveDrag = true;
+      endMiddleDrag(event);
+    }
+    if (rightDrag?.id === event.pointerId) {
+      hadActiveDrag = true;
+      endRightDrag(event);
+    }
+    if (!hadActiveDrag) {
+      return;
+    }
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    controls.resetState();
+    runtimeControls.needsUpdate = true;
+    updatePanCursorPreview(isGlobePanModifier(event));
+    onInteraction();
   };
   const handleContextMenu = (event: MouseEvent) => {
     if (canHandle()) {
       blockEvent(event);
     }
   };
-  const handleDoubleClick = (event: MouseEvent) => {
-    if (event.button !== 0 || !canHandle()) return;
+  const handleAuxClick = (event: MouseEvent) => {
+    if (!canHandle()) {
+      return;
+    }
+    if (event.button === 1 || event.button === 2) {
+      blockEvent(event);
+    }
+  };
+  const handlePointerEnter = (event: PointerEvent) => {
+    pointerHoveringElement = true;
+    updatePanCursorPreview(isGlobePanModifier(event));
+  };
+  const handlePointerLeave = (event: PointerEvent) => {
+    pointerHoveringElement = false;
+    clearPanCursorPreview();
+    if (event.buttons && leftCandidate?.id === event.pointerId) {
+      endLeftDrag(event);
+    }
+  };
+  const handleModifierKeyChange = (event: KeyboardEvent) => {
+    if (isEditableKeyboardTarget(event.target)) {
+      clearPanCursorPreview();
+      return;
+    }
+    if (!isGlobePanModifierKey(event)) {
+      return;
+    }
+    updatePanCursorPreview(isGlobePanModifier(event));
+  };
+  const handleWheel = (event: WheelEvent) => {
+    if (!canHandle()) return;
+    if (!hasNonZeroWheelDelta(event)) return;
+    const zoomDelta = normalizeGlobeWheelZoomDelta(event, element);
     blockEvent(event);
+    if (!zoomDelta) {
+      return;
+    }
+    cancelOrbitInertia();
     controls.resetState();
     setHoverPoint(event);
-    queueZoom(CESIUM_DOUBLE_CLICK_ZOOM_DELTA);
+    queueZoom(zoomDelta);
+    setInteractionHint("globe-zoom", 700);
   };
-
-  element.addEventListener("pointerdown", handlePointerDown, true);
-  element.addEventListener("contextmenu", handleContextMenu, true);
-  element.addEventListener("dblclick", handleDoubleClick, true);
-  window.addEventListener("pointermove", handlePointerMove, true);
-  window.addEventListener("pointerup", handlePointerEnd, true);
-  window.addEventListener("pointercancel", handlePointerEnd, true);
-
-  return () => {
+  const handleDoubleClick = (event: MouseEvent) => {
+    if (event.button !== 0 || !canHandle()) return;
+    if (shouldBypassDoubleClick(event)) return;
+    blockEvent(event);
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    controls.resetState();
+    setHoverPoint(event);
+    queueZoom(getGlobeDoubleClickZoomDelta(event, element));
+    setInteractionHint("globe-zoom", 700);
+  };
+  const handleWindowBlur = () => {
+    const hadCancelableInteraction = hasCancelableInteraction();
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    clearPanCursorPreview();
     endLeftDrag();
     endRightDrag();
     endMiddleDrag();
+    clearInteractionHint();
+    if (hadCancelableInteraction) {
+      controls.resetState();
+      runtimeControls.needsUpdate = true;
+      onInteraction();
+    }
+  };
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === "hidden") {
+      handleWindowBlur();
+    }
+  };
+  const cancelInteractionMomentum = (options: { clearHint?: boolean } = {}) => {
+    const shouldClearHint = options.clearHint !== false;
+    const hadCancelableInteraction = hasCancelableInteraction();
+    cancelOrbitInertia();
+    clearQueuedZoom();
+    clearPanCursorPreview(shouldClearHint);
+    endLeftDrag(undefined, shouldClearHint);
+    endRightDrag(undefined, shouldClearHint);
+    endMiddleDrag(undefined, shouldClearHint);
+    if (shouldClearHint) {
+      clearInteractionHint();
+    }
+    if (!hadCancelableInteraction) {
+      return false;
+    }
+    controls.resetState();
+    runtimeControls.needsUpdate = true;
+    onInteraction();
+    return true;
+  };
+  runtimeControls._cancelInteractionMomentum = cancelInteractionMomentum;
+
+  element.addEventListener("pointerdown", handlePointerDown, true);
+  element.addEventListener("pointerenter", handlePointerEnter, true);
+  element.addEventListener("pointerleave", handlePointerLeave, true);
+  element.addEventListener("lostpointercapture", handleLostPointerCapture, true);
+  element.addEventListener("contextmenu", handleContextMenu, true);
+  element.addEventListener("auxclick", handleAuxClick, true);
+  element.addEventListener("wheel", handleWheel, { capture: true, passive: false });
+  element.addEventListener("dblclick", handleDoubleClick, true);
+  window.addEventListener("pointermove", handlePointerMove, true);
+  window.addEventListener("pointerup", handlePointerEnd, true);
+  window.addEventListener("pointercancel", handlePointerCancel, true);
+  window.addEventListener("keydown", handleModifierKeyChange, true);
+  window.addEventListener("keyup", handleModifierKeyChange, true);
+  window.addEventListener("blur", handleWindowBlur);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+
+  return () => {
+    cancelInteractionMomentum();
+    if (interactionHintClearTimer) {
+      window.clearTimeout(interactionHintClearTimer);
+      interactionHintClearTimer = 0;
+    }
+    if (runtimeControls._cancelInteractionMomentum === cancelInteractionMomentum) {
+      delete runtimeControls._cancelInteractionMomentum;
+    }
     element.removeEventListener("pointerdown", handlePointerDown, true);
+    element.removeEventListener("pointerenter", handlePointerEnter, true);
+    element.removeEventListener("pointerleave", handlePointerLeave, true);
+    element.removeEventListener("lostpointercapture", handleLostPointerCapture, true);
     element.removeEventListener("contextmenu", handleContextMenu, true);
+    element.removeEventListener("auxclick", handleAuxClick, true);
+    element.removeEventListener("wheel", handleWheel, true);
     element.removeEventListener("dblclick", handleDoubleClick, true);
-    window.removeEventListener("pointermove", handlePointerMove, true);
-    window.removeEventListener("pointerup", handlePointerEnd, true);
-    window.removeEventListener("pointercancel", handlePointerEnd, true);
+  window.removeEventListener("pointermove", handlePointerMove, true);
+  window.removeEventListener("pointerup", handlePointerEnd, true);
+  window.removeEventListener("pointercancel", handlePointerCancel, true);
+    window.removeEventListener("keydown", handleModifierKeyChange, true);
+    window.removeEventListener("keyup", handleModifierKeyChange, true);
+    window.removeEventListener("blur", handleWindowBlur);
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
   };
 }
 
+function hasNonZeroWheelDelta(event: WheelEvent): boolean {
+  return event.deltaX !== 0 || event.deltaY !== 0 || event.deltaZ !== 0;
+}
+
+function normalizeGlobeWheelZoomDelta(event: WheelEvent, element: HTMLElement): number {
+  const deltaModeScale = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+    ? 16
+    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+      ? Math.max(element.clientHeight, 1)
+      : 1;
+  const rawDelta = -event.deltaY * deltaModeScale;
+  if (!rawDelta) {
+    return 0;
+  }
+  const direction = Math.sign(rawDelta);
+  const easedMagnitude = Math.pow(Math.abs(rawDelta), 0.88) * CESIUM_WHEEL_ZOOM_SPEED;
+  return THREE.MathUtils.clamp(direction * easedMagnitude, -360, 360);
+}
+
+function getGlobeViewportZoomScale(element: HTMLElement): number {
+  return THREE.MathUtils.clamp(
+    CESIUM_REFERENCE_VIEWPORT_HEIGHT / Math.max(element.clientHeight, 1),
+    CESIUM_MIN_VIEWPORT_ZOOM_SCALE,
+    CESIUM_MAX_VIEWPORT_ZOOM_SCALE
+  );
+}
+
+function normalizeGlobeDragZoomDelta(deltaY: number, element: HTMLElement): number {
+  if (!deltaY) {
+    return 0;
+  }
+  return THREE.MathUtils.clamp(
+    deltaY * CESIUM_RIGHT_DRAG_ZOOM_SPEED * getGlobeViewportZoomScale(element),
+    -360,
+    360
+  );
+}
+
+function getGlobeDoubleClickZoomDelta(event: MouseEvent, element: HTMLElement): number {
+  const rawMagnitude = element.clientHeight > 0
+    ? element.clientHeight * CESIUM_DOUBLE_CLICK_ZOOM_VIEWPORT_RATIO
+    : CESIUM_DOUBLE_CLICK_ZOOM_DELTA;
+  const magnitude = THREE.MathUtils.clamp(
+    rawMagnitude,
+    CESIUM_MIN_DOUBLE_CLICK_ZOOM_DELTA,
+    CESIUM_MAX_DOUBLE_CLICK_ZOOM_DELTA
+  );
+  return event.shiftKey ? -magnitude : magnitude;
+}
+
+function isGlobePanModifier(event: Pick<MouseEvent | KeyboardEvent, "shiftKey" | "ctrlKey" | "metaKey">): boolean {
+  return event.shiftKey || event.ctrlKey || event.metaKey;
+}
+
+function isGlobePanModifierKey(event: KeyboardEvent): boolean {
+  return event.key === "Shift" || event.key === "Control" || event.key === "Meta" || event.key === "OS";
+}
+
 function isTransformControlPointerHit(
-  event: PointerEvent,
+  event: Pick<MouseEvent | PointerEvent, "clientX" | "clientY">,
   controls: TransformControls | null,
   camera: THREE.Camera,
   element: HTMLElement
@@ -2623,14 +6414,25 @@ function isTransformControlPointerHit(
   const helper = controls.getHelper();
   if (!helper.visible) return false;
   const rect = element.getBoundingClientRect();
-  const pointer = new THREE.Vector2(
+  TRANSFORM_CONTROL_HIT_POINTER.set(
     ((event.clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1,
     -((event.clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1
   );
-  const raycaster = new THREE.Raycaster();
   helper.updateMatrixWorld(true);
-  raycaster.setFromCamera(pointer, camera);
-  return raycaster.intersectObject(helper, true).length > 0;
+  TRANSFORM_CONTROL_HIT_RAYCASTER.setFromCamera(TRANSFORM_CONTROL_HIT_POINTER, camera);
+  return TRANSFORM_CONTROL_HIT_RAYCASTER.intersectObject(helper, true).length > 0;
+}
+
+function shouldShowTransformControlHelper(
+  selectedLayerKey: string | null,
+  objectsByLayerKey: Map<string, THREE.Object3D>,
+  placementMode: boolean
+): boolean {
+  if (placementMode || !selectedLayerKey) {
+    return false;
+  }
+  const selected = objectsByLayerKey.get(selectedLayerKey);
+  return Boolean(selected && isObjectVisibleInHierarchy(selected));
 }
 
 function getRendererBackend(renderer: PreviewRenderer): RendererBackend {
@@ -2697,9 +6499,42 @@ function readCameraView(camera: THREE.PerspectiveCamera, globeControls: GlobeCon
     target.multiplyScalar(100).add(camera.position);
   }
   return {
-    position: camera.position.toArray() as [number, number, number],
-    target: target.toArray() as [number, number, number]
+    position: toSceneViewTuple(camera.position),
+    target: toSceneViewTuple(target)
   };
+}
+
+function toSceneViewTuple(vector: THREE.Vector3): [number, number, number] {
+  return [
+    normalizeSceneViewNumber(vector.x),
+    normalizeSceneViewNumber(vector.y),
+    normalizeSceneViewNumber(vector.z)
+  ];
+}
+
+function getSceneViewStateSignature(state: SceneViewState): string {
+  const camera = state.camera;
+  const cameraSignature = camera
+    ? [
+      ...camera.position.map(formatSceneViewNumber),
+      ...camera.target.map(formatSceneViewNumber)
+    ].join(",")
+    : "";
+  return [
+    cameraSignature,
+    state.selectedObjectId || "",
+    state.visibleLayerIds?.join("\u001f") || ""
+  ].join("|");
+}
+
+function formatSceneViewNumber(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(PREVIEW_SCENE_VIEW_NUMBER_PRECISION) : String(value);
+}
+
+function normalizeSceneViewNumber(value: number): number {
+  return Number.isFinite(value)
+    ? Number(value.toFixed(PREVIEW_SCENE_VIEW_NUMBER_PRECISION))
+    : value;
 }
 
 function restoreCameraView(
@@ -2774,9 +6609,31 @@ function getVisibleObjectBox(object: THREE.Object3D): THREE.Box3 | null {
   return hasBounds && !box.isEmpty() && Number.isFinite(box.min.x) ? box : null;
 }
 
+function getBox3Signature(box: THREE.Box3): string {
+  return [
+    box.min.x,
+    box.min.y,
+    box.min.z,
+    box.max.x,
+    box.max.y,
+    box.max.z
+  ].map((value) => Number.isFinite(value) ? value.toPrecision(10) : String(value)).join(",");
+}
+
 function getTilesRendererFromObject(object: THREE.Object3D): TilesRenderer | null {
   const candidate = object.userData.previewTilesRenderer;
   return candidate instanceof TilesRenderer ? candidate : null;
+}
+
+function isObjectInTilesRendererHierarchy(object: THREE.Object3D): boolean {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (getTilesRendererFromObject(current)) {
+      return true;
+    }
+    current = current.parent;
+  }
+  return false;
 }
 
 function createStarField() {
@@ -2813,6 +6670,67 @@ function createStarField() {
   stars.name = "Star Field";
   stars.renderOrder = -10;
   return stars;
+}
+
+function createFallbackEarth() {
+  const group = new THREE.Group();
+  group.name = "Default Earth";
+
+  const globeGeometry = new THREE.SphereGeometry(1, 96, 48);
+  globeGeometry.scale(
+    GEOSPATIAL_WGS84.radii.x,
+    GEOSPATIAL_WGS84.radii.y,
+    GEOSPATIAL_WGS84.radii.z
+  );
+
+  const globe = new THREE.Mesh(
+    globeGeometry,
+    new THREE.MeshStandardMaterial({
+      color: 0x1e6f9f,
+      emissive: 0x061a2a,
+      roughness: 0.96,
+      metalness: 0,
+      transparent: true,
+      opacity: 0.92
+    })
+  );
+  globe.name = "Default Earth Surface";
+  group.add(globe);
+
+  const gridGeometry = new THREE.WireframeGeometry(globeGeometry.clone());
+  const grid = new THREE.LineSegments(
+    gridGeometry,
+    new THREE.LineBasicMaterial({
+      color: 0x83d7ff,
+      transparent: true,
+      opacity: 0.08,
+      depthWrite: false
+    })
+  );
+  grid.name = "Default Earth Grid";
+  grid.renderOrder = 1;
+  group.add(grid);
+
+  const atmosphereGeometry = new THREE.SphereGeometry(1.012, 64, 32);
+  atmosphereGeometry.scale(
+    GEOSPATIAL_WGS84.radii.x,
+    GEOSPATIAL_WGS84.radii.y,
+    GEOSPATIAL_WGS84.radii.z
+  );
+  const atmosphere = new THREE.Mesh(
+    atmosphereGeometry,
+    new THREE.MeshBasicMaterial({
+      color: 0x4fb6ff,
+      transparent: true,
+      opacity: 0.08,
+      side: THREE.BackSide,
+      depthWrite: false
+    })
+  );
+  atmosphere.name = "Default Earth Atmosphere";
+  group.add(atmosphere);
+
+  return group;
 }
 
 function pseudoRandom(index: number, salt: number) {
@@ -2974,18 +6892,16 @@ function buildLayerTree(
   options: LayerTreeOptions = {}
 ): { tree: LayerNode[]; objectsByKey: Map<string, THREE.Object3D> } {
   const objectsByKey = new Map<string, THREE.Object3D>();
-  let count = 0;
 
   const visit = (object: THREE.Object3D, path: string): LayerNode | null => {
-    if (count > 500) return null;
     const key = path || "root";
     object.userData.previewLayerKey = key;
     objectsByKey.set(key, object);
-    count += 1;
     if (options.shallow) {
       return {
         key,
-        title: options.rootTitle || `${safeLayerName(object)}${object.type ? ` · ${object.type}` : ""}`
+        title: options.rootTitle || safeLayerName(object),
+        kind: object.type
       };
     }
     const children = object.children
@@ -2994,7 +6910,8 @@ function buildLayerTree(
 
     return {
       key,
-      title: options.rootTitle || `${safeLayerName(object)}${object.type ? ` · ${object.type}` : ""}`,
+      title: options.rootTitle || safeLayerName(object),
+      kind: object.type,
       children: children.length ? children : undefined
     };
   };
@@ -3006,25 +6923,100 @@ function buildLayerTree(
   };
 }
 
+function collectMaterialList(root: THREE.Object3D, maxObjects = Number.POSITIVE_INFINITY): MaterialNode[] {
+  const materials = new Map<string, MaterialNode>();
+  const stack = [root];
+  let count = 0;
+  while (stack.length && count < maxObjects) {
+    const object = stack.pop()!;
+    count += 1;
+    const mesh = object as THREE.Object3D & { material?: THREE.Material | THREE.Material[] };
+    const objectMaterials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+    if (objectMaterials.length) {
+      const layerKey = typeof object.userData.previewLayerKey === "string" ? object.userData.previewLayerKey : findLayerKeyForObject(object);
+      objectMaterials.forEach((material) => {
+        const key = material.uuid || material.name || "material";
+        const current = materials.get(key);
+        if (current) {
+          current.objectCount += 1;
+          if (!current.layerKey && layerKey) {
+            current.layerKey = layerKey;
+          }
+          return;
+        }
+        materials.set(key, {
+          key,
+          title: material.name?.trim() || "No Name",
+          layerKey,
+          objectCount: 1,
+          color: getMaterialPreviewColor(material)
+        });
+      });
+    }
+    for (let index = object.children.length - 1; index >= 0; index -= 1) {
+      stack.push(object.children[index]);
+    }
+  }
+  return [...materials.values()].sort((first, second) => first.title.localeCompare(second.title, "zh-CN"));
+}
+
+function getLayerTreeStateSignature(nodes: LayerNode[]): string {
+  const parts: string[] = [];
+  const visit = (node: LayerNode) => {
+    parts.push(node.key, node.title, node.kind || "", String(node.children?.length || 0));
+    node.children?.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return parts.join("\u001f");
+}
+
+function getMaterialListStateSignature(materials: MaterialNode[]): string {
+  return materials
+    .map((material) => [
+      material.key,
+      material.title,
+      material.layerKey || "",
+      material.objectCount,
+      material.color || ""
+    ].join("\u001e"))
+    .join("\u001f");
+}
+
+function getMaterialPreviewColor(material: THREE.Material): string | undefined {
+  const candidate = material as THREE.Material & { color?: THREE.Color };
+  return candidate.color instanceof THREE.Color ? `#${candidate.color.getHexString()}` : undefined;
+}
+
 function safeLayerName(object: THREE.Object3D): string {
   return (object.name || object.type || "Object").slice(0, 80);
 }
 
-function collectLayerSignature(root: THREE.Object3D): string {
+function collectLayerSignature(root: THREE.Object3D, maxObjects = 800): string {
   const parts: string[] = [];
+  const stack = [root];
   let count = 0;
-  root.traverse((object) => {
-    if (count > 800) return;
+  while (stack.length && count < maxObjects) {
+    const object = stack.pop()!;
     parts.push(`${object.uuid}:${object.type}:${object.name}:${object.children.length}`);
     count += 1;
-  });
+    for (let index = object.children.length - 1; index >= 0; index -= 1) {
+      stack.push(object.children[index]);
+    }
+  }
+  if (stack.length) {
+    parts.push(`more:${stack.length}`);
+  }
   return parts.join("|");
 }
 
 function findLayerKeyForObject(object: THREE.Object3D): string | null {
+  if (typeof object.userData.previewLayerKey === "string") {
+    return object.userData.previewLayerKey;
+  }
   let current: THREE.Object3D | null = object;
   while (current) {
     if (typeof current.userData.previewLayerKey === "string") {
+      object.userData.previewLayerKey = current.userData.previewLayerKey;
       return current.userData.previewLayerKey;
     }
     current = current.parent;
@@ -3042,51 +7034,293 @@ function flattenLayerKeys(nodes: LayerNode[]): string[] {
   return keys;
 }
 
-function collectExpandableLayerKeys(nodes: LayerNode[]): string[] {
-  const keys: string[] = [];
+function compactMeshLayerTree(nodes: LayerNode[]): LayerNode[] {
+  const visit = (node: LayerNode): LayerNode[] => {
+    const children = node.children?.flatMap(visit);
+    const nextNode = children
+      ? {
+        ...node,
+        children: children.length ? children : undefined
+      }
+      : node;
+    return shouldPromoteMeshLayerNode(nextNode) ? nextNode.children || [] : [nextNode];
+  };
+  return nodes.flatMap(visit);
+}
+
+function collectFlatMeshLayerNodes(nodes: LayerNode[]): LayerNode[] {
+  const renderableNodes: LayerNode[] = [];
+  const leafNodes: LayerNode[] = [];
   const visit = (node: LayerNode) => {
-    if (node.children?.length) {
-      keys.push(node.key);
-      node.children.forEach(visit);
+    const flatNode = {
+      ...node,
+      children: undefined
+    };
+    if (isRenderableMeshLayerNode(node)) {
+      renderableNodes.push(flatNode);
     }
+    if (!node.children?.length) {
+      leafNodes.push(flatNode);
+      return;
+    }
+    node.children.forEach(visit);
   };
   nodes.forEach(visit);
+  return renderableNodes.length ? renderableNodes : leafNodes;
+}
+
+function normalizeLayerSearchQuery(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function isLayerNodeSearchMatch(node: LayerNode, query: string): boolean {
+  if (!query) {
+    return true;
+  }
+  return node.title.toLocaleLowerCase().includes(query) ||
+    node.key.toLocaleLowerCase().includes(query) ||
+    (node.kind || "").toLocaleLowerCase().includes(query);
+}
+
+function filterLayerTreeBySearchQuery(nodes: LayerNode[], query: string): LayerNode[] {
+  if (!query) {
+    return nodes;
+  }
+  const visit = (node: LayerNode): LayerNode | null => {
+    if (isLayerNodeSearchMatch(node, query)) {
+      return node;
+    }
+    const children = node.children
+      ?.map(visit)
+      .filter((child): child is LayerNode => Boolean(child));
+    if (!children?.length) {
+      return null;
+    }
+    return {
+      ...node,
+      children
+    };
+  };
+  return nodes
+    .map(visit)
+    .filter((node): node is LayerNode => Boolean(node));
+}
+
+function countLayerSearchMatches(nodes: LayerNode[], query: string): number {
+  if (!query) {
+    return 0;
+  }
+  let count = 0;
+  const visit = (node: LayerNode) => {
+    if (isLayerNodeSearchMatch(node, query)) {
+      count += 1;
+    }
+    node.children?.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return count;
+}
+
+function collectPickableObjects(
+  root: THREE.Object3D,
+  fallbackLayerKey: string | null = null,
+  options: { maxObjects?: number; maxPickableObjects?: number } = {}
+): THREE.Object3D[] {
+  const maxObjects = options.maxObjects ?? Number.POSITIVE_INFINITY;
+  const maxPickableObjects = options.maxPickableObjects ?? Number.POSITIVE_INFINITY;
+  const pickableObjects: THREE.Object3D[] = [];
+  const stack = [root];
+  let count = 0;
+  while (stack.length && count < maxObjects && pickableObjects.length < maxPickableObjects) {
+    const object = stack.pop()!;
+    count += 1;
+    if (isRaycastRenderableObject(object) && !isHelperObject(object)) {
+      if (fallbackLayerKey && typeof object.userData.previewLayerKey !== "string") {
+        object.userData.previewLayerKey = fallbackLayerKey;
+      }
+      pickableObjects.push(object);
+    }
+    for (let index = object.children.length - 1; index >= 0; index -= 1) {
+      stack.push(object.children[index]);
+    }
+  }
+  return pickableObjects;
+}
+
+function isRaycastRenderableObject(object: THREE.Object3D): boolean {
+  const candidate = object as THREE.Object3D & {
+    isBatchedMesh?: boolean;
+    isInstancedMesh?: boolean;
+    isLine?: boolean;
+    isLineSegments?: boolean;
+    isMesh?: boolean;
+    isPoints?: boolean;
+    isSkinnedMesh?: boolean;
+    isSprite?: boolean;
+  };
+  return Boolean(
+    candidate.isMesh ||
+    candidate.isSkinnedMesh ||
+    candidate.isInstancedMesh ||
+    candidate.isBatchedMesh ||
+    candidate.isLine ||
+    candidate.isLineSegments ||
+    candidate.isPoints ||
+    candidate.isSprite
+  );
+}
+
+function isRenderableMeshLayerNode(node: LayerNode): boolean {
+  const kind = node.kind || "";
+  return kind === "Mesh" ||
+    kind === "SkinnedMesh" ||
+    kind === "InstancedMesh" ||
+    kind === "BatchedMesh" ||
+    kind === "Line" ||
+    kind === "LineSegments" ||
+    kind === "Points" ||
+    kind === "Sprite";
+}
+
+function shouldPromoteMeshLayerNode(node: LayerNode): boolean {
+  if (!node.children?.length) {
+    return false;
+  }
+  const title = node.title.toLowerCase();
+  return node.key === "model" ||
+    title.startsWith("group") ||
+    title.startsWith("scene") ||
+    title.includes("gltf") ||
+    title.includes("glb");
+}
+
+function collectExpandableLayerKeys(nodes: LayerNode[], maxDepth = 2, maxKeys = 80): string[] {
+  const keys: string[] = [];
+  const visit = (node: LayerNode, depth: number) => {
+    if (keys.length >= maxKeys) {
+      return;
+    }
+    if (node.children?.length && depth < maxDepth) {
+      keys.push(node.key);
+      node.children.forEach((child) => visit(child, depth + 1));
+    }
+  };
+  nodes.forEach((node) => visit(node, 0));
   return keys;
 }
 
-function collectNodeKeys(node: LayerNode): string[] {
-  return [
-    node.key,
-    ...(node.children || []).flatMap(collectNodeKeys)
-  ];
+function buildLayerNodeKeyLookup(nodes: LayerNode[]): Map<string, string[]> {
+  const lookup = new Map<string, string[]>();
+  const visit = (node: LayerNode): string[] => {
+    const keys = [node.key];
+    node.children?.forEach((child) => {
+      keys.push(...visit(child));
+    });
+    lookup.set(node.key, keys);
+    return keys;
+  };
+  nodes.forEach(visit);
+  return lookup;
 }
 
-function getLayerVisibilityState(node: LayerNode, checkedSet: Set<string>): LayerVisibilityState {
-  const nodeVisible = checkedSet.has(node.key);
-  if (!node.children?.length) {
-    return nodeVisible ? "visible" : "hidden";
+function findLayerNodeTitle(nodes: LayerNode[], key: string): string | null {
+  const stack = [...nodes];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (node.key === key) {
+      return node.title;
+    }
+    if (node.children?.length) {
+      stack.push(...node.children);
+    }
   }
+  return null;
+}
 
-  const childStates = node.children.map((child) => getLayerVisibilityState(child, checkedSet));
-  if (nodeVisible && childStates.every((state) => state === "visible")) {
+function findLayerAncestorKeys(nodes: LayerNode[], targetKey: string): string[] {
+  const visit = (node: LayerNode, ancestors: string[]): string[] | null => {
+    if (node.key === targetKey) {
+      return ancestors;
+    }
+    if (!node.children?.length) {
+      return null;
+    }
+    const nextAncestors = [...ancestors, node.key];
+    for (const child of node.children) {
+      const result = visit(child, nextAncestors);
+      if (result) {
+        return result;
+      }
+    }
+    return null;
+  };
+  for (const node of nodes) {
+    const result = visit(node, []);
+    if (result) {
+      return result;
+    }
+  }
+  return [];
+}
+
+function getLayerKeyFallbackTitle(key: string): string {
+  const fallbackTitle = key.split("/").filter(Boolean).pop();
+  return fallbackTitle || key;
+}
+
+function buildLayerVisibilityStateMap(
+  nodes: LayerNode[],
+  checkedSet: Set<string>
+): Map<string, LayerVisibilityState> {
+  const states = new Map<string, LayerVisibilityState>();
+  const visit = (node: LayerNode): LayerVisibilityState => {
+    const nodeVisible = checkedSet.has(node.key);
+    if (!node.children?.length) {
+      const state: LayerVisibilityState = nodeVisible ? "visible" : "hidden";
+      states.set(node.key, state);
+      return state;
+    }
+
+    const childStates = node.children.map(visit);
+    const state = getLayerVisibilityState(nodeVisible, childStates);
+    states.set(node.key, state);
+    return state;
+  };
+  nodes.forEach(visit);
+  return states;
+}
+
+function getLayerVisibilityState(
+  nodeVisible: boolean,
+  childStates: LayerVisibilityState[]
+): LayerVisibilityState {
+  if (nodeVisible && childStates.every((childState) => childState === "visible")) {
     return "visible";
   }
-  if (!nodeVisible && childStates.every((state) => state === "hidden")) {
+  if (!nodeVisible && childStates.every((childState) => childState === "hidden")) {
     return "hidden";
   }
   return "partial";
 }
 
-function collectSceneStats(root: THREE.Object3D): { meshes: number; vertices: number } {
+function collectSceneStats(root: THREE.Object3D, maxObjects = Number.POSITIVE_INFINITY): { meshes: number; vertices: number } {
   let meshes = 0;
   let vertices = 0;
-  root.traverse((object) => {
+  const stack = [root];
+  let count = 0;
+  while (stack.length && count < maxObjects) {
+    const object = stack.pop()!;
+    count += 1;
     const mesh = object as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    meshes += 1;
-    const position = mesh.geometry?.getAttribute("position");
-    vertices += position?.count || 0;
-  });
+    if (mesh.isMesh) {
+      meshes += 1;
+      const position = mesh.geometry?.getAttribute("position");
+      vertices += position?.count || 0;
+    }
+    for (let index = object.children.length - 1; index >= 0; index -= 1) {
+      stack.push(object.children[index]);
+    }
+  }
   return { meshes, vertices };
 }
 
@@ -3183,8 +7417,11 @@ function getTilesLoadErrorMessage(event: unknown): string {
 }
 
 function resolveContextTilesUrl(payload: PreviewPayload): string | undefined {
-  if (CESIUM_ION_TOKEN && CESIUM_ION_ASSET_ID) {
-    return `cesium-ion://asset/${encodeURIComponent(CESIUM_ION_ASSET_ID)}`;
+  const runtimeToken = getCesiumIonRuntimeToken();
+  const assetId = getCesiumIonRuntimeAssetId();
+  if ((CESIUM_ION_TOKEN || runtimeToken) && assetId) {
+    const tokenQuery = runtimeToken ? `?token=${encodeURIComponent(runtimeToken)}` : "";
+    return `cesium-ion://asset/${encodeURIComponent(assetId)}${tokenQuery}`;
   }
   const companionTiles = payload.files.find((file) => (
     file.fileType === "3dtiles" &&
@@ -3195,6 +7432,22 @@ function resolveContextTilesUrl(payload: PreviewPayload): string | undefined {
     return api.absoluteUrl(api.previewContentUrl(payload.task.id, companionTiles.fileName));
   }
   return undefined;
+}
+
+function getCesiumIonRuntimeToken(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  const params = new URLSearchParams(window.location.search);
+  return String(params.get("ionToken") || params.get("cesiumIonToken") || "").trim();
+}
+
+function getCesiumIonRuntimeAssetId(): string {
+  if (typeof window === "undefined") {
+    return CESIUM_ION_ASSET_ID;
+  }
+  const params = new URLSearchParams(window.location.search);
+  return String(params.get("ionAssetId") || params.get("cesiumIonAssetId") || CESIUM_ION_ASSET_ID).trim();
 }
 
 function createDefaultEllipsoidContext(): EllipsoidContext {
@@ -3211,6 +7464,10 @@ function createDefaultEllipsoidContext(): EllipsoidContext {
 function createTilesRenderer(url: string): TilesRenderer {
   const ionConfig = getCesiumIonConfig(url);
   const tiles = new TilesRenderer(ionConfig?.endpointUrl || (ionConfig ? undefined : url));
+  tiles.errorTarget = PREVIEW_TILE_ERROR_TARGET;
+  tiles.loadSiblings = false;
+  tiles.loadAncestors = false;
+  tiles.maxTilesProcessed = PREVIEW_TILE_MAX_PROCESSED;
   if (ionConfig) {
     tiles.registerPlugin(new CesiumIonAuthPlugin({
       apiToken: ionConfig.apiToken,
@@ -3239,12 +7496,78 @@ function registerTilesRenderer(
   renderer: PreviewRenderer,
   element: HTMLElement
 ) {
+  ensureTilesCamera(tiles, camera);
+  setTilesPreviewResolution(tiles, camera, renderer, element, "normal", true);
+}
+
+function ensureTilesCamera(tiles: TilesRenderer, camera: THREE.Camera) {
+  if (TILE_CAMERA_CACHE.get(tiles) === camera) {
+    return;
+  }
   tiles.setCamera(camera);
-  tiles.setResolution(
-    camera,
-    element.clientWidth || renderer.domElement.clientWidth || 1024,
-    element.clientHeight || renderer.domElement.clientHeight || 768
-  );
+  TILE_CAMERA_CACHE.set(tiles, camera);
+}
+
+function setTilesPreviewResolution(
+  tiles: TilesRenderer,
+  camera: THREE.Camera,
+  renderer: PreviewRenderer,
+  element: HTMLElement,
+  quality: PreviewTilesQuality = "normal",
+  force = false
+) {
+  renderer.getDrawingBufferSize(TILE_RESOLUTION_SIZE);
+  const width = TILE_RESOLUTION_SIZE.x || element.clientWidth || renderer.domElement.clientWidth || 1024;
+  const height = TILE_RESOLUTION_SIZE.y || element.clientHeight || renderer.domElement.clientHeight || 768;
+  const { maxResolution, errorTarget, maxTilesProcessed } = getPreviewTilesQualitySettings(quality);
+  const scale = Math.min(1, maxResolution / Math.max(width, height, 1));
+  const nextWidth = Math.max(1, Math.round(width * scale));
+  const nextHeight = Math.max(1, Math.round(height * scale));
+  const cached = TILE_RESOLUTION_CACHE.get(tiles);
+  if (
+    !force &&
+    cached &&
+    cached.width === nextWidth &&
+    cached.height === nextHeight &&
+    cached.quality === quality &&
+    cached.errorTarget === errorTarget &&
+    cached.maxTilesProcessed === maxTilesProcessed
+  ) {
+    return false;
+  }
+  tiles.errorTarget = errorTarget;
+  tiles.maxTilesProcessed = maxTilesProcessed;
+  tiles.setResolution(camera, nextWidth, nextHeight);
+  TILE_RESOLUTION_CACHE.set(tiles, {
+    width: nextWidth,
+    height: nextHeight,
+    quality,
+    errorTarget,
+    maxTilesProcessed
+  });
+  return true;
+}
+
+function getPreviewTilesQualitySettings(quality: PreviewTilesQuality) {
+  if (quality === "interactive") {
+    return {
+      maxResolution: PREVIEW_INTERACTIVE_TILES_MAX_RESOLUTION,
+      errorTarget: PREVIEW_INTERACTIVE_TILE_ERROR_TARGET,
+      maxTilesProcessed: PREVIEW_INTERACTIVE_TILE_MAX_PROCESSED
+    };
+  }
+  if (quality === "balanced") {
+    return {
+      maxResolution: PREVIEW_BALANCED_TILES_MAX_RESOLUTION,
+      errorTarget: PREVIEW_BALANCED_TILE_ERROR_TARGET,
+      maxTilesProcessed: PREVIEW_BALANCED_TILE_MAX_PROCESSED
+    };
+  }
+  return {
+    maxResolution: PREVIEW_TILES_MAX_RESOLUTION,
+    errorTarget: PREVIEW_TILE_ERROR_TARGET,
+    maxTilesProcessed: PREVIEW_TILE_MAX_PROCESSED
+  };
 }
 
 function setEllipsoidContextFromTiles(
@@ -3493,6 +7816,30 @@ function shouldDefaultCollapseLayerPanel(): boolean {
   return typeof window !== "undefined" && window.innerWidth < 960;
 }
 
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tagName = target.tagName.toLowerCase();
+  return target.isContentEditable ||
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    Boolean(target.closest("[contenteditable='true']"));
+}
+
+function isOperationHelpShortcut(event: KeyboardEvent): boolean {
+  if (event.altKey || event.ctrlKey || event.metaKey) {
+    return false;
+  }
+  return event.key === "?" || event.key.toLowerCase() === "h";
+}
+
+function getTransformModeShortcut(key: string): TransformMode | null {
+  const normalizedKey = key.toLowerCase();
+  return TRANSFORM_MODE_OPTIONS.find((option) => option.shortcut.toLowerCase() === normalizedKey)?.value || null;
+}
+
 function normalizeResetTransform(transform: PreviewTransform, sceneMode: PreviewSceneMode): PreviewTransform {
   const geo = sceneMode === "sphere" && transform.geo
     ? { ...transform.geo }
@@ -3606,6 +7953,44 @@ function previewTypeLabel(type: string): string {
   return labels[type] || type || "-";
 }
 
+function previewInteractionHintLabel(hint: PreviewInteractionHint): string {
+  const labels: Record<PreviewInteractionHint, string> = {
+    "globe-rotate": "旋转地球",
+    "globe-pan": "平移地球",
+    "globe-tilt": "俯仰观察",
+    "globe-zoom": "缩放地球",
+    "view-fit": "正在适配模型",
+    "view-focus-selected": "正在聚焦选中对象",
+    "view-reset": "正在恢复默认视角",
+    "view-earth-default": "正在恢复地球默认视角",
+    "view-cancel-interaction": "已停止视角惯性",
+    "transform-translate": "已切换到平移模式",
+    "transform-rotate": "已切换到旋转模式",
+    "transform-scale": "已切换到缩放模式"
+  };
+  return labels[hint];
+}
+
+function viewCommandInteractionHint(command: ViewCommand): PreviewInteractionHint | null {
+  const hints: Record<Exclude<ViewCommand, null>, PreviewInteractionHint> = {
+    fit: "view-fit",
+    "focus-selected": "view-focus-selected",
+    reset: "view-reset",
+    "earth-default": "view-earth-default",
+    "cancel-interaction": "view-cancel-interaction"
+  };
+  return command ? hints[command] : null;
+}
+
+function transformModeInteractionHint(mode: TransformMode): PreviewInteractionHint {
+  const hints: Record<TransformMode, PreviewInteractionHint> = {
+    translate: "transform-translate",
+    rotate: "transform-rotate",
+    scale: "transform-scale"
+  };
+  return hints[mode];
+}
+
 function saveLabel(status: PreviewSaveState): string {
   const labels = {
     idle: "",
@@ -3638,4 +8023,19 @@ function formatSize(value: number): string {
 
 function roundDisplay(value: number): number {
   return Number.isFinite(value) ? Number(value.toFixed(4)) : 0;
+}
+
+function formatPreviewNumberInput(
+  value: string | number | undefined,
+  info: { userTyping: boolean; input: string },
+  precision = 4
+): string {
+  if (info.userTyping) {
+    return info.input;
+  }
+  const numericValue = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numericValue)) {
+    return "0";
+  }
+  return String(Number(numericValue.toFixed(precision)));
 }

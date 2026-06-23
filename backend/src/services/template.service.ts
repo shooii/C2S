@@ -34,6 +34,10 @@ export interface UpdateTemplateConfigurationInput {
   parameterLabels?: Array<{ id: string; label: string }>;
 }
 
+interface ParseTemplateOptions {
+  parameterLabels?: Array<{ id: string; name: string; label: string }>;
+}
+
 export function listTemplates(options: { search?: string; enabled?: boolean } = {}): TemplateRecord[] {
   const db = getDb();
   const where: string[] = [];
@@ -190,13 +194,14 @@ export async function replaceTemplateFromUpload(
   }
 }
 
-export async function parseTemplate(id: string): Promise<TemplateDetail> {
+export async function parseTemplate(id: string, options: ParseTemplateOptions = {}): Promise<TemplateDetail> {
   const template = getTemplate(id);
   const db = getDb();
   const parsingAt = nowIso();
   const existingLabels = new Map(
     template.parameters.map((parameter) => [parameter.name.toLowerCase(), parameter.label])
   );
+  const currentLabels = buildCurrentParameterLabelMap(template.parameters, options.parameterLabels);
 
   db.prepare("UPDATE templates SET parseStatus = ?, parseMessage = ?, updatedAt = ? WHERE id = ?")
     .run("parsing", "正在解析 FME Published Parameters / User Parameters", parsingAt, id);
@@ -230,7 +235,7 @@ export async function parseTemplate(id: string): Promise<TemplateDetail> {
           id: randomUUID(),
           templateId: id,
           name: parameter.name,
-          label: existingLabels.get(parameter.name.toLowerCase()) || parameter.label,
+          label: currentLabels.get(parameter.name.toLowerCase()) || existingLabels.get(parameter.name.toLowerCase()) || parameter.label,
           type: parameter.type,
           defaultValue: parameter.defaultValue,
           required: parameter.required ? 1 : 0,
@@ -337,6 +342,28 @@ export function updateTemplateConfiguration(
 export function updateTemplateParseStatus(id: string, status: ParseStatus, message: string): void {
   getDb().prepare("UPDATE templates SET parseStatus = ?, parseMessage = ?, updatedAt = ? WHERE id = ?")
     .run(status, message, nowIso(), id);
+}
+
+function buildCurrentParameterLabelMap(
+  parameters: TemplateParameter[],
+  labels: ParseTemplateOptions["parameterLabels"] = []
+): Map<string, string> {
+  const parameterById = new Map(parameters.map((parameter) => [parameter.id, parameter]));
+  const result = new Map<string, string>();
+  labels.forEach((entry) => {
+    const parameter = parameterById.get(entry.id);
+    const label = entry.label.trim();
+    if (
+      !parameter ||
+      parameter.name !== entry.name ||
+      !label ||
+      label.length > 100
+    ) {
+      return;
+    }
+    result.set(parameter.name.toLowerCase(), label);
+  });
+  return result;
 }
 
 function mapTemplateRow(row: TemplateRow): TemplateRecord {
