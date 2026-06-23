@@ -7625,8 +7625,12 @@ function getCesiumIonConfig(url: string): { apiToken: string; assetId: string | 
   return null;
 }
 
+function hasNativeGeospatialPlacement(type: string): boolean {
+  return type === "3dtiles";
+}
+
 function shouldUseGeoPlacement(type: string, sceneMode: PreviewSceneMode): boolean {
-  return sceneMode === "sphere";
+  return sceneMode === "sphere" && !hasNativeGeospatialPlacement(type);
 }
 
 function geoTransformToMatrix(transform: PreviewTransform, ellipsoidContext: EllipsoidContext): THREE.Matrix4 {

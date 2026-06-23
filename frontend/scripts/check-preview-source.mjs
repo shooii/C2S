@@ -910,6 +910,9 @@ if (!previewPage.includes('object.type === "Line" || object.type === "LineSegmen
 if (!previewPage.includes("getEastNorthUpFrame(position") || !previewPage.includes("three-geospatial ENU uses Z as local Up")) {
   failures.push("src/pages/Preview/index.tsx: geospatial placement must keep the model local Z axis aligned to ENU up");
 }
+if (!previewPage.includes("function hasNativeGeospatialPlacement") || !previewPage.includes('return type === "3dtiles"') || !previewPage.includes("sceneMode === \"sphere\" && !hasNativeGeospatialPlacement(type)")) {
+  failures.push("src/pages/Preview/index.tsx: 3D Tiles should preserve native tileset georeferencing instead of being geospatially re-positioned a second time");
+}
 if (!previewPage.includes("normalizeTransformForScene") || !previewPage.includes("normalizeAngle(transform.rotation[0])") || !previewPage.includes("rotation: [\n      normalizeAngle(transform.rotation[0]),\n      0,\n      0")) {
   failures.push("src/pages/Preview/index.tsx: sphere preview should keep only azimuth so the model Z axis stays perpendicular to local ground");
 }
