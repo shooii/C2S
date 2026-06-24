@@ -721,7 +721,7 @@ const TRANSFORM_MODE_OPTIONS: Array<{
 const METERS_PER_DEGREE = 111_319.49079327358;
 const DEFAULT_GLOBE_LONGITUDE = 104;
 const DEFAULT_GLOBE_LATITUDE = 30;
-const DEFAULT_GLOBE_HEIGHT = 40_000_000;
+const DEFAULT_GLOBE_HEIGHT = 32_000_000;
 const MIN_GLOBE_ZOOM_DISTANCE = 2;
 const MIN_GLOBE_CAMERA_NEAR = 0.001;
 const MAX_GLOBE_CAMERA_FAR = 120_000_000;
@@ -7298,6 +7298,16 @@ function getWorldSurfaceNormal(point: THREE.Vector3, ellipsoidContext: Ellipsoid
   return normal.transformDirection(ellipsoidContext.group.matrixWorld).normalize();
 }
 
+function getWorldNorthDirection(point: THREE.Vector3, ellipsoidContext: EllipsoidContext): THREE.Vector3 {
+  const localPoint = point.clone().applyMatrix4(getEllipsoidFrameInverse(ellipsoidContext));
+  const eastNorthUpFrame = ellipsoidContext.geospatialEllipsoid
+    .getEastNorthUpFrame(localPoint, new THREE.Matrix4());
+  return new THREE.Vector3(0, 1, 0)
+    .transformDirection(eastNorthUpFrame)
+    .transformDirection(ellipsoidContext.group.matrixWorld)
+    .normalize();
+}
+
 function getTilesetCenterGeo(tiles: TilesRenderer, ellipsoidContext: EllipsoidContext): PreviewGeoPlacement | null {
   const sphere = new THREE.Sphere();
   if (!tiles.getBoundingSphere(sphere) || !Number.isFinite(sphere.radius)) {
@@ -7330,7 +7340,7 @@ function setInitialCamera(
   const targetVector = new THREE.Vector3().fromArray(target);
   const positionVector = new THREE.Vector3().fromArray(position);
   camera.position.copy(positionVector);
-  camera.up.copy(getWorldSurfaceNormal(targetVector, ellipsoidContext));
+  camera.up.copy(getWorldNorthDirection(targetVector, ellipsoidContext));
   camera.lookAt(targetVector);
   camera.near = 1;
   camera.far = MAX_GLOBE_CAMERA_FAR;

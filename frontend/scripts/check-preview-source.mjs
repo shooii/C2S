@@ -633,12 +633,18 @@ if (
   failures.push("src/pages/Preview/index.tsx: WebGL preview fallback should use the native WebGLRenderer path instead of WebGPURenderer forceWebGL initialization");
 }
 if (
-  !previewPage.includes("const DEFAULT_GLOBE_HEIGHT = 40_000_000") ||
+  !previewPage.includes("const DEFAULT_GLOBE_HEIGHT = 32_000_000") ||
   previewPage.includes("new THREE.Color(8, 8, 8)") ||
   !previewPage.includes("new THREE.MeshStandardMaterial({") ||
   !previewPage.includes("color: 0xffffff")
 ) {
   failures.push("src/pages/Preview/index.tsx: fallback earth should stay a no-texture white shaded globe with a camera distance that frames the sphere");
+}
+if (
+  !previewPage.includes("function getWorldNorthDirection") ||
+  !previewPage.includes("camera.up.copy(getWorldNorthDirection(targetVector, ellipsoidContext))")
+) {
+  failures.push("src/pages/Preview/index.tsx: earth default view should keep geographic north aligned to screen up");
 }
 if (
   !previewPage.includes("createPreviewAtmosphereRenderer") ||
