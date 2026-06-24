@@ -258,15 +258,30 @@ const updateTransformModeBranch = updateTransformModeStart >= 0 && updateTransfo
   : "";
 if (
   !previewPage.includes("const transformModeRef = useRef<TransformMode>(transformMode)") ||
+  !previewPage.includes("const transformControlsActiveRef = useRef(false)") ||
+  !previewPage.includes("const commitTransformControlsActive = useCallback((active: boolean) => {") ||
   !commitTransformModeBranch.includes("if (transformModeRef.current === mode)") ||
   !commitTransformModeBranch.includes("return false;") ||
   !commitTransformModeBranch.includes("transformModeRef.current = mode") ||
   !commitTransformModeBranch.includes("setTransformMode(mode)") ||
   !commitTransformModeBranch.includes("return true;") ||
-  !updateTransformModeBranch.includes("if (!commitTransformMode(mode))") ||
-  updateTransformModeBranch.indexOf("if (!commitTransformMode(mode))") > updateTransformModeBranch.indexOf("showInteractionHint")
+  !updateTransformModeBranch.includes("const wasInactive = !transformControlsActiveRef.current") ||
+  !updateTransformModeBranch.includes("const modeChanged = commitTransformMode(mode)") ||
+  !updateTransformModeBranch.includes("commitTransformControlsActive(true)") ||
+  !updateTransformModeBranch.includes("if (!modeChanged && !wasInactive)") ||
+  updateTransformModeBranch.indexOf("commitTransformControlsActive(true)") > updateTransformModeBranch.indexOf("showInteractionHint")
 ) {
-  failures.push("src/pages/Preview/index.tsx: transform mode controls should use a ref-backed commit helper so shortcuts skip unchanged state and listener churn");
+  failures.push("src/pages/Preview/index.tsx: transform mode controls should use ref-backed helpers so shortcuts skip unchanged state while same-mode clicks can activate the gizmo");
+}
+if (
+  !previewPage.includes("transformControlsActive={transformControlsActive}") ||
+  !previewPage.includes("latestTransformControlsActiveRef.current = transformControlsActive") ||
+  !previewPage.includes("function shouldShowTransformControlHelper(\n  transformControlsActive: boolean") ||
+  !previewPage.includes("if (!transformControlsActive || placementMode || !selectedLayerKey)") ||
+  !previewPage.includes("value={transformControlsActive ? transformMode : undefined}") ||
+  !previewPage.includes("aria-pressed={transformControlsActive && transformMode === mode.value}")
+) {
+  failures.push("src/pages/Preview/index.tsx: selecting a mesh layer should not show transform axes until a translate/rotate/scale mode is activated");
 }
 if (!previewPage.includes("runtimeStatus.fps && runtimeStatus.fps > 0") || !previewPage.includes("const fpsLabel = fpsValue ? String(fpsValue) : null")) {
   failures.push("src/pages/Preview/index.tsx: FPS overlay should appear only after a real positive sample exists");

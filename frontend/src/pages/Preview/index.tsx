@@ -898,6 +898,7 @@ function PreviewWorkspace({
   const [materialList, setMaterialList] = useState<MaterialNode[]>([]);
   const [selectedMaterialKey, setSelectedMaterialKey] = useState<string | null>(null);
   const [transformMode, setTransformMode] = useState<TransformMode>("translate");
+  const [transformControlsActive, setTransformControlsActive] = useState(false);
   const [viewOptions, setViewOptions] = useState<PreviewViewOptions>(readPreviewViewOptions);
   const [previewTimeMs, setPreviewTimeMs] = useState(() => roundPreviewTimeToMinute(Date.now()));
   const [viewCommand, setViewCommand] = useState<ViewCommandRequest | null>(null);
@@ -927,6 +928,7 @@ function PreviewWorkspace({
   const placementModeRef = useRef(placementMode);
   const operationHelpOpenRef = useRef(operationHelpOpen);
   const transformModeRef = useRef<TransformMode>(transformMode);
+  const transformControlsActiveRef = useRef(false);
   const stageFullscreenRef = useRef(stageFullscreen);
   const leftPanelTouchedRef = useRef(hasStoredPreviewLeftPanelCollapsedPreference());
   const leftPanelCollapsedRef = useRef(leftPanelCollapsed);
@@ -1061,6 +1063,15 @@ function PreviewWorkspace({
     return true;
   }, []);
 
+  const commitTransformControlsActive = useCallback((active: boolean) => {
+    if (transformControlsActiveRef.current === active) {
+      return false;
+    }
+    transformControlsActiveRef.current = active;
+    setTransformControlsActive(active);
+    return true;
+  }, []);
+
   const clearViewCommand = useCallback(() => {
     if (!viewCommandRef.current) {
       return;
@@ -1122,6 +1133,7 @@ function PreviewWorkspace({
     selectedMaterialKeyRef.current = null;
     setSelectedMaterialKey(null);
     commitTransformMode("translate");
+    commitTransformControlsActive(false);
     clearViewCommand();
     commitPlacementMode(false);
     if (placementFeedbackTimerRef.current) {
@@ -1284,11 +1296,14 @@ function PreviewWorkspace({
   }, [sceneMode, showInteractionHint]);
 
   const updateTransformMode = useCallback((mode: TransformMode) => {
-    if (!commitTransformMode(mode)) {
+    const wasInactive = !transformControlsActiveRef.current;
+    const modeChanged = commitTransformMode(mode);
+    commitTransformControlsActive(true);
+    if (!modeChanged && !wasInactive) {
       return;
     }
     showInteractionHint(transformModeInteractionHint(mode));
-  }, [commitTransformMode, showInteractionHint]);
+  }, [commitTransformControlsActive, commitTransformMode, showInteractionHint]);
 
   const handleFocusLayer = useCallback((key: string | null) => {
     updateSelectedLayer(key);
@@ -2041,9 +2056,10 @@ function PreviewWorkspace({
     commitPlacementMode(false);
     if (!canEditScene) {
       commitTransformMode("translate");
+      commitTransformControlsActive(false);
       commitOperationHelpOpen(false);
     }
-  }, [canEditScene, canUsePlacementMode, clearPlacementFeedback, clearScheduledInteractionHint, commitOperationHelpOpen, commitPlacementMode, commitTransformMode]);
+  }, [canEditScene, canUsePlacementMode, clearPlacementFeedback, clearScheduledInteractionHint, commitOperationHelpOpen, commitPlacementMode, commitTransformControlsActive, commitTransformMode]);
   const workspaceClassName = [
     "preview-workspace",
     leftPanelCollapsed ? "is-left-collapsed" : "",
@@ -2353,6 +2369,7 @@ function PreviewWorkspace({
             sceneMode={sceneMode}
             transform={transform}
             transformMode={transformMode}
+            transformControlsActive={transformControlsActive}
             selectedLayerKey={selectedLayerKey}
             hiddenLayerKeys={hiddenLayerKeys}
             placementMode={placementMode}
@@ -2473,11 +2490,11 @@ function PreviewWorkspace({
                   <Tooltip title={placementMode ? "退出地表落位后可切换变换模式" : mode.tooltip} key={mode.value}>
                     <Button
                       aria-label={mode.tooltip}
-                      aria-pressed={transformMode === mode.value}
-                      className={transformMode === mode.value ? "is-active" : undefined}
+                      aria-pressed={transformControlsActive && transformMode === mode.value}
+                      className={transformControlsActive && transformMode === mode.value ? "is-active" : undefined}
                       disabled={placementMode}
                       icon={mode.icon}
-                      type={transformMode === mode.value ? "primary" : "default"}
+                      type={transformControlsActive && transformMode === mode.value ? "primary" : "default"}
                       onClick={() => {
                         if (placementMode) {
                           return;
@@ -2906,7 +2923,7 @@ function PreviewWorkspace({
               block
               optionType="button"
               buttonStyle="solid"
-              value={transformMode}
+              value={transformControlsActive ? transformMode : undefined}
               disabled={transformModeControlsDisabled}
               options={TRANSFORM_MODE_OPTIONS.map(({ label, value }) => ({ label, value }))}
               onChange={(event) => {
@@ -2946,6 +2963,7 @@ type PreviewStageProps = {
   sceneMode: PreviewSceneMode;
   transform: PreviewTransform;
   transformMode: TransformMode;
+  transformControlsActive: boolean;
   selectedLayerKey: string | null;
   hiddenLayerKeys: string[];
   placementMode: boolean;
@@ -2997,6 +3015,7 @@ const PreviewStage = memo(function PreviewStage({
   sceneMode,
   transform,
   transformMode,
+  transformControlsActive,
   selectedLayerKey,
   hiddenLayerKeys,
   placementMode,
@@ -3062,6 +3081,7 @@ const PreviewStage = memo(function PreviewStage({
         sceneMode={sceneMode}
         transform={transform}
         transformMode={transformMode}
+        transformControlsActive={transformControlsActive}
         selectedLayerKey={selectedLayerKey}
         hiddenLayerKeys={hiddenLayerKeys}
         placementMode={canEditScene && placementMode}
@@ -3738,6 +3758,7 @@ type ThreeSceneProps = {
   sceneMode: PreviewSceneMode;
   transform: PreviewTransform;
   transformMode: TransformMode;
+  transformControlsActive: boolean;
   selectedLayerKey: string | null;
   hiddenLayerKeys: string[];
   placementMode: boolean;
@@ -3773,6 +3794,7 @@ const ThreeScene = memo(function ThreeScene({
   sceneMode,
   transform,
   transformMode,
+  transformControlsActive,
   selectedLayerKey,
   hiddenLayerKeys,
   placementMode,
@@ -3810,6 +3832,7 @@ const ThreeScene = memo(function ThreeScene({
   const latestSceneModeRef = useRef(sceneMode);
   const latestPlacementModeRef = useRef(placementMode);
   const latestTransformModeRef = useRef(transformMode);
+  const latestTransformControlsActiveRef = useRef(transformControlsActive);
   const latestSelectedLayerKeyRef = useRef(selectedLayerKey);
   const latestSceneViewStateRef = useRef(sceneViewState);
   const latestViewOptionsRef = useRef(viewOptions);
@@ -3859,6 +3882,7 @@ const ThreeScene = memo(function ThreeScene({
     const controls = transformControlsRef.current;
     if (controls) {
       controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
         objectsByLayerKeyRef.current,
         placementMode
@@ -3872,6 +3896,7 @@ const ThreeScene = memo(function ThreeScene({
     const controls = transformControlsRef.current;
     if (controls) {
       controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         selectedLayerKey,
         objectsByLayerKeyRef.current,
         latestPlacementModeRef.current
@@ -3879,6 +3904,20 @@ const ThreeScene = memo(function ThreeScene({
     }
     notifySceneRefreshRef.current();
   }, [selectedLayerKey]);
+
+  useEffect(() => {
+    latestTransformControlsActiveRef.current = transformControlsActive;
+    const controls = transformControlsRef.current;
+    if (controls) {
+      controls.getHelper().visible = shouldShowTransformControlHelper(
+        transformControlsActive,
+        latestSelectedLayerKeyRef.current,
+        objectsByLayerKeyRef.current,
+        latestPlacementModeRef.current
+      );
+    }
+    notifySceneRefreshRef.current();
+  }, [transformControlsActive]);
 
   useEffect(() => {
     latestSceneViewStateRef.current = sceneViewState;
@@ -3911,6 +3950,7 @@ const ThreeScene = memo(function ThreeScene({
     );
     if (transformControlsRef.current) {
       transformControlsRef.current.getHelper().visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
         objectsByLayerKeyRef.current,
         latestPlacementModeRef.current
@@ -3939,6 +3979,7 @@ const ThreeScene = memo(function ThreeScene({
     }
     if (controls) {
       controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
         objectsByLayerKeyRef.current,
         latestPlacementModeRef.current
@@ -3955,6 +3996,7 @@ const ThreeScene = memo(function ThreeScene({
     const controls = transformControlsRef.current;
     if (controls) {
       controls.getHelper().visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
         objectsByLayerKeyRef.current,
         latestPlacementModeRef.current
@@ -4612,6 +4654,7 @@ const ThreeScene = memo(function ThreeScene({
       const transformControlsHelper = transformControls.getHelper();
       removeTransformControlHelperLines(transformControlsHelper);
       transformControlsHelper.visible = shouldShowTransformControlHelper(
+        latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
         objectsByLayerKeyRef.current,
         latestPlacementModeRef.current
@@ -4712,6 +4755,7 @@ const ThreeScene = memo(function ThreeScene({
             latestTransformModeRef.current
           );
           transformControls.getHelper().visible = shouldShowTransformControlHelper(
+            latestTransformControlsActiveRef.current,
             latestSelectedLayerKeyRef.current,
             objectsByLayerKeyRef.current,
             latestPlacementModeRef.current
@@ -5085,6 +5129,7 @@ const ThreeScene = memo(function ThreeScene({
             isDynamicTilesScene ? PREVIEW_DYNAMIC_MATERIAL_SCAN_LIMIT : Number.POSITIVE_INFINITY
           ));
           transformControls.getHelper().visible = shouldShowTransformControlHelper(
+            latestTransformControlsActiveRef.current,
             latestSelectedLayerKeyRef.current,
             objectsByLayerKeyRef.current,
             latestPlacementModeRef.current
@@ -6008,11 +6053,12 @@ function isTransformControlPointerHit(
 }
 
 function shouldShowTransformControlHelper(
+  transformControlsActive: boolean,
   selectedLayerKey: string | null,
   objectsByLayerKey: Map<string, THREE.Object3D>,
   placementMode: boolean
 ): boolean {
-  if (placementMode || !selectedLayerKey) {
+  if (!transformControlsActive || placementMode || !selectedLayerKey) {
     return false;
   }
   const selected = objectsByLayerKey.get(selectedLayerKey);
