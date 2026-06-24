@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { detectWebGPUAdapterSupport } from "../utils/webgpuSupport";
 
 interface WebGPUSupportState {
   supported: boolean;
@@ -16,30 +17,13 @@ export function useWebGPUSupport(): WebGPUSupportState {
     let disposed = false;
 
     const check = async () => {
-      const gpu = (navigator as Navigator & {
-        gpu?: {
-          requestAdapter?: () => Promise<unknown>;
-        };
-      }).gpu;
-
-      if (!gpu?.requestAdapter) {
-        if (!disposed) {
-          setState({
-            supported: false,
-            checking: false,
-            reason: "当前浏览器未提供 WebGPU API。"
-          });
-        }
-        return;
-      }
-
       try {
-        const adapter = await gpu.requestAdapter();
+        const support = await detectWebGPUAdapterSupport();
         if (!disposed) {
           setState({
-            supported: Boolean(adapter),
+            supported: support.supported,
             checking: false,
-            reason: adapter ? undefined : "当前设备未提供可用的 WebGPU 适配器。"
+            reason: support.reason
           });
         }
       } catch (error) {

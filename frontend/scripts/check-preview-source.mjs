@@ -612,11 +612,33 @@ if (
 if (
   !previewPage.includes("createWebGPUPreviewRenderer(container, rendererPreference") ||
   !previewPage.includes("const renderer = new WebGPURenderer({") ||
-  !previewPage.includes("forceWebGL") ||
+  !previewPage.includes('powerPreference: webgpuSupport.powerPreference') ||
   !previewPage.includes("await renderer.init()") ||
   !previewPage.includes("highPrecision")
 ) {
   failures.push("src/pages/Preview/index.tsx: online preview should use the threejs-render WebGPURenderer initialization path");
+}
+const webgpuSupportSource = readSource("src/utils/webgpuSupport.ts");
+if (
+  !webgpuSupportSource.includes('powerPreference: "high-performance"') ||
+  !webgpuSupportSource.includes('featureLevel: "compatibility"') ||
+  !webgpuSupportSource.includes("detectWebGPUAdapterSupport")
+) {
+  failures.push("src/utils/webgpuSupport.ts: WebGPU support detection should try the high-performance compatibility adapter before falling back");
+}
+if (
+  !previewPage.includes("new THREE.WebGLRenderer({") ||
+  previewPage.includes("forceWebGL")
+) {
+  failures.push("src/pages/Preview/index.tsx: WebGL preview fallback should use the native WebGLRenderer path instead of WebGPURenderer forceWebGL initialization");
+}
+if (
+  !previewPage.includes("const DEFAULT_GLOBE_HEIGHT = 40_000_000") ||
+  previewPage.includes("new THREE.Color(8, 8, 8)") ||
+  !previewPage.includes("new THREE.MeshStandardMaterial({") ||
+  !previewPage.includes("color: 0xffffff")
+) {
+  failures.push("src/pages/Preview/index.tsx: fallback earth should stay a no-texture white shaded globe with a camera distance that frames the sphere");
 }
 if (
   !previewPage.includes("createPreviewAtmosphereRenderer") ||
@@ -624,6 +646,28 @@ if (
   !combinedSource.includes("AtmosphereContext")
 ) {
   failures.push("src/pages/Preview: online sphere preview should keep the threejs-render atmosphere earth rendering path");
+}
+const previewAtmosphereRendererSource = readSource("src/pages/Preview/previewAtmosphereRenderer.ts");
+if (
+  !previewAtmosphereRendererSource.includes("const DEFAULT_TONE_MAPPING_EXPOSURE = 35") ||
+  !previewAtmosphereRendererSource.includes("webgpuRenderer.toneMapping = THREE.NoToneMapping") ||
+  !previewAtmosphereRendererSource.includes("getToneMappingExposure")
+) {
+  failures.push("src/pages/Preview/previewAtmosphereRenderer.ts: WebGPU atmosphere pipeline should reuse the reference render-pipeline tone mapping exposure path");
+}
+if (
+  !previewPage.includes("getPreviewSolarTimeMs") ||
+  !previewPage.includes("syncPreviewTimeLighting") ||
+  !previewPage.includes("atmosphereExposure")
+) {
+  failures.push("src/pages/Preview/index.tsx: time controls should drive local solar lighting, renderer exposure, and atmosphere exposure");
+}
+if (
+  !combinedSource.includes("PreviewTileMaterialReplacementPlugin") ||
+  !combinedSource.includes("MeshStandardNodeMaterial") ||
+  !previewPage.includes("preparePreviewObjectForRenderer")
+) {
+  failures.push("src/pages/Preview: WebGPU previews should reuse the reference MeshStandardNodeMaterial replacement path");
 }
 const viewOptionsWriterStart = previewPage.indexOf("function writePreviewViewOptions(");
 const viewOptionsWriterEnd = previewPage.indexOf("function readPreviewSidePanelPreferences", viewOptionsWriterStart);

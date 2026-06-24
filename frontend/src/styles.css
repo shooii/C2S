@@ -1632,6 +1632,54 @@ body {
   border-radius: 6px;
 }
 
+.preview-time-panel {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 9px;
+  background: #f7fbff;
+  border: 1px solid #d8eaff;
+  border-radius: 7px;
+}
+
+.preview-time-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.preview-time-panel-header > span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+  color: #234766;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.preview-time-panel-header .ant-btn {
+  flex: 0 0 auto;
+}
+
+.preview-time-slider-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.preview-time-slider-row > span {
+  color: #516075;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.preview-time-slider-row .ant-slider {
+  margin: 4px 6px;
+}
+
 .preview-render-surface {
   isolation: isolate;
   overflow: hidden;

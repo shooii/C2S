@@ -7,6 +7,7 @@ import {
   InputNumber,
   Radio,
   Result,
+  Slider,
   Space,
   Spin,
   Tag,
@@ -17,6 +18,7 @@ import {
   AimOutlined,
   ArrowLeftOutlined,
   BgColorsOutlined,
+  ClockCircleOutlined,
   CloseOutlined,
   ColumnHeightOutlined,
   CompressOutlined,
@@ -40,6 +42,7 @@ import {
   SearchOutlined,
   SettingOutlined,
   StarOutlined,
+  SunOutlined,
   UndoOutlined,
   UpOutlined
 } from "@ant-design/icons";
@@ -66,8 +69,11 @@ import { UnrealPreview } from "../../components/preview/UnrealPreview";
 import { usePreviewSettings } from "../../hooks/usePreviewSettings";
 import { useSceneViewState } from "../../hooks/useSceneViewState";
 import { useWebGPUSupport } from "../../hooks/useWebGPUSupport";
-import { createPreviewAtmosphereRenderer, type PreviewAtmosphereRenderer } from "./previewAtmosphereRenderer";
+import { detectWebGPUAdapterSupport, describeWebGPUAdapterFailure } from "../../utils/webgpuSupport";
+import { createPreviewAtmosphereRenderer, getPreviewSunDirectionECEF, type PreviewAtmosphereRenderer } from "./previewAtmosphereRenderer";
+import { AgXPunchyToneMapping, agxPunchyToneMapping } from "./previewAgxToneMapping";
 import { configurePreviewGlobeControls, type RuntimeGlobeControls } from "./previewGlobeControls";
+import { PreviewTileMaterialReplacementPlugin, replacePreviewMeshMaterials } from "./previewWebGpuMaterials";
 import type {
   PreviewGeoPlacement,
   PreviewPayload,
@@ -178,6 +184,8 @@ const PREVIEW_DYNAMIC_PICKABLE_SCAN_LIMIT = 1200;
 const PREVIEW_DYNAMIC_PICKABLE_OBJECT_LIMIT = 520;
 const PREVIEW_DYNAMIC_MATERIAL_SCAN_LIMIT = 650;
 const PREVIEW_DYNAMIC_STATS_SCAN_LIMIT = 1000;
+const PREVIEW_DAY_MINUTES = 24 * 60;
+const PREVIEW_TIME_SLIDER_STEP_MINUTES = 15;
 
 function clampPreviewLeftPanelWidth(width: number): number {
   return Math.round(THREE.MathUtils.clamp(
@@ -226,6 +234,139 @@ function formatPreviewStateNumber(value: number): number {
   return Number.isFinite(value)
     ? Math.round(value * 1_000_000_000) / 1_000_000_000
     : 0;
+}
+
+function roundPreviewTimeToMinute(timeMs: number): number {
+  if (!Number.isFinite(timeMs)) {
+    return roundPreviewTimeToMinute(Date.now());
+  }
+  return Math.round(timeMs / 60_000) * 60_000;
+}
+
+function padPreviewTimePart(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatPreviewDateTimeLocal(timeMs: number): string {
+  const date = new Date(Number.isFinite(timeMs) ? timeMs : Date.now());
+  return [
+    date.getFullYear(),
+    "-",
+    padPreviewTimePart(date.getMonth() + 1),
+    "-",
+    padPreviewTimePart(date.getDate()),
+    "T",
+    padPreviewTimePart(date.getHours()),
+    ":",
+    padPreviewTimePart(date.getMinutes())
+  ].join("");
+}
+
+function parsePreviewDateTimeLocal(value: string): number | null {
+  const timeMs = new Date(value).getTime();
+  return Number.isFinite(timeMs) ? roundPreviewTimeToMinute(timeMs) : null;
+}
+
+function getPreviewTimeOfDayMinutes(timeMs: number): number {
+  const date = new Date(Number.isFinite(timeMs) ? timeMs : Date.now());
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+function setPreviewTimeOfDayMinutes(timeMs: number, minuteOfDay: number): number {
+  const date = new Date(Number.isFinite(timeMs) ? timeMs : Date.now());
+  const normalizedMinute = Math.round(THREE.MathUtils.clamp(minuteOfDay, 0, PREVIEW_DAY_MINUTES - 1));
+  date.setHours(Math.floor(normalizedMinute / 60), normalizedMinute % 60, 0, 0);
+  return date.getTime();
+}
+
+function formatPreviewMinuteOfDay(minuteOfDay: number): string {
+  const normalizedMinute = Math.round(THREE.MathUtils.clamp(minuteOfDay, 0, PREVIEW_DAY_MINUTES - 1));
+  return `${padPreviewTimePart(Math.floor(normalizedMinute / 60))}:${padPreviewTimePart(normalizedMinute % 60)}`;
+}
+
+function getPreviewSolarTimeMs(timeMs: number, longitude: number): number {
+  const date = new Date(Number.isFinite(timeMs) ? timeMs : Date.now());
+  const year = date.getFullYear();
+  const dayOfYear = getPreviewLocalDayOfYear(date);
+  const timeOfDay = date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600;
+  const epoch = Date.UTC(year, 0, 1, 0, 0, 0, 0);
+  const longitudeOffset = longitude / 15;
+  return epoch + ((dayOfYear - 1) * 24 + timeOfDay - longitudeOffset) * 3_600_000;
+}
+
+function getPreviewLocalDayOfYear(date: Date): number {
+  const start = Date.UTC(date.getFullYear(), 0, 1);
+  const day = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  return Math.floor((day - start) / 86_400_000) + 1;
+}
+
+function getPreviewLightingReferenceGeo(transform: PreviewTransform, modelLoaded: boolean): PreviewGeoPlacement {
+  if (modelLoaded && transform.geo && !isDefaultPreviewLightingGeo(transform.geo)) {
+    return transform.geo;
+  }
+  return {
+    longitude: DEFAULT_GLOBE_LONGITUDE,
+    latitude: DEFAULT_GLOBE_LATITUDE,
+    height: 0
+  };
+}
+
+function isDefaultPreviewLightingGeo(geo: PreviewGeoPlacement): boolean {
+  return Math.abs(geo.longitude) < 1e-8 &&
+    Math.abs(geo.latitude) < 1e-8 &&
+    Math.abs(geo.height) < 1e-4;
+}
+
+const previewLightingSurfaceScratch = new THREE.Vector3();
+const previewLightingNormalScratch = new THREE.Vector3();
+const previewLightingSunScratch = new THREE.Vector3();
+
+function getPreviewTimeLightingState(
+  timeMs: number,
+  transform: PreviewTransform,
+  ellipsoidContext: EllipsoidContext,
+  modelLoaded: boolean
+): PreviewTimeLightingState {
+  const referenceGeo = getPreviewLightingReferenceGeo(transform, modelLoaded);
+  const solarTimeMs = getPreviewSolarTimeMs(timeMs, referenceGeo.longitude);
+  const localPosition = geodeticToLocalPosition({
+    longitude: referenceGeo.longitude,
+    latitude: referenceGeo.latitude,
+    height: 0
+  }, ellipsoidContext, previewLightingSurfaceScratch);
+  const normal = ellipsoidContext.geospatialEllipsoid
+    .getSurfaceNormal(localPosition, previewLightingNormalScratch)
+    .normalize();
+  const sunDirection = getPreviewSunDirectionECEF(solarTimeMs, previewLightingSunScratch);
+  const sunElevation = THREE.MathUtils.clamp(normal.dot(sunDirection), -1, 1);
+  const daylight = smoothPreviewLighting(-0.06, 0.28, sunElevation);
+  const horizonGlow = 1 - Math.min(1, Math.abs(sunElevation + 0.02) / 0.22);
+  const twilight = THREE.MathUtils.clamp(horizonGlow, 0, 1) * (1 - daylight * 0.45);
+  const backgroundColor = PREVIEW_LIGHTING_NIGHT_SKY.clone().lerp(PREVIEW_LIGHTING_DAY_SKY, daylight);
+  const sunColor = PREVIEW_LIGHTING_SUNSET.clone().lerp(PREVIEW_LIGHTING_DAY_SUN, smoothPreviewLighting(0.04, 0.45, sunElevation));
+
+  return {
+    daylight,
+    sunIntensity: 0.08 + daylight * 4.45 + twilight * 0.95,
+    hemisphereIntensity: 0.16 + daylight * 0.95 + twilight * 0.24,
+    atmosphereHemisphereIntensity: 0.05 + daylight * 0.3 + twilight * 0.12,
+    rendererExposure: 0.42 + daylight * 0.96 + twilight * 0.16,
+    atmosphereExposure: 7 + daylight * 30 + twilight * 9,
+    starOpacity: 0.78 - daylight * 0.58,
+    backgroundColor,
+    sunColor,
+    solarTimeMs,
+    signature: [
+      Math.round(solarTimeMs / 60_000),
+      daylight.toFixed(3),
+      twilight.toFixed(3)
+    ].join(":")
+  };
+}
+
+function smoothPreviewLighting(edge0: number, edge1: number, value: number): number {
+  const t = THREE.MathUtils.clamp((value - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
 function getPreviewTransformPersistenceState(transform: PreviewTransform) {
@@ -544,6 +685,20 @@ interface CanvasHoverRequest {
   shiftKey: boolean;
 }
 
+interface PreviewTimeLightingState {
+  daylight: number;
+  sunIntensity: number;
+  hemisphereIntensity: number;
+  atmosphereHemisphereIntensity: number;
+  rendererExposure: number;
+  atmosphereExposure: number;
+  starOpacity: number;
+  backgroundColor: THREE.Color;
+  sunColor: THREE.Color;
+  solarTimeMs: number;
+  signature: string;
+}
+
 const DEFAULT_TRANSFORM: PreviewTransform = {
   position: [0, 0, 0],
   rotation: [0, 0, 0],
@@ -566,11 +721,15 @@ const TRANSFORM_MODE_OPTIONS: Array<{
 const METERS_PER_DEGREE = 111_319.49079327358;
 const DEFAULT_GLOBE_LONGITUDE = 104;
 const DEFAULT_GLOBE_LATITUDE = 30;
-const DEFAULT_GLOBE_HEIGHT = 15_500_000;
+const DEFAULT_GLOBE_HEIGHT = 40_000_000;
 const MIN_GLOBE_ZOOM_DISTANCE = 2;
 const MIN_GLOBE_CAMERA_NEAR = 0.001;
 const MAX_GLOBE_CAMERA_FAR = 120_000_000;
 const MIN_GLOBE_FOCUS_DISTANCE = 0.5;
+const PREVIEW_LIGHTING_NIGHT_SKY = new THREE.Color(0x020611);
+const PREVIEW_LIGHTING_DAY_SKY = new THREE.Color(0x071422);
+const PREVIEW_LIGHTING_SUNSET = new THREE.Color(0xffb06a);
+const PREVIEW_LIGHTING_DAY_SUN = new THREE.Color(0xffffff);
 const PREVIEW_MAX_PIXEL_RATIO = 1.5;
 const PREVIEW_INTERACTIVE_PIXEL_RATIO = 0.9;
 const PREVIEW_LOW_FPS_PIXEL_RATIO = 0.85;
@@ -737,6 +896,7 @@ function PreviewWorkspace({
   const [selectedMaterialKey, setSelectedMaterialKey] = useState<string | null>(null);
   const [transformMode, setTransformMode] = useState<TransformMode>("translate");
   const [viewOptions, setViewOptions] = useState<PreviewViewOptions>(readPreviewViewOptions);
+  const [previewTimeMs, setPreviewTimeMs] = useState(() => roundPreviewTimeToMinute(Date.now()));
   const [viewCommand, setViewCommand] = useState<ViewCommandRequest | null>(null);
   const [placementMode, setPlacementMode] = useState(false);
   const [placementFeedback, setPlacementFeedback] = useState("");
@@ -1596,6 +1756,24 @@ function PreviewWorkspace({
     }));
   }, []);
 
+  const handlePreviewTimeInputChange = useCallback((value: string) => {
+    const nextTimeMs = parsePreviewDateTimeLocal(value);
+    if (nextTimeMs !== null) {
+      setPreviewTimeMs(nextTimeMs);
+    }
+  }, []);
+
+  const handlePreviewTimeOfDayChange = useCallback((value: number | number[]) => {
+    if (Array.isArray(value)) {
+      return;
+    }
+    setPreviewTimeMs((current) => setPreviewTimeOfDayMinutes(current, value));
+  }, []);
+
+  const resetPreviewTimeToNow = useCallback(() => {
+    setPreviewTimeMs(roundPreviewTimeToMinute(Date.now()));
+  }, []);
+
   useEffect(() => {
     writePreviewViewOptions(viewOptions);
   }, [viewOptions]);
@@ -1881,6 +2059,10 @@ function PreviewWorkspace({
   const showFloatingSelectedObject = Boolean(canEditScene && selectedLayerKey && showSceneShortcutTools);
   const showHiddenMeshesHint = Boolean(canEditScene && isModel && allMeshLayersHidden);
   const transformModeControlsDisabled = !canEditScene || placementMode;
+  const timeControlsDisabled = activePreviewEngine !== "three";
+  const previewTimeInputValue = formatPreviewDateTimeLocal(previewTimeMs);
+  const previewTimeOfDayMinutes = getPreviewTimeOfDayMinutes(previewTimeMs);
+  const previewTimeOfDayLabel = formatPreviewMinuteOfDay(previewTimeOfDayMinutes);
   const sideTabContentPending = activeSideTab !== renderedSideTab;
 
   return (
@@ -2168,6 +2350,7 @@ function PreviewWorkspace({
             placementFeedback={placementFeedback}
             canEditScene={canEditScene}
             viewOptions={viewOptions}
+            previewTimeMs={previewTimeMs}
             viewCommand={viewCommand}
             sceneViewState={sceneViewState}
             onLayerTreeChange={updateLayerTree}
@@ -2661,6 +2844,44 @@ function PreviewWorkspace({
                 </>
               ) : null}
             </Space>
+            <div className="preview-time-panel">
+              <div className="preview-time-panel-header">
+                <span>
+                  <SunOutlined />
+                  时间与光照
+                </span>
+                <Tooltip title="使用当前时间">
+                  <Button
+                    aria-label="使用当前时间"
+                    icon={<ClockCircleOutlined />}
+                    size="small"
+                    type="text"
+                    disabled={timeControlsDisabled}
+                    onClick={resetPreviewTimeToNow}
+                  />
+                </Tooltip>
+              </div>
+              <Input
+                aria-label="预览时间"
+                type="datetime-local"
+                value={previewTimeInputValue}
+                disabled={timeControlsDisabled}
+                onChange={(event) => handlePreviewTimeInputChange(event.target.value)}
+              />
+              <div className="preview-time-slider-row">
+                <span>{previewTimeOfDayLabel}</span>
+                <Slider
+                  aria-label="一天内时间"
+                  min={0}
+                  max={PREVIEW_DAY_MINUTES - 1}
+                  step={PREVIEW_TIME_SLIDER_STEP_MINUTES}
+                  value={previewTimeOfDayMinutes}
+                  disabled={timeControlsDisabled}
+                  tooltip={{ formatter: (value) => formatPreviewMinuteOfDay(Number(value ?? 0)) }}
+                  onChange={handlePreviewTimeOfDayChange}
+                />
+              </div>
+            </div>
             <Radio.Group
               aria-label="模型变换模式"
               block
@@ -2712,6 +2933,7 @@ type PreviewStageProps = {
   placementFeedback: string;
   canEditScene: boolean;
   viewOptions: PreviewViewOptions;
+  previewTimeMs: number;
   viewCommand: ViewCommandRequest | null;
   sceneViewState: SceneViewState;
   onLayerTreeChange: (tree: LayerNode[]) => void;
@@ -2762,6 +2984,7 @@ const PreviewStage = memo(function PreviewStage({
   placementFeedback,
   canEditScene,
   viewOptions,
+  previewTimeMs,
   viewCommand,
   sceneViewState,
   onLayerTreeChange,
@@ -2824,6 +3047,7 @@ const PreviewStage = memo(function PreviewStage({
         hiddenLayerKeys={hiddenLayerKeys}
         placementMode={canEditScene && placementMode}
         viewOptions={viewOptions}
+        previewTimeMs={previewTimeMs}
         viewCommand={viewCommand}
         sceneViewState={sceneViewState}
         onLayerTreeChange={onLayerTreeChange}
@@ -3499,6 +3723,7 @@ type ThreeSceneProps = {
   hiddenLayerKeys: string[];
   placementMode: boolean;
   viewOptions: PreviewViewOptions;
+  previewTimeMs: number;
   viewCommand: ViewCommandRequest | null;
   sceneViewState: SceneViewState;
   onLayerTreeChange: (tree: LayerNode[]) => void;
@@ -3533,6 +3758,7 @@ const ThreeScene = memo(function ThreeScene({
   hiddenLayerKeys,
   placementMode,
   viewOptions,
+  previewTimeMs,
   viewCommand,
   sceneViewState,
   onLayerTreeChange,
@@ -3568,6 +3794,7 @@ const ThreeScene = memo(function ThreeScene({
   const latestSelectedLayerKeyRef = useRef(selectedLayerKey);
   const latestSceneViewStateRef = useRef(sceneViewState);
   const latestViewOptionsRef = useRef(viewOptions);
+  const latestPreviewTimeMsRef = useRef(previewTimeMs);
   const latestHiddenLayerKeysRef = useRef(hiddenLayerKeys);
   const hiddenLayerKeysSignatureRef = useRef<string | null>(null);
   const notifySceneRefreshRef = useRef<(options?: { syncCamera?: boolean }) => void>(() => undefined);
@@ -3642,6 +3869,11 @@ const ThreeScene = memo(function ThreeScene({
     latestViewOptionsRef.current = viewOptions;
     notifySceneRefreshRef.current();
   }, [viewOptions]);
+
+  useEffect(() => {
+    latestPreviewTimeMsRef.current = previewTimeMs;
+    notifySceneRefreshRef.current();
+  }, [previewTimeMs]);
 
   useEffect(() => {
     const modelRoot = modelRootRef.current;
@@ -3820,6 +4052,7 @@ const ThreeScene = memo(function ThreeScene({
     let pendingTransformChange: PreviewTransform | null = null;
     let pendingTransformChangeTimer = 0;
     let lastTransformChangeEmitTime = 0;
+    let previewLightingSignature = "";
     const plainBackground = new THREE.Color(0x071422);
     let atmosphereRenderer: PreviewAtmosphereRenderer | null = null;
     const cancelScheduledPreviewResize = () => {
@@ -3940,6 +4173,7 @@ const ThreeScene = memo(function ThreeScene({
     };
     fallbackEarth = createFallbackEarth();
     ellipsoidAnchor.add(fallbackEarth);
+    const allowAtmosphereRenderer = hasCesiumIonGlobeContext(contextTilesUrl, url);
 
     const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 120_000_000);
     if (!restoreCameraView(camera, latestSceneViewStateRef.current, ellipsoidContextRef.current)) {
@@ -4086,30 +4320,72 @@ const ThreeScene = memo(function ThreeScene({
       };
       updateNavigationMode();
 
-      try {
-        atmosphereRenderer = createPreviewAtmosphereRenderer({
-          renderer,
-          scene,
-          camera,
-          ellipsoidFrame: ellipsoidAnchor,
-          getGeospatialEllipsoid: () => ellipsoidContextRef.current.geospatialEllipsoid
-        });
-      } catch (error) {
-        console.warn("Takram atmosphere preview renderer failed to initialize.", error);
-        atmosphereRenderer = null;
-      }
-
-      scene.add(new THREE.HemisphereLight(0xdcefff, 0x162032, atmosphereRenderer ? 0.35 : 1.1));
-      if (!atmosphereRenderer) {
-        const directional = new THREE.DirectionalLight(0xffffff, 4.2);
-        directional.position.set(1, 0.35, 0.55).normalize();
-        scene.add(directional);
-      }
+      const getCurrentPreviewLightingState = () => getPreviewTimeLightingState(
+        latestPreviewTimeMsRef.current,
+        latestTransformRef.current,
+        ellipsoidContextRef.current,
+        Boolean(modelRootRef.current)
+      );
+      const initialLightingState = getCurrentPreviewLightingState();
+      const hemisphereLight = new THREE.HemisphereLight(0xdcefff, 0x162032, initialLightingState.hemisphereIntensity);
+      scene.add(hemisphereLight);
+      let fallbackDirectionalLight: THREE.DirectionalLight | null = new THREE.DirectionalLight(0xffffff, 4.2);
+      updatePreviewFallbackSunLight(fallbackDirectionalLight, initialLightingState, ellipsoidContextRef.current);
+      scene.add(fallbackDirectionalLight);
+      const syncPreviewTimeLighting = (activeRenderer: PreviewRenderer): boolean => {
+        const lightingState = getCurrentPreviewLightingState();
+        if (lightingState.signature === previewLightingSignature) {
+          return false;
+        }
+        previewLightingSignature = lightingState.signature;
+        activeRenderer.toneMappingExposure = lightingState.rendererExposure;
+        hemisphereLight.intensity = atmosphereRenderer
+          ? lightingState.atmosphereHemisphereIntensity
+          : lightingState.hemisphereIntensity;
+        if (fallbackDirectionalLight) {
+          updatePreviewFallbackSunLight(fallbackDirectionalLight, lightingState, ellipsoidContextRef.current);
+        }
+        updatePreviewStarFieldOpacity(starField, lightingState.starOpacity);
+        plainBackground.copy(lightingState.backgroundColor);
+        return true;
+      };
+      const ensureAtmosphereRenderer = () => {
+        if (!allowAtmosphereRenderer || atmosphereRenderer || !renderer) {
+          return;
+        }
+        try {
+          const lightingState = getCurrentPreviewLightingState();
+          atmosphereRenderer = createPreviewAtmosphereRenderer({
+            renderer,
+            scene,
+            camera,
+            ellipsoidFrame: ellipsoidAnchor,
+            getGeospatialEllipsoid: () => ellipsoidContextRef.current.geospatialEllipsoid,
+            getShadowTiles: () => tilesRef.current,
+            getTimeMs: () => getCurrentPreviewLightingState().solarTimeMs,
+            getToneMappingExposure: () => getCurrentPreviewLightingState().atmosphereExposure
+          });
+          if (atmosphereRenderer) {
+            hemisphereLight.intensity = lightingState.atmosphereHemisphereIntensity;
+            if (fallbackDirectionalLight) {
+              scene.remove(fallbackDirectionalLight);
+              fallbackDirectionalLight = null;
+            }
+            previewLightingSignature = "";
+            syncPreviewTimeLighting(renderer);
+          }
+        } catch (error) {
+          console.warn("Takram atmosphere preview renderer failed to initialize.", error);
+          atmosphereRenderer = null;
+        }
+      };
 
       starField = createStarField();
       starField.visible = true;
       scene.add(starField);
       scene.background = null;
+      previewLightingSignature = "";
+      syncPreviewTimeLighting(renderer);
 
       let lastLoadProgressPercent = -1;
       let lastLoadProgressEmitTime = 0;
@@ -4217,6 +4493,7 @@ const ThreeScene = memo(function ThreeScene({
           if (fallbackEarth) {
             fallbackEarth.visible = false;
           }
+          ensureAtmosphereRenderer();
         });
         addTilesEventListener(loaded.tiles, "load-error", (event) => {
           if (hasContent || !renderer) return;
@@ -4225,12 +4502,11 @@ const ThreeScene = memo(function ThreeScene({
             fallbackEarth.visible = true;
           }
           const message = getTilesLoadErrorMessage(event);
-          statusMessage = `Cesium ion 真实地球加载失败${message ? `：${message}` : ""}`;
-          hasCriticalSceneError = true;
+          statusMessage = `Cesium ion 真实地球加载失败，已使用默认地球${message ? `：${message}` : ""}`;
           onSceneInfoChange({
             backend: getRendererBackend(renderer),
-            status: "error",
-            message: statusMessage,
+            status: modelRootRef.current ? "ready" : "loading",
+            message: modelRootRef.current ? "" : "正在加载场景",
             meshes: cachedStats.meshes,
             vertices: cachedStats.vertices,
             performanceMode: "normal"
@@ -4304,8 +4580,9 @@ const ThreeScene = memo(function ThreeScene({
               }
             }
           } catch (error) {
-            contextWarning = error instanceof Error ? error.message : "上下文 3D Tiles 加载失败";
-            hasCriticalSceneError = true;
+            contextWarning = error instanceof Error
+              ? `Cesium ion 真实地球加载失败，已使用默认地球：${error.message}`
+              : "Cesium ion 真实地球加载失败，已使用默认地球";
           }
         }
 
@@ -4958,6 +5235,8 @@ const ThreeScene = memo(function ThreeScene({
           sceneVisualDirty = true;
         }
         const sceneRefreshDirty = now < sceneVisualDirtyUntil;
+        const lightingDirty = syncPreviewTimeLighting(activeRenderer);
+        sceneVisualDirty = lightingDirty || sceneVisualDirty;
         const runtimeGlobeControls = globeControls as RuntimeGlobeControls;
         const globeControlsPending = Boolean(
           runtimeGlobeControls.needsUpdate ||
@@ -5149,6 +5428,18 @@ const ThreeScene = memo(function ThreeScene({
     let removePointerHandler: (() => void) | undefined;
     void run().then((cleanup) => {
       removePointerHandler = cleanup;
+    }).catch((error) => {
+      if (disposed) {
+        return;
+      }
+      onSceneInfoChange({
+        backend: renderer ? getRendererBackend(renderer) : "Detecting",
+        status: "error",
+        message: error instanceof Error ? error.message : "渲染器初始化失败",
+        meshes: 0,
+        vertices: 0,
+        performanceMode: "normal"
+      });
     });
 
     return () => {
@@ -5432,38 +5723,64 @@ async function createWebGPUPreviewRenderer(
   preference: ThreeRendererPreference,
   onBackend: (backend: RendererBackend) => void
 ): Promise<PreviewRendererResult> {
-  const forceWebGL = preference === "webgl" || !(await isWebGPUAvailable());
-  const renderer = new WebGPURenderer({
+  let webgpuInitError: unknown;
+  const webgpuSupport = preference === "webgpu" ? await detectWebGPUAdapterSupport() : null;
+
+  if (webgpuSupport?.supported) {
+    try {
+      const renderer = new WebGPURenderer({
+        antialias: true,
+        alpha: true,
+        powerPreference: webgpuSupport.powerPreference
+      });
+      await renderer.init();
+      (renderer as unknown as { highPrecision?: boolean }).highPrecision = true;
+      (renderer as unknown as {
+        library?: {
+          addToneMapping?: (node: unknown, toneMapping: unknown) => void;
+        };
+      }).library?.addToneMapping?.(agxPunchyToneMapping, AgXPunchyToneMapping);
+      configurePreviewRenderer(container, renderer);
+      const backend = getRendererBackend(renderer);
+      onBackend(backend);
+      return {
+        renderer,
+        backend,
+        fallbackMessage: backend === "WebGL2 fallback" ? WEBGPU_FALLBACK_MESSAGE : undefined
+      };
+    } catch (error) {
+      webgpuInitError = error;
+      console.warn("WebGPU preview renderer failed to initialize; using native WebGL renderer.", error);
+    }
+  } else if (preference === "webgpu") {
+    webgpuInitError = new Error(webgpuSupport?.reason || describeWebGPUAdapterFailure([]));
+  }
+
+  const renderer = new THREE.WebGLRenderer({
     antialias: true,
     alpha: true,
-    forceWebGL
+    powerPreference: "high-performance"
   });
-  await renderer.init();
-  (renderer as unknown as { highPrecision?: boolean }).highPrecision = true;
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.AgXToneMapping;
-  renderer.toneMappingExposure = 1.25;
-  renderer.setPixelRatio(getPreviewPixelRatio());
-  resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
+  configurePreviewRenderer(container, renderer);
   const backend = getRendererBackend(renderer);
   onBackend(backend);
   return {
     renderer,
     backend,
-    fallbackMessage: preference === "webgpu" && backend !== "WebGPU" ? WEBGPU_FALLBACK_MESSAGE : undefined
+    fallbackMessage: preference === "webgpu"
+      ? webgpuInitError instanceof Error
+        ? `${WEBGPU_FALLBACK_MESSAGE}（${webgpuInitError.message}）`
+        : WEBGPU_FALLBACK_MESSAGE
+      : undefined
   };
 }
 
-async function isWebGPUAvailable(): Promise<boolean> {
-  const gpu = (navigator as Navigator & { gpu?: { requestAdapter?: () => Promise<unknown> } }).gpu;
-  if (!gpu?.requestAdapter) {
-    return false;
-  }
-  try {
-    return Boolean(await gpu.requestAdapter());
-  } catch {
-    return false;
-  }
+function configurePreviewRenderer(container: HTMLDivElement, renderer: PreviewRenderer) {
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.AgXToneMapping;
+  renderer.toneMappingExposure = 1.25;
+  renderer.setPixelRatio(getPreviewPixelRatio());
+  resizeRenderer(container, renderer, new THREE.PerspectiveCamera());
 }
 
 async function loadPreviewObject(
@@ -5476,14 +5793,17 @@ async function loadPreviewObject(
 ): Promise<LoadedPreviewObject> {
   if (type === "gltf") {
     const gltf = await new GLTFLoader().loadAsync(url, createLoadingProgressHandler(onProgress));
+    preparePreviewObjectForRenderer(gltf.scene, renderer);
     return { object: gltf.scene, name: gltf.scene.name || label || "glTF / GLB" };
   }
   if (type === "fbx") {
     const object = await new FBXLoader().loadAsync(url, createLoadingProgressHandler(onProgress));
+    preparePreviewObjectForRenderer(object, renderer);
     return { object, name: object.name || label || "FBX" };
   }
   if (type === "obj") {
     const object = await new OBJLoader().loadAsync(url, createLoadingProgressHandler(onProgress));
+    preparePreviewObjectForRenderer(object, renderer);
     return { object, name: object.name || label || "OBJ" };
   }
   if (type === "dae") {
@@ -5491,6 +5811,7 @@ async function loadPreviewObject(
     if (!collada?.scene) {
       throw new Error("DAE / Collada 模型加载失败。");
     }
+    preparePreviewObjectForRenderer(collada.scene, renderer);
     return { object: collada.scene, name: collada.scene.name || label || "DAE" };
   }
   if (type === "stl") {
@@ -5498,6 +5819,7 @@ async function loadPreviewObject(
     const material = new THREE.MeshStandardMaterial({ color: 0x8ec9ff, metalness: 0.05, roughness: 0.72 });
     const object = new THREE.Mesh(geometry, material);
     object.name = label || "STL";
+    preparePreviewObjectForRenderer(object, renderer);
     return { object, name: object.name };
   }
   if (type === "ply") {
@@ -5506,18 +5828,20 @@ async function loadPreviewObject(
     const material = new THREE.MeshStandardMaterial({ color: 0x8ec9ff, metalness: 0.05, roughness: 0.72 });
     const object = new THREE.Mesh(geometry, material);
     object.name = label || "PLY";
+    preparePreviewObjectForRenderer(object, renderer);
     return { object, name: object.name };
   }
   if (type === "usd") {
     try {
       const object = await new USDLoader().loadAsync(url, createLoadingProgressHandler(onProgress));
+      preparePreviewObjectForRenderer(object, renderer);
       return { object, name: object.name || label || "USD" };
     } catch (error) {
       throw new Error(`USD / USDZ 暂时无法在线预览${error instanceof Error ? `：${error.message}` : ""}`);
     }
   }
   if (type === "3dtiles") {
-    const tiles = createTilesRenderer(url);
+    const tiles = createTilesRenderer(url, shouldUsePreviewWebGpuNodeMaterials(renderer));
     tiles.group.name = label || "3D Tiles";
     tiles.group.userData.previewTilesRenderer = tiles;
     return {
@@ -5528,6 +5852,12 @@ async function loadPreviewObject(
     };
   }
   throw new Error(`暂不支持该预览类型：${type}`);
+}
+
+function preparePreviewObjectForRenderer(object: THREE.Object3D, renderer: PreviewRenderer) {
+  if (shouldUsePreviewWebGpuNodeMaterials(renderer)) {
+    replacePreviewMeshMaterials(object);
+  }
 }
 
 function createLoadingProgressHandler(onProgress?: (percent: number) => void) {
@@ -5602,7 +5932,20 @@ function shouldShowTransformControlHelper(
     return false;
   }
   const selected = objectsByLayerKey.get(selectedLayerKey);
-  return Boolean(selected && isObjectVisibleInHierarchy(selected));
+  return Boolean(selected && hasVisibleRenderableObject(selected));
+}
+
+function hasVisibleRenderableObject(object: THREE.Object3D): boolean {
+  let hasRenderableObject = false;
+  object.traverse((child) => {
+    if (hasRenderableObject || isHelperObject(child) || !isObjectVisibleInHierarchy(child)) {
+      return;
+    }
+    if (isRaycastRenderableObject(child)) {
+      hasRenderableObject = true;
+    }
+  });
+  return hasRenderableObject;
 }
 
 function getRendererBackend(renderer: PreviewRenderer): RendererBackend {
@@ -5610,6 +5953,10 @@ function getRendererBackend(renderer: PreviewRenderer): RendererBackend {
   if (backend?.isWebGPUBackend) return "WebGPU";
   if (backend?.isWebGLBackend) return "WebGL2 fallback";
   return renderer instanceof THREE.WebGLRenderer ? "WebGL" : "WebGPU";
+}
+
+function shouldUsePreviewWebGpuNodeMaterials(renderer: PreviewRenderer): boolean {
+  return renderer instanceof WebGPURenderer && getRendererBackend(renderer) === "WebGPU";
 }
 
 function normalizeObjectToPivot(object: THREE.Object3D) {
@@ -5846,61 +6193,55 @@ function createFallbackEarth() {
   const group = new THREE.Group();
   group.name = "Default Earth";
 
-  const globeGeometry = new THREE.SphereGeometry(1, 96, 48);
-  globeGeometry.scale(
-    GEOSPATIAL_WGS84.radii.x,
-    GEOSPATIAL_WGS84.radii.y,
-    GEOSPATIAL_WGS84.radii.z
-  );
-
   const globe = new THREE.Mesh(
-    globeGeometry,
+    createScaledFallbackSphereGeometry(1, 128, 64),
     new THREE.MeshStandardMaterial({
-      color: 0x1e6f9f,
-      emissive: 0x061a2a,
-      roughness: 0.96,
-      metalness: 0,
-      transparent: true,
-      opacity: 0.92
+      color: 0xffffff,
+      roughness: 1,
+      metalness: 0
     })
   );
   globe.name = "Default Earth Surface";
   group.add(globe);
 
-  const gridGeometry = new THREE.WireframeGeometry(globeGeometry.clone());
-  const grid = new THREE.LineSegments(
-    gridGeometry,
-    new THREE.LineBasicMaterial({
-      color: 0x83d7ff,
-      transparent: true,
-      opacity: 0.08,
-      depthWrite: false
-    })
-  );
-  grid.name = "Default Earth Grid";
-  grid.renderOrder = 1;
-  group.add(grid);
-
-  const atmosphereGeometry = new THREE.SphereGeometry(1.012, 64, 32);
-  atmosphereGeometry.scale(
-    GEOSPATIAL_WGS84.radii.x,
-    GEOSPATIAL_WGS84.radii.y,
-    GEOSPATIAL_WGS84.radii.z
-  );
-  const atmosphere = new THREE.Mesh(
-    atmosphereGeometry,
-    new THREE.MeshBasicMaterial({
-      color: 0x4fb6ff,
-      transparent: true,
-      opacity: 0.08,
-      side: THREE.BackSide,
-      depthWrite: false
-    })
-  );
-  atmosphere.name = "Default Earth Atmosphere";
-  group.add(atmosphere);
-
   return group;
+}
+
+const previewFallbackSunDirectionScratch = new THREE.Vector3();
+
+function updatePreviewFallbackSunLight(
+  light: THREE.DirectionalLight,
+  lightingState: PreviewTimeLightingState,
+  ellipsoidContext: EllipsoidContext
+) {
+  getPreviewSunDirectionECEF(lightingState.solarTimeMs, previewFallbackSunDirectionScratch);
+  previewFallbackSunDirectionScratch.transformDirection(ellipsoidContext.group.matrixWorld).normalize();
+  light.position.copy(previewFallbackSunDirectionScratch);
+  light.intensity = lightingState.sunIntensity;
+  light.color.copy(lightingState.sunColor);
+  light.updateMatrixWorld();
+}
+
+function updatePreviewStarFieldOpacity(starField: THREE.Points | null, opacity: number) {
+  if (!starField || !(starField.material instanceof THREE.PointsMaterial)) {
+    return;
+  }
+  const nextOpacity = THREE.MathUtils.clamp(opacity, 0.12, 0.82);
+  if (Math.abs(starField.material.opacity - nextOpacity) < 0.01) {
+    return;
+  }
+  starField.material.opacity = nextOpacity;
+}
+
+function createScaledFallbackSphereGeometry(scale: number, widthSegments: number, heightSegments: number) {
+  const geometry = new THREE.SphereGeometry(1, widthSegments, heightSegments);
+  geometry.rotateX(Math.PI / 2);
+  geometry.scale(
+    GEOSPATIAL_WGS84.radii.x * scale,
+    GEOSPATIAL_WGS84.radii.y * scale,
+    GEOSPATIAL_WGS84.radii.z * scale
+  );
+  return geometry;
 }
 
 function pseudoRandom(index: number, salt: number) {
@@ -6586,6 +6927,20 @@ function getTilesLoadErrorMessage(event: unknown): string {
   return typeof url === "string" ? url : "";
 }
 
+function hasCesiumIonGlobeContext(contextTilesUrl?: string, previewUrl?: string): boolean {
+  if (!CESIUM_ION_TOKEN && !getCesiumIonRuntimeToken()) {
+    return false;
+  }
+  return isCesiumIonTilesUrl(contextTilesUrl) || isCesiumIonTilesUrl(previewUrl);
+}
+
+function isCesiumIonTilesUrl(url?: string): boolean {
+  return Boolean(url && (
+    /^cesium-ion:\/\//i.test(url) ||
+    /^https:\/\/api\.cesium\.com\/v1\/assets\/\d+\/endpoint/i.test(url)
+  ));
+}
+
 function resolveContextTilesUrl(payload: PreviewPayload): string | undefined {
   const runtimeToken = getCesiumIonRuntimeToken();
   const assetId = getCesiumIonRuntimeAssetId();
@@ -6631,7 +6986,7 @@ function createDefaultEllipsoidContext(): EllipsoidContext {
   };
 }
 
-function createTilesRenderer(url: string): TilesRenderer {
+function createTilesRenderer(url: string, useWebGpuNodeMaterials = false): TilesRenderer {
   const ionConfig = getCesiumIonConfig(url);
   const tiles = new TilesRenderer(ionConfig?.endpointUrl || (ionConfig ? undefined : url));
   tiles.errorTarget = PREVIEW_TILE_ERROR_TARGET;
@@ -6649,6 +7004,9 @@ function createTilesRenderer(url: string): TilesRenderer {
     dracoLoader: createDracoLoader(),
     autoDispose: true
   }));
+  if (useWebGpuNodeMaterials) {
+    tiles.registerPlugin(new PreviewTileMaterialReplacementPlugin() as any);
+  }
   tiles.registerPlugin(new TilesFadePlugin());
   tiles.registerPlugin(new UpdateOnChangePlugin());
   return tiles;
