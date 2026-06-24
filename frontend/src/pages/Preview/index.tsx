@@ -4173,6 +4173,9 @@ const ThreeScene = memo(function ThreeScene({
     };
     fallbackEarth = createFallbackEarth();
     ellipsoidAnchor.add(fallbackEarth);
+    if (latestSceneModeRef.current === "sphere" && (type === "3dtiles" || contextTilesUrl)) {
+      fallbackEarth.visible = false;
+    }
     const allowAtmosphereRenderer = hasCesiumIonGlobeContext(contextTilesUrl, url);
 
     const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 120_000_000);
@@ -4485,6 +4488,28 @@ const ThreeScene = memo(function ThreeScene({
         addTilesEventListener(tiles, "load-error", markTilesVisualDirty);
       };
 
+      const focusLoadedModelWhenReady = (modelRoot: THREE.Object3D) => {
+        if (disposed || framedLoadedTiles) {
+          return false;
+        }
+        const focused = focusObject(
+          modelRoot,
+          camera,
+          latestSceneModeRef.current,
+          globeControls,
+          ellipsoidContextRef.current,
+          { allowInitialFallback: false }
+        );
+        if (!focused) {
+          return false;
+        }
+        framedLoadedTiles = true;
+        lastTilesUpdateTime = 0;
+        markSceneVisualDirty();
+        markTilesVisualDirty();
+        return true;
+      };
+
       const watchPhotorealisticGlobe = (loaded: LoadedPreviewObject) => {
         if (!loaded.tiles || !loaded.isPhotorealisticGlobe) return;
         let hasContent = false;
@@ -4616,6 +4641,12 @@ const ThreeScene = memo(function ThreeScene({
             };
           }
           modelRootRef.current = modelRoot;
+          const focusMainTiles = () => {
+            focusLoadedModelWhenReady(modelRoot);
+          };
+          addTilesEventListener(loaded.tiles, "load-tileset", focusMainTiles);
+          addTilesEventListener(loaded.tiles, "load-model", focusMainTiles);
+          addTilesEventListener(loaded.tiles, "tile-visibility-change", focusMainTiles);
         } else {
           const modelRoot = new THREE.Group();
           modelRoot.name = loaded.name;
@@ -4646,7 +4677,10 @@ const ThreeScene = memo(function ThreeScene({
             objectsByLayerKeyRef.current,
             latestPlacementModeRef.current
           );
-          if (!restoreCameraView(camera, latestSceneViewStateRef.current, ellipsoidContextRef.current)) {
+          const shouldAutoFocusLoadedModel = Boolean(loaded.tiles || contextTilesUrl);
+          if (shouldAutoFocusLoadedModel) {
+            focusLoadedModelWhenReady(modelRoot);
+          } else if (!restoreCameraView(camera, latestSceneViewStateRef.current, ellipsoidContextRef.current)) {
             setInitialCamera(camera, latestSceneModeRef.current, ellipsoidContextRef.current);
           }
           globeControls.update(0);
@@ -5027,8 +5061,14 @@ const ThreeScene = memo(function ThreeScene({
         if (force || nextStatsSignature !== statsSignature) {
           statsSignature = nextStatsSignature;
           if (tilesRef.current.length && !framedLoadedTiles && stats.meshes > 0) {
-            focusObject(modelRoot, camera, latestSceneModeRef.current, globeControls, ellipsoidContextRef.current);
-            framedLoadedTiles = true;
+            framedLoadedTiles = focusObject(
+              modelRoot,
+              camera,
+              latestSceneModeRef.current,
+              globeControls,
+              ellipsoidContextRef.current,
+              { allowInitialFallback: false }
+            ) || framedLoadedTiles;
           }
           onSceneInfoChange({
             backend: getRendererBackend(renderer),
@@ -5982,15 +6022,28 @@ function focusObject(
   camera: THREE.PerspectiveCamera,
   sceneMode: PreviewSceneMode,
   globeControls: GlobeControls | null,
-  ellipsoidContext: EllipsoidContext
-) {
+  ellipsoidContext: EllipsoidContext,
+  options: { allowInitialFallback?: boolean } = {}
+): boolean {
+  const allowInitialFallback = options.allowInitialFallback ?? true;
   const sphere = getObjectFocusSphere(object);
   if (!sphere) {
-    if (sceneMode === "sphere") {
+    if (allowInitialFallback && sceneMode === "sphere") {
       setInitialCamera(camera, sceneMode, ellipsoidContext);
+      return true;
     }
-    return;
+    return false;
   }
+  return focusSphere(sphere, camera, sceneMode, globeControls, ellipsoidContext);
+}
+
+function focusSphere(
+  sphere: THREE.Sphere,
+  camera: THREE.PerspectiveCamera,
+  sceneMode: PreviewSceneMode,
+  globeControls: GlobeControls | null,
+  ellipsoidContext: EllipsoidContext
+): boolean {
   const radius = Math.max(sphere.radius, MIN_GLOBE_FOCUS_DISTANCE);
   if (sceneMode === "sphere" && globeControls) {
     const normal = getWorldSurfaceNormal(sphere.center, ellipsoidContext);
@@ -6003,8 +6056,9 @@ function focusObject(
     camera.updateProjectionMatrix();
     globeControls.update(0);
     applyCloseZoomCameraClipping(camera, ellipsoidContext);
-    return;
+    return true;
   }
+  return false;
 }
 
 function readCameraView(camera: THREE.PerspectiveCamera, globeControls: GlobeControls | null): SceneViewState["camera"] {
