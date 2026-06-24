@@ -117,6 +117,7 @@ type PreviewSaveState = "idle" | "saving" | "saved" | "error";
 
 interface PreviewViewOptions {
   stars: boolean;
+  earth: boolean;
 }
 
 interface LayerNode {
@@ -520,19 +521,20 @@ function hasStoredPreviewRightPanelCollapsedPreference(): boolean {
 
 function readPreviewViewOptions(): PreviewViewOptions {
   if (typeof window === "undefined") {
-    return { stars: true };
+    return { stars: true, earth: true };
   }
   try {
     const rawValue = window.localStorage.getItem(PREVIEW_VIEW_OPTIONS_STORAGE_KEY);
     if (!rawValue) {
-      return { stars: true };
+      return { stars: true, earth: true };
     }
     const parsedValue = JSON.parse(rawValue) as Partial<PreviewViewOptions>;
     return {
-      stars: typeof parsedValue.stars === "boolean" ? parsedValue.stars : true
+      stars: typeof parsedValue.stars === "boolean" ? parsedValue.stars : true,
+      earth: typeof parsedValue.earth === "boolean" ? parsedValue.earth : true
     };
   } catch {
-    return { stars: true };
+    return { stars: true, earth: true };
   }
 }
 
@@ -656,6 +658,7 @@ interface LoadedPreviewObject {
   name: string;
   tiles?: TilesRenderer;
   isPhotorealisticGlobe?: boolean;
+  hasPhotorealisticGlobeContent?: boolean;
 }
 
 interface SurfacePlacement {
@@ -2060,6 +2063,12 @@ function PreviewWorkspace({
   const showHiddenMeshesHint = Boolean(canEditScene && isModel && allMeshLayersHidden);
   const transformModeControlsDisabled = !canEditScene || placementMode;
   const timeControlsDisabled = activePreviewEngine !== "three";
+  const earthToggleDisabled = activePreviewEngine !== "three" || !isSphereScene;
+  const earthToggleTooltip = !isSphereScene
+    ? "地球显示仅用于球面场景"
+    : viewOptions.earth
+      ? "隐藏地球"
+      : "显示地球";
   const previewTimeInputValue = formatPreviewDateTimeLocal(previewTimeMs);
   const previewTimeOfDayMinutes = getPreviewTimeOfDayMinutes(previewTimeMs);
   const previewTimeOfDayLabel = formatPreviewMinuteOfDay(previewTimeOfDayMinutes);
@@ -2801,6 +2810,16 @@ function PreviewWorkspace({
                   icon={<StarOutlined />}
                   disabled={activePreviewEngine !== "three"}
                   onClick={() => toggleViewOption("stars")}
+                />
+              </Tooltip>
+              <Tooltip title={earthToggleTooltip}>
+                <Button
+                  aria-label={viewOptions.earth ? "隐藏地球" : "显示地球"}
+                  aria-pressed={viewOptions.earth}
+                  type={viewOptions.earth ? "primary" : "default"}
+                  icon={viewOptions.earth ? <EyeOutlined /> : <EyeInvisibleOutlined />}
+                  disabled={earthToggleDisabled}
+                  onClick={() => toggleViewOption("earth")}
                 />
               </Tooltip>
               {showInspectorShortcutActions ? (
@@ -4015,6 +4034,24 @@ const ThreeScene = memo(function ThreeScene({
     let renderer: PreviewRenderer | null = null;
     const loadedObjects: LoadedPreviewObject[] = [];
     const tileEventCleanups: Array<() => void> = [];
+    let fallbackEarthBaseVisible = true;
+    const hasPhotorealisticGlobeContent = () => loadedObjects.some((loaded) => (
+      loaded.isPhotorealisticGlobe && loaded.hasPhotorealisticGlobeContent
+    ));
+    const isEarthSurfaceVisible = () => (
+      latestSceneModeRef.current !== "sphere" || latestViewOptionsRef.current.earth
+    );
+    const syncEarthSurfaceVisibility = () => {
+      const earthSurfaceVisible = isEarthSurfaceVisible();
+      if (fallbackEarth) {
+        fallbackEarth.visible = fallbackEarthBaseVisible && !hasPhotorealisticGlobeContent() && earthSurfaceVisible;
+      }
+      loadedObjects.forEach((loaded) => {
+        if (loaded.isPhotorealisticGlobe) {
+          loaded.object.visible = earthSurfaceVisible;
+        }
+      });
+    };
     let hasCriticalSceneError = false;
     let layerSignature = "";
     let statsSignature = "";
@@ -4173,9 +4210,8 @@ const ThreeScene = memo(function ThreeScene({
     };
     fallbackEarth = createFallbackEarth();
     ellipsoidAnchor.add(fallbackEarth);
-    if (latestSceneModeRef.current === "sphere" && (type === "3dtiles" || contextTilesUrl)) {
-      fallbackEarth.visible = false;
-    }
+    fallbackEarthBaseVisible = !(latestSceneModeRef.current === "sphere" && (type === "3dtiles" || contextTilesUrl));
+    syncEarthSurfaceVisibility();
     const allowAtmosphereRenderer = hasCesiumIonGlobeContext(contextTilesUrl, url);
 
     const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 120_000_000);
@@ -4515,17 +4551,16 @@ const ThreeScene = memo(function ThreeScene({
         let hasContent = false;
         addTilesEventListener(loaded.tiles, "load-model", () => {
           hasContent = true;
-          if (fallbackEarth) {
-            fallbackEarth.visible = false;
-          }
+          loaded.hasPhotorealisticGlobeContent = true;
+          fallbackEarthBaseVisible = false;
+          syncEarthSurfaceVisibility();
           ensureAtmosphereRenderer();
         });
         addTilesEventListener(loaded.tiles, "load-error", (event) => {
           if (hasContent || !renderer) return;
           markTilesVisualDirty();
-          if (fallbackEarth) {
-            fallbackEarth.visible = true;
-          }
+          fallbackEarthBaseVisible = true;
+          syncEarthSurfaceVisibility();
           const message = getTilesLoadErrorMessage(event);
           statusMessage = `Cesium ion 真实地球加载失败，已使用默认地球${message ? `：${message}` : ""}`;
           onSceneInfoChange({
@@ -4594,6 +4629,7 @@ const ThreeScene = memo(function ThreeScene({
             }
             loadedObjects.push(contextTiles);
             sceneContentRoot.add(contextTiles.object);
+            syncEarthSurfaceVisibility();
             placementSurfaceRootRef.current = contextTiles.object;
             if (contextTiles.tiles) {
               registerTilesRenderer(contextTiles.tiles, camera, renderer, container);
@@ -4605,6 +4641,8 @@ const ThreeScene = memo(function ThreeScene({
               }
             }
           } catch (error) {
+            fallbackEarthBaseVisible = true;
+            syncEarthSurfaceVisibility();
             contextWarning = error instanceof Error
               ? `Cesium ion 真实地球加载失败，已使用默认地球：${error.message}`
               : "Cesium ion 真实地球加载失败，已使用默认地球";
@@ -4617,6 +4655,7 @@ const ThreeScene = memo(function ThreeScene({
           return;
         }
         loadedObjects.push(loaded);
+        syncEarthSurfaceVisibility();
 
         if (loaded.tiles) {
           const modelRoot = new THREE.Group();
@@ -5304,7 +5343,12 @@ const ThreeScene = memo(function ThreeScene({
         applyCloseZoomCameraClipping(camera, ellipsoidContextRef.current);
         if (starField) starField.visible = latestViewOptionsRef.current.stars;
         scene.background = latestViewOptionsRef.current.stars ? null : plainBackground;
+        syncEarthSurfaceVisibility();
         tilesRef.current.forEach((tiles) => {
+          if (isPhotorealisticGlobeTiles(tiles)) {
+            tiles.group.visible = isEarthSurfaceVisible();
+            return;
+          }
           if (tiles.group.name === "上下文 3D Tiles") {
             tiles.group.visible = true;
           }
@@ -5527,18 +5571,12 @@ const ThreeScene = memo(function ThreeScene({
     : sceneMode === "sphere"
       ? "三维操作：左键拖动平移地球，右键或 Shift 加左键旋转，滚轮缩放，双击模型聚焦"
       : "三维操作：左键旋转，Shift、Ctrl 或 ⌘ 加左键平移，滚轮缩放，右键上下拖动缩放，中键俯仰观察，双击模型聚焦";
-  const canvasInteractionTitle = placementMode
-    ? "地表落位：单击地球表面放置 · Esc 退出"
-    : sceneMode === "sphere"
-      ? "左键拖动平移地球 · 右键或 Shift+左键旋转 · 滚轮缩放 · 双击模型聚焦"
-      : "左键旋转 · Shift/Ctrl/⌘+左键平移 · 滚轮缩放 · 右键拖动缩放 · 中键俯仰 · 双击模型聚焦";
 
   return (
     <div
       ref={containerRef}
       aria-label={canvasInteractionDescription}
       className={`preview-three-canvas${placementMode ? " is-placement-mode" : ""}`}
-      title={canvasInteractionTitle}
     />
   );
 }, areThreeScenePropsEqual);
@@ -5882,13 +5920,15 @@ async function loadPreviewObject(
   }
   if (type === "3dtiles") {
     const tiles = createTilesRenderer(url, shouldUsePreviewWebGpuNodeMaterials(renderer));
+    const isPhotorealisticGlobe = Boolean(getCesiumIonConfig(url));
     tiles.group.name = label || "3D Tiles";
     tiles.group.userData.previewTilesRenderer = tiles;
+    tiles.group.userData.previewIsPhotorealisticGlobe = isPhotorealisticGlobe;
     return {
       object: tiles.group,
       name: label || "3D Tiles",
       tiles,
-      isPhotorealisticGlobe: Boolean(getCesiumIonConfig(url))
+      isPhotorealisticGlobe
     };
   }
   throw new Error(`暂不支持该预览类型：${type}`);
@@ -5914,6 +5954,10 @@ function createLoadingProgressHandler(onProgress?: (percent: number) => void) {
 function disposeLoaded(loaded: LoadedPreviewObject) {
   loaded.tiles?.dispose();
   loaded.object.traverse(disposeObject);
+}
+
+function isPhotorealisticGlobeTiles(tiles: TilesRenderer): boolean {
+  return tiles.group.userData.previewIsPhotorealisticGlobe === true;
 }
 
 function resizeRenderer(container: HTMLDivElement, renderer: PreviewRenderer, camera: THREE.PerspectiveCamera) {

@@ -669,6 +669,25 @@ if (
   failures.push("src/pages/Preview/index.tsx: time controls should drive local solar lighting, renderer exposure, and atmosphere exposure");
 }
 if (
+  previewPage.includes("canvasInteractionTitle") ||
+  previewPage.includes("title={canvasInteractionTitle}") ||
+  !previewPage.includes("aria-label={canvasInteractionDescription}")
+) {
+  failures.push("src/pages/Preview/index.tsx: three.js canvas should not show native title hover hints while keeping an accessible label");
+}
+if (
+  !previewPage.includes("earth: typeof parsedValue.earth === \"boolean\" ? parsedValue.earth : true") ||
+  !previewPage.includes("onClick={() => toggleViewOption(\"earth\")}") ||
+  !previewPage.includes("tiles.group.userData.previewIsPhotorealisticGlobe = isPhotorealisticGlobe") ||
+  !previewPage.includes("function isPhotorealisticGlobeTiles(tiles: TilesRenderer): boolean") ||
+  !previewPage.includes("syncEarthSurfaceVisibility()") ||
+  !previewPage.includes("tiles.group.visible = isEarthSurfaceVisible()") ||
+  !previewPage.includes("hasPhotorealisticGlobeContent") ||
+  !previewPage.includes("fallbackEarth.visible = fallbackEarthBaseVisible && !hasPhotorealisticGlobeContent() && earthSurfaceVisible")
+) {
+  failures.push("src/pages/Preview/index.tsx: scene controls should toggle only earth surface visibility while keeping atmosphere and lighting active");
+}
+if (
   !combinedSource.includes("PreviewTileMaterialReplacementPlugin") ||
   !combinedSource.includes("MeshStandardNodeMaterial") ||
   !previewPage.includes("preparePreviewObjectForRenderer")
