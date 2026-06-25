@@ -15,6 +15,7 @@ const forbiddenChecks = [
   { pattern: "\u7cbe\u786e\u843d\u4f4d", reason: "geospatial placement fields should be grouped as position, not a redundant inspector subsection" },
   { pattern: "\u6a21\u578b\u8868\u9762", reason: "surface placement excludes the preview model itself, so the hint should not promise model-surface placement" },
   { pattern: "\u8868\u9762\u843d\u4f4d", reason: "placement mode should be labelled as ground-surface placement to avoid implying the preview model itself is a valid target" },
+  { pattern: "\u5730\u8868\u843d\u4f4d", reason: "ground-surface placement mode has been removed from the preview scene controls" },
   { pattern: "\u6570\u636e\u4f53\u91cf", reason: "file size belongs in compact file metadata, not a bottom statistics strip" },
   { pattern: "\u4efb\u52a1\u72b6\u6001", reason: "task status belongs in task detail pages, not the focused preview surface" },
   { pattern: "preview-status-bar", reason: "bottom preview status bar was intentionally removed" },
@@ -141,7 +142,7 @@ if (
   failures.push("src/pages/Preview/index.tsx: scene-control inspector should resize like the layer panel, with a left-edge drag handle that grows leftward, shrinks rightward, and persists width");
 }
 if (!previewPage.includes("CanvasPointerIntent") || !previewPage.includes("handlePointerUp") || !previewPage.includes("hasPointerMoved(canvasPointerIntent, event)") || !previewPage.includes("event.button !== 0")) {
-  failures.push("src/pages/Preview/index.tsx: canvas selection and surface placement should trigger only on primary-button taps, not on camera drags or secondary clicks");
+  failures.push("src/pages/Preview/index.tsx: canvas selection should trigger only on primary-button taps, not on camera drags or secondary clicks");
 }
 const canvasPointerDownStart = previewPage.indexOf("const handlePointerDown = (event: PointerEvent) => {");
 const canvasPointerDownEnd = previewPage.indexOf("const handlePointerCancel", canvasPointerDownStart);
@@ -168,7 +169,7 @@ if (
   !canvasPointerUpBranch.includes("isTransformControlPointerHit(event") ||
   !canvasDoubleClickBranch.includes("isTransformControlPointerHit(event")
 ) {
-  failures.push("src/pages/Preview/index.tsx: canvas selection, placement, and double-click focus should not fire from TransformControls handles");
+  failures.push("src/pages/Preview/index.tsx: canvas selection and double-click focus should not fire from TransformControls handles");
 }
 if (canvasPointerDownBranch.includes("markPreviewInteraction()")) {
   failures.push("src/pages/Preview/index.tsx: canvas pointer-down should only record tap intent and must not extend the interaction quality window");
@@ -176,19 +177,15 @@ if (canvasPointerDownBranch.includes("markPreviewInteraction()")) {
 if (!canvasPointerLeaveBranch.includes("event.buttons") || !canvasPointerLeaveBranch.includes("canvasPointerIntent = null")) {
   failures.push("src/pages/Preview/index.tsx: leaving the canvas while dragging should clear pending click-selection intent");
 }
-if (!previewPage.includes("onPlacementCancel") || !previewPage.includes('aria-label="\u5730\u8868\u843d\u4f4d\u6a21\u5f0f\uff1a\u5355\u51fb\u5730\u7403\u8868\u9762\u5b8c\u6210\u843d\u4f4d\uff0cEsc \u9000\u51fa"') || !previewPage.includes("\u9000\u51fa\u5730\u8868\u843d\u4f4d")) {
-  failures.push("src/pages/Preview/index.tsx: placement mode should keep a concise visible status, accessible instructions, and an in-scene exit");
-}
 if (
-  !previewPage.includes("const placementModeRef = useRef(placementMode)") ||
-  !previewPage.includes("const commitPlacementMode = useCallback((enabled: boolean) => {") ||
-  !previewPage.includes("if (placementModeRef.current === enabled)") ||
-  !previewPage.includes("const togglePlacementMode = useCallback(() => {")
+  previewPage.includes("placementMode") ||
+  previewPage.includes("onPlacement") ||
+  previewPage.includes("getSurfacePlacement") ||
+  previewPage.includes("SurfacePlacement") ||
+  combinedSource.includes("preview-placement") ||
+  combinedSource.includes("is-placement-mode")
 ) {
-  failures.push("src/pages/Preview/index.tsx: placement mode open/close paths should skip unchanged state before dispatching React updates");
-}
-if (previewPage.includes("setPlacementMode(false)") || previewPage.includes("setPlacementMode((value)")) {
-  failures.push("src/pages/Preview/index.tsx: placement mode controls should route through the guarded commit/toggle helpers");
+  failures.push("src/pages/Preview and styles: ground-surface placement mode and its in-scene prompts should stay removed");
 }
 if (
   !previewPage.includes("const operationHelpOpenRef = useRef(operationHelpOpen)") ||
@@ -200,15 +197,6 @@ if (
 }
 if (previewPage.includes("setOperationHelpOpen(false)") || previewPage.includes("setOperationHelpOpen((value)")) {
   failures.push("src/pages/Preview/index.tsx: operation help controls should route through the guarded commit/toggle helpers");
-}
-if (!previewPage.includes("<strong>\u843d\u4f4d\u4e2d</strong>") || !previewPage.includes('aria-label="\u5730\u8868\u843d\u4f4d"')) {
-  failures.push("src/pages/Preview/index.tsx: placement hint should use a state label distinct from the action button");
-}
-if (!previewPage.includes("aria-label=\"\u5730\u8868\u843d\u4f4d\"") || !previewPage.includes("\u5730\u8868\u843d\u4f4d")) {
-  failures.push("src/pages/Preview/index.tsx: placement entry points should use the explicit ground-surface label");
-}
-if (!previewPage.includes('event.key !== "Escape"') || !previewPage.includes('window.addEventListener("keydown", handlePlacementKeyDown)') || !previewPage.includes("Esc \u9000\u51fa")) {
-  failures.push("src/pages/Preview/index.tsx: placement mode should support and disclose Escape as a keyboard exit");
 }
 if (!previewPage.includes("stageFullscreen") || !previewPage.includes('document.addEventListener("fullscreenchange", syncStageFullscreen)') || !previewPage.includes("toggleStageFullscreen") || !previewPage.includes("document.exitFullscreen") || !previewPage.includes("FullscreenExitOutlined")) {
   failures.push("src/pages/Preview/index.tsx: fullscreen control should reflect current state and support exiting fullscreen");
@@ -265,23 +253,28 @@ if (
   !commitTransformModeBranch.includes("transformModeRef.current = mode") ||
   !commitTransformModeBranch.includes("setTransformMode(mode)") ||
   !commitTransformModeBranch.includes("return true;") ||
+  !updateTransformModeBranch.includes("if (!selectedLayerKeyRef.current)") ||
   !updateTransformModeBranch.includes("const wasInactive = !transformControlsActiveRef.current") ||
   !updateTransformModeBranch.includes("const modeChanged = commitTransformMode(mode)") ||
   !updateTransformModeBranch.includes("commitTransformControlsActive(true)") ||
   !updateTransformModeBranch.includes("if (!modeChanged && !wasInactive)") ||
   updateTransformModeBranch.indexOf("commitTransformControlsActive(true)") > updateTransformModeBranch.indexOf("showInteractionHint")
 ) {
-  failures.push("src/pages/Preview/index.tsx: transform mode controls should use ref-backed helpers so shortcuts skip unchanged state while same-mode clicks can activate the gizmo");
+  failures.push("src/pages/Preview/index.tsx: transform mode controls should use ref-backed helpers, require a selected model, and let same-mode clicks activate the gizmo");
 }
 if (
+  !previewPage.includes("commitTransformControlsActive(false);") ||
+  !previewPage.includes("const hasTransformSelection = Boolean(selectedLayerKey)") ||
+  !previewPage.includes("const transformModeControlsDisabled = !canEditScene || !hasTransformSelection") ||
   !previewPage.includes("transformControlsActive={transformControlsActive}") ||
   !previewPage.includes("latestTransformControlsActiveRef.current = transformControlsActive") ||
   !previewPage.includes("function shouldShowTransformControlHelper(\n  transformControlsActive: boolean") ||
-  !previewPage.includes("if (!transformControlsActive || placementMode || !selectedLayerKey)") ||
+  !previewPage.includes("if (!transformControlsActive || !selectedLayerKey)") ||
   !previewPage.includes("value={transformControlsActive ? transformMode : undefined}") ||
-  !previewPage.includes("aria-pressed={transformControlsActive && transformMode === mode.value}")
+  !previewPage.includes("aria-pressed={transformControlsActive && transformMode === mode.value}") ||
+  !previewPage.includes("disabled={transformModeControlsDisabled}")
 ) {
-  failures.push("src/pages/Preview/index.tsx: selecting a mesh layer should not show transform axes until a translate/rotate/scale mode is activated");
+  failures.push("src/pages/Preview/index.tsx: selecting a mesh layer should enable transform controls without showing axes until a translate/rotate/scale mode is activated");
 }
 if (!previewPage.includes("runtimeStatus.fps && runtimeStatus.fps > 0") || !previewPage.includes("const fpsLabel = fpsValue ? String(fpsValue) : null")) {
   failures.push("src/pages/Preview/index.tsx: FPS overlay should appear only after a real positive sample exists");
@@ -340,9 +333,6 @@ if (!previewPage.includes('type PreviewSaveState = "idle" | "saving" | "saved" |
 }
 if (!previewPage.includes('const saveStateRef = useRef<PreviewSaveState>("idle")') || !previewPage.includes("const updateSaveState = useCallback((nextState: PreviewSaveState) => {") || !previewPage.includes("if (saveStateRef.current === nextState)")) {
   failures.push("src/pages/Preview/index.tsx: preview save status should skip duplicate state dispatches during continuous edits");
-}
-if (!previewPage.includes('const placementFeedbackRef = useRef("")') || !previewPage.includes("if (placementFeedbackRef.current !== message)") || !previewPage.includes("placementFeedbackRef.current = \"\"")) {
-  failures.push("src/pages/Preview/index.tsx: placement feedback should avoid duplicate text state updates while still refreshing its timer");
 }
 if (!previewPage.includes("normalizeResetTransform(transform, sceneMode)")) {
   failures.push("src/pages/Preview/index.tsx: reset transform should keep the current geospatial placement instead of teleporting to the default longitude/latitude");

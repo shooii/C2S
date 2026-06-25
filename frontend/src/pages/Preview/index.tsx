@@ -24,7 +24,6 @@ import {
   CompressOutlined,
   DownOutlined,
   DragOutlined,
-  EnvironmentOutlined,
   FileOutlined,
   FullscreenExitOutlined,
   FullscreenOutlined,
@@ -661,10 +660,6 @@ interface LoadedPreviewObject {
   hasPhotorealisticGlobeContent?: boolean;
 }
 
-interface SurfacePlacement {
-  point: THREE.Vector3;
-}
-
 interface LayerTreeOptions {
   rootTitle?: string;
   shallow?: boolean;
@@ -902,8 +897,6 @@ function PreviewWorkspace({
   const [viewOptions, setViewOptions] = useState<PreviewViewOptions>(readPreviewViewOptions);
   const [previewTimeMs, setPreviewTimeMs] = useState(() => roundPreviewTimeToMinute(Date.now()));
   const [viewCommand, setViewCommand] = useState<ViewCommandRequest | null>(null);
-  const [placementMode, setPlacementMode] = useState(false);
-  const [placementFeedback, setPlacementFeedback] = useState("");
   const [operationHelpOpen, setOperationHelpOpen] = useState(false);
   const [interactionHint, setInteractionHint] = useState<PreviewInteractionHint | null>(null);
   const initialSceneInfo: SceneInfo = {
@@ -925,7 +918,6 @@ function PreviewWorkspace({
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(getInitialPreviewRightPanelCollapsed);
   const [rightPanelWidth, setRightPanelWidth] = useState(getInitialPreviewRightPanelWidth);
   const [stageFullscreen, setStageFullscreen] = useState(false);
-  const placementModeRef = useRef(placementMode);
   const operationHelpOpenRef = useRef(operationHelpOpen);
   const transformModeRef = useRef<TransformMode>(transformMode);
   const transformControlsActiveRef = useRef(false);
@@ -938,8 +930,6 @@ function PreviewWorkspace({
   const rightPanelCollapsedRef = useRef(rightPanelCollapsed);
   const rightPanelResizeRef = useRef<{ startX: number; startWidth: number; lastWidth: number } | null>(null);
   const rightPanelWidthUpdateRef = useRef<PreviewPanelWidthRafState>({ frameId: 0, width: null });
-  const placementFeedbackTimerRef = useRef(0);
-  const placementFeedbackRef = useRef("");
   const interactionHintTimerRef = useRef(0);
   const interactionHintRef = useRef<PreviewInteractionHint | null>(null);
   const viewCommandRef = useRef<ViewCommandRequest | null>(null);
@@ -1024,20 +1014,6 @@ function PreviewWorkspace({
     }
     stageFullscreenRef.current = fullscreen;
     setStageFullscreen(fullscreen);
-  }, []);
-
-  const commitPlacementMode = useCallback((enabled: boolean) => {
-    if (placementModeRef.current === enabled) {
-      return;
-    }
-    placementModeRef.current = enabled;
-    setPlacementMode(enabled);
-  }, []);
-
-  const togglePlacementMode = useCallback(() => {
-    const nextPlacementMode = !placementModeRef.current;
-    placementModeRef.current = nextPlacementMode;
-    setPlacementMode(nextPlacementMode);
   }, []);
 
   const commitOperationHelpOpen = useCallback((open: boolean) => {
@@ -1135,13 +1111,6 @@ function PreviewWorkspace({
     commitTransformMode("translate");
     commitTransformControlsActive(false);
     clearViewCommand();
-    commitPlacementMode(false);
-    if (placementFeedbackTimerRef.current) {
-      window.clearTimeout(placementFeedbackTimerRef.current);
-      placementFeedbackTimerRef.current = 0;
-    }
-    placementFeedbackRef.current = "";
-    setPlacementFeedback("");
     commitOperationHelpOpen(false);
     if (interactionHintTimerRef.current) {
       window.clearTimeout(interactionHintTimerRef.current);
@@ -1156,7 +1125,7 @@ function PreviewWorkspace({
     rightPanelTouchedRef.current = hasStoredPreviewRightPanelCollapsedPreference();
     commitLeftPanelCollapsed(getInitialPreviewLeftPanelCollapsed());
     commitRightPanelCollapsed(getInitialPreviewRightPanelCollapsed());
-  }, [clearViewCommand, commitExpandedLayerKeys, commitLeftPanelCollapsed, commitOperationHelpOpen, commitPlacementMode, commitRightPanelCollapsed, commitTransformMode, fileKey, payload.type, setSceneViewState, updateSaveState]);
+  }, [clearViewCommand, commitExpandedLayerKeys, commitLeftPanelCollapsed, commitOperationHelpOpen, commitRightPanelCollapsed, commitTransformControlsActive, commitTransformMode, fileKey, payload.type, setSceneViewState, updateSaveState]);
 
   useEffect(() => {
     const syncPreviewResponsiveLayout = () => {
@@ -1229,6 +1198,7 @@ function PreviewWorkspace({
   const updateSelectedLayer = useCallback((key: string | null) => {
     if (!key) {
       commitSelectedMaterialKey(null);
+      commitTransformControlsActive(false);
     }
     if (selectedLayerKeyRef.current === key) {
       return;
@@ -1236,7 +1206,7 @@ function PreviewWorkspace({
     selectedLayerKeyRef.current = key;
     setSelectedLayerKey(key);
     markDirty();
-  }, [commitSelectedMaterialKey, markDirty]);
+  }, [commitSelectedMaterialKey, commitTransformControlsActive, markDirty]);
 
   const clearPreviewSelection = useCallback(() => {
     updateSelectedLayer(null);
@@ -1296,6 +1266,9 @@ function PreviewWorkspace({
   }, [sceneMode, showInteractionHint]);
 
   const updateTransformMode = useCallback((mode: TransformMode) => {
+    if (!selectedLayerKeyRef.current) {
+      return;
+    }
     const wasInactive = !transformControlsActiveRef.current;
     const modeChanged = commitTransformMode(mode);
     commitTransformControlsActive(true);
@@ -1566,33 +1539,6 @@ function PreviewWorkspace({
     });
   }, [commitSceneInfo]);
 
-  const clearPlacementFeedback = useCallback(() => {
-    if (placementFeedbackTimerRef.current) {
-      window.clearTimeout(placementFeedbackTimerRef.current);
-      placementFeedbackTimerRef.current = 0;
-    }
-    if (!placementFeedbackRef.current) {
-      return;
-    }
-    placementFeedbackRef.current = "";
-    setPlacementFeedback("");
-  }, []);
-
-  const showPlacementFeedback = useCallback((message: string) => {
-    if (placementFeedbackTimerRef.current) {
-      window.clearTimeout(placementFeedbackTimerRef.current);
-    }
-    if (placementFeedbackRef.current !== message) {
-      placementFeedbackRef.current = message;
-      setPlacementFeedback(message);
-    }
-    placementFeedbackTimerRef.current = window.setTimeout(() => {
-      placementFeedbackTimerRef.current = 0;
-      placementFeedbackRef.current = "";
-      setPlacementFeedback("");
-    }, 1800);
-  }, []);
-
   const toggleExpandedLayer = useCallback((key: string) => {
     const current = expandedLayerKeysRef.current;
     commitExpandedLayerKeys(current.includes(key)
@@ -1601,50 +1547,12 @@ function PreviewWorkspace({
     );
   }, [commitExpandedLayerKeys]);
 
-  const handlePlacementDone = useCallback(() => {
-    showPlacementFeedback("模型已放置到地表");
-    commitPlacementMode(false);
-  }, [commitPlacementMode, showPlacementFeedback]);
-
-  const handlePlacementCancel = useCallback(() => {
-    clearPlacementFeedback();
-    commitPlacementMode(false);
-  }, [clearPlacementFeedback, commitPlacementMode]);
-
-  useEffect(() => () => {
-    if (placementFeedbackTimerRef.current) {
-      window.clearTimeout(placementFeedbackTimerRef.current);
-      placementFeedbackTimerRef.current = 0;
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!placementMode || operationHelpOpen) {
-      return;
-    }
-    const handlePlacementKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") {
-        return;
-      }
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      handlePlacementCancel();
-    };
-    window.addEventListener("keydown", handlePlacementKeyDown);
-    return () => window.removeEventListener("keydown", handlePlacementKeyDown);
-  }, [handlePlacementCancel, operationHelpOpen, placementMode]);
-
   useEffect(() => {
     const handlePreviewKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (operationHelpOpen) {
           event.preventDefault();
           commitOperationHelpOpen(false);
-          return;
-        }
-        if (placementMode) {
-          event.preventDefault();
-          handlePlacementCancel();
           return;
         }
         if (isEditableKeyboardTarget(event.target)) {
@@ -1700,7 +1608,6 @@ function PreviewWorkspace({
       if (
         shortcutTransformMode &&
         canEditScene &&
-        !placementMode &&
         !event.altKey &&
         !event.ctrlKey &&
         !event.metaKey
@@ -1714,7 +1621,7 @@ function PreviewWorkspace({
     };
     window.addEventListener("keydown", handlePreviewKeyDown);
     return () => window.removeEventListener("keydown", handlePreviewKeyDown);
-  }, [canEditScene, clearPreviewSelection, commitOperationHelpOpen, handlePlacementCancel, issueViewCommand, operationHelpOpen, placementMode, sceneMode, toggleOperationHelpOpen, updateTransformMode]);
+  }, [canEditScene, clearPreviewSelection, commitOperationHelpOpen, issueViewCommand, operationHelpOpen, sceneMode, toggleOperationHelpOpen, updateTransformMode]);
 
   const handleSceneViewStateChange = useCallback((nextState: SceneViewState) => {
     mergeSceneViewState(nextState);
@@ -2027,16 +1934,10 @@ function PreviewWorkspace({
   const adaptivePerformanceActive = activePreviewEngine === "three" && isModel && sceneInfo.performanceMode === "adaptive";
   const showScenePerformanceBadge = Boolean(fpsLabel || adaptivePerformanceActive);
   const isSphereScene = sceneMode === "sphere";
-  const canUsePlacementMode = canEditScene && isSphereScene;
   const focusViewCommand: ViewCommand = selectedLayerKey ? "focus-selected" : "fit";
   const fitViewTooltip = selectedLayerKey ? "聚焦选中对象（F）" : "适配模型（F）";
   const fitViewAriaLabel = selectedLayerKey ? "聚焦选中对象" : "适配模型";
   const resetViewTooltip = isSphereScene ? "恢复到地球默认（Home）" : "重置视角（Home）";
-  const placementTooltip = !isSphereScene
-    ? "球面场景支持地表落位"
-    : placementMode
-      ? "退出地表落位（Esc）"
-      : "地表落位：单击地球表面放置";
   const operationHelpTooltip = operationHelpOpen ? "收起操作说明（Esc / H / ?）" : "操作说明（H / ?）";
 
   useEffect(() => {
@@ -2046,20 +1947,16 @@ function PreviewWorkspace({
   }, [hasUnrealPreview, previewEngine, setPreviewEngine]);
 
   useEffect(() => {
-    if (canUsePlacementMode) {
+    if (canEditScene) {
       return;
     }
     clearScheduledInteractionHint();
     interactionHintRef.current = null;
     setInteractionHint(null);
-    clearPlacementFeedback();
-    commitPlacementMode(false);
-    if (!canEditScene) {
-      commitTransformMode("translate");
-      commitTransformControlsActive(false);
-      commitOperationHelpOpen(false);
-    }
-  }, [canEditScene, canUsePlacementMode, clearPlacementFeedback, clearScheduledInteractionHint, commitOperationHelpOpen, commitPlacementMode, commitTransformControlsActive, commitTransformMode]);
+    commitTransformMode("translate");
+    commitTransformControlsActive(false);
+    commitOperationHelpOpen(false);
+  }, [canEditScene, clearScheduledInteractionHint, commitOperationHelpOpen, commitTransformControlsActive, commitTransformMode]);
   const workspaceClassName = [
     "preview-workspace",
     leftPanelCollapsed ? "is-left-collapsed" : "",
@@ -2077,7 +1974,9 @@ function PreviewWorkspace({
   const showStandaloneOperationHelpButton = canEditScene && !showSceneShortcutTools;
   const showFloatingSelectedObject = Boolean(canEditScene && selectedLayerKey && showSceneShortcutTools);
   const showHiddenMeshesHint = Boolean(canEditScene && isModel && allMeshLayersHidden);
-  const transformModeControlsDisabled = !canEditScene || placementMode;
+  const hasTransformSelection = Boolean(selectedLayerKey);
+  const transformModeControlsDisabled = !canEditScene || !hasTransformSelection;
+  const transformModeTooltipPrefix = hasTransformSelection ? "" : "选中模型后可";
   const timeControlsDisabled = activePreviewEngine !== "three";
   const earthToggleDisabled = activePreviewEngine !== "three" || !isSphereScene;
   const earthToggleTooltip = !isSphereScene
@@ -2372,9 +2271,6 @@ function PreviewWorkspace({
             transformControlsActive={transformControlsActive}
             selectedLayerKey={selectedLayerKey}
             hiddenLayerKeys={hiddenLayerKeys}
-            placementMode={placementMode}
-            placementFeedback={placementFeedback}
-            canEditScene={canEditScene}
             viewOptions={viewOptions}
             previewTimeMs={previewTimeMs}
             viewCommand={viewCommand}
@@ -2385,9 +2281,6 @@ function PreviewWorkspace({
             onSceneViewStateChange={handleSceneViewStateChange}
             onSelectLayer={updateSelectedLayer}
             onTransformChange={updateTransform}
-            onPlacementDone={handlePlacementDone}
-            onPlacementCancel={handlePlacementCancel}
-            onPlacementMiss={showPlacementFeedback}
             onViewCommandHandled={handleViewCommandHandled}
             onInteractionHintChange={handleInteractionHintChange}
             onRendererFallback={handleRendererFallback}
@@ -2432,36 +2325,26 @@ function PreviewWorkspace({
                   />
                 </Tooltip>
               ) : null}
-              <Tooltip title={placementTooltip}>
-                <Button
-                  aria-label="地表落位"
-                  aria-pressed={canUsePlacementMode && placementMode}
-                  type={canUsePlacementMode && placementMode ? "primary" : "default"}
-                  icon={<EnvironmentOutlined />}
-                  disabled={!canUsePlacementMode}
-                  onClick={togglePlacementMode}
-                />
-              </Tooltip>
-              <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "回正姿态"}>
+              <Tooltip title="回正姿态">
                 <Button
                   aria-label="回正姿态"
                   icon={<ColumnHeightOutlined />}
-                  disabled={placementMode}
+                  disabled={transformModeControlsDisabled}
                   onClick={() => {
-                    if (placementMode) {
+                    if (transformModeControlsDisabled) {
                       return;
                     }
                     updateTransform(normalizeUprightTransform(transform, sceneMode));
                   }}
                 />
               </Tooltip>
-              <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "重置变换"}>
+              <Tooltip title="重置变换">
                 <Button
                   aria-label="重置变换"
                   icon={<UndoOutlined />}
-                  disabled={placementMode}
+                  disabled={transformModeControlsDisabled}
                   onClick={() => {
-                    if (placementMode) {
+                    if (transformModeControlsDisabled) {
                       return;
                     }
                     updateTransform(normalizeResetTransform(transform, sceneMode));
@@ -2487,16 +2370,16 @@ function PreviewWorkspace({
               </Tooltip>
               <div className="preview-scene-mode-switch" aria-label="模型变换模式">
                 {TRANSFORM_MODE_OPTIONS.map((mode) => (
-                  <Tooltip title={placementMode ? "退出地表落位后可切换变换模式" : mode.tooltip} key={mode.value}>
+                  <Tooltip title={`${transformModeTooltipPrefix}${mode.tooltip}`} key={mode.value}>
                     <Button
                       aria-label={mode.tooltip}
                       aria-pressed={transformControlsActive && transformMode === mode.value}
                       className={transformControlsActive && transformMode === mode.value ? "is-active" : undefined}
-                      disabled={placementMode}
+                      disabled={transformModeControlsDisabled}
                       icon={mode.icon}
                       type={transformControlsActive && transformMode === mode.value ? "primary" : "default"}
                       onClick={() => {
-                        if (placementMode) {
+                        if (transformModeControlsDisabled) {
                           return;
                         }
                         updateTransformMode(mode.value);
@@ -2653,10 +2536,6 @@ function PreviewWorkspace({
                     <dt>W / E / R</dt>
                     <dd>切换平移 / 旋转 / 缩放变换模式</dd>
                   </div>
-                  <div>
-                    <dt>地表落位</dt>
-                    <dd>{isSphereScene ? "开启后单击地球表面放置模型；落位期间暂停变换编辑" : "仅球面场景支持地表落位"}</dd>
-                  </div>
                 </dl>
               </div>
               <div className="preview-operation-help-section">
@@ -2676,7 +2555,7 @@ function PreviewWorkspace({
                   </div>
                   <div>
                     <dt>Esc</dt>
-                    <dd>关闭说明、退出落位、清除选中或停止视角惯性</dd>
+                    <dd>关闭说明、清除选中或停止视角惯性</dd>
                   </div>
                 </dl>
               </div>
@@ -2841,17 +2720,7 @@ function PreviewWorkspace({
               </Tooltip>
               {showInspectorShortcutActions ? (
                 <>
-                  <Tooltip title={placementTooltip}>
-                    <Button
-                      aria-label="地表落位"
-                      aria-pressed={canUsePlacementMode && placementMode}
-                      type={canUsePlacementMode && placementMode ? "primary" : "default"}
-                      icon={<EnvironmentOutlined />}
-                      disabled={!canUsePlacementMode}
-                      onClick={togglePlacementMode}
-                    />
-                  </Tooltip>
-                  <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "回正姿态"}>
+                  <Tooltip title="回正姿态">
                     <Button
                       aria-label="回正姿态"
                       icon={<ColumnHeightOutlined />}
@@ -2864,7 +2733,7 @@ function PreviewWorkspace({
                       }}
                     />
                   </Tooltip>
-                  <Tooltip title={placementMode ? "退出地表落位后可编辑模型变换" : "重置变换"}>
+                  <Tooltip title="重置变换">
                     <Button
                       aria-label="重置变换"
                       icon={<UndoOutlined />}
@@ -2933,11 +2802,6 @@ function PreviewWorkspace({
                 updateTransformMode(event.target.value);
               }}
             />
-            {placementMode ? (
-              <div className="preview-control-mode-hint" role="status">
-                地表落位中：单击地球表面放置，或按 Esc 退出；变换编辑已暂停。
-              </div>
-            ) : null}
           </Space>
 
           <Divider />
@@ -2966,9 +2830,6 @@ type PreviewStageProps = {
   transformControlsActive: boolean;
   selectedLayerKey: string | null;
   hiddenLayerKeys: string[];
-  placementMode: boolean;
-  placementFeedback: string;
-  canEditScene: boolean;
   viewOptions: PreviewViewOptions;
   previewTimeMs: number;
   viewCommand: ViewCommandRequest | null;
@@ -2979,9 +2840,6 @@ type PreviewStageProps = {
   onSceneViewStateChange: (state: SceneViewState) => void;
   onSelectLayer: (key: string | null) => void;
   onTransformChange: (transform: PreviewTransform) => void;
-  onPlacementDone: () => void;
-  onPlacementCancel: () => void;
-  onPlacementMiss: (message: string) => void;
   onViewCommandHandled: (result?: ViewCommandHandledResult) => void;
   onInteractionHintChange: (hint: PreviewInteractionHint | null) => void;
   onRendererFallback: (message: string) => void;
@@ -3018,9 +2876,6 @@ const PreviewStage = memo(function PreviewStage({
   transformControlsActive,
   selectedLayerKey,
   hiddenLayerKeys,
-  placementMode,
-  placementFeedback,
-  canEditScene,
   viewOptions,
   previewTimeMs,
   viewCommand,
@@ -3031,9 +2886,6 @@ const PreviewStage = memo(function PreviewStage({
   onSceneViewStateChange,
   onSelectLayer,
   onTransformChange,
-  onPlacementDone,
-  onPlacementCancel,
-  onPlacementMiss,
   onViewCommandHandled,
   onInteractionHintChange,
   onRendererFallback,
@@ -3084,7 +2936,6 @@ const PreviewStage = memo(function PreviewStage({
         transformControlsActive={transformControlsActive}
         selectedLayerKey={selectedLayerKey}
         hiddenLayerKeys={hiddenLayerKeys}
-        placementMode={canEditScene && placementMode}
         viewOptions={viewOptions}
         previewTimeMs={previewTimeMs}
         viewCommand={viewCommand}
@@ -3095,49 +2946,10 @@ const PreviewStage = memo(function PreviewStage({
         onSceneViewStateChange={onSceneViewStateChange}
         onSelectLayer={onSelectLayer}
         onTransformChange={onTransformChange}
-        onPlacementDone={onPlacementDone}
-        onPlacementMiss={onPlacementMiss}
         onViewCommandHandled={onViewCommandHandled}
         onInteractionHintChange={onInteractionHintChange}
         onRendererFallback={onRendererFallback}
       />
-      {placementMode ? (
-        <div
-          className="preview-placement-hint"
-          role="status"
-          aria-label="地表落位模式：单击地球表面完成落位，Esc 退出"
-        >
-          <AimOutlined className="preview-placement-hint-icon" />
-          <span className="preview-placement-hint-copy">
-            <strong>落位中</strong>
-            <span>单击地球表面放置 · Esc 退出</span>
-            {placementFeedback ? (
-              <span className="preview-placement-feedback">{placementFeedback}</span>
-            ) : null}
-          </span>
-          <Tooltip title="退出地表落位">
-            <Button
-              aria-label="退出地表落位"
-              icon={<CloseOutlined />}
-              size="small"
-              type="text"
-              onClick={onPlacementCancel}
-            />
-          </Tooltip>
-        </div>
-      ) : placementFeedback ? (
-        <div
-          className="preview-placement-hint"
-          role="status"
-          aria-label="地表落位完成"
-        >
-          <AimOutlined className="preview-placement-hint-icon" />
-          <span className="preview-placement-hint-copy">
-            <strong>落位完成</strong>
-            <span>{placementFeedback}</span>
-          </span>
-        </div>
-      ) : null}
     </div>
   );
 }, arePreviewStagePropsEqual);
@@ -3761,7 +3573,6 @@ type ThreeSceneProps = {
   transformControlsActive: boolean;
   selectedLayerKey: string | null;
   hiddenLayerKeys: string[];
-  placementMode: boolean;
   viewOptions: PreviewViewOptions;
   previewTimeMs: number;
   viewCommand: ViewCommandRequest | null;
@@ -3772,8 +3583,6 @@ type ThreeSceneProps = {
   onSceneViewStateChange: (state: SceneViewState) => void;
   onSelectLayer: (key: string | null) => void;
   onTransformChange: (transform: PreviewTransform) => void;
-  onPlacementDone: () => void;
-  onPlacementMiss: (message: string) => void;
   onViewCommandHandled: (result?: ViewCommandHandledResult) => void;
   onInteractionHintChange: (hint: PreviewInteractionHint | null) => void;
   onRendererFallback: (message: string) => void;
@@ -3797,7 +3606,6 @@ const ThreeScene = memo(function ThreeScene({
   transformControlsActive,
   selectedLayerKey,
   hiddenLayerKeys,
-  placementMode,
   viewOptions,
   previewTimeMs,
   viewCommand,
@@ -3808,8 +3616,6 @@ const ThreeScene = memo(function ThreeScene({
   onSceneViewStateChange,
   onSelectLayer,
   onTransformChange,
-  onPlacementDone,
-  onPlacementMiss,
   onViewCommandHandled,
   onInteractionHintChange,
   onRendererFallback
@@ -3817,7 +3623,6 @@ const ThreeScene = memo(function ThreeScene({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const modelRootRef = useRef<THREE.Object3D | null>(null);
   const transformHandleRef = useRef<THREE.Object3D | null>(null);
-  const placementSurfaceRootRef = useRef<THREE.Object3D | null>(null);
   const tilesRef = useRef<TilesRenderer[]>([]);
   const transformControlsRef = useRef<TransformControls | null>(null);
   const globeControlsRef = useRef<GlobeControls | null>(null);
@@ -3830,7 +3635,6 @@ const ThreeScene = memo(function ThreeScene({
   const applyingTransformRef = useRef(false);
   const latestTransformRef = useRef(transform);
   const latestSceneModeRef = useRef(sceneMode);
-  const latestPlacementModeRef = useRef(placementMode);
   const latestTransformModeRef = useRef(transformMode);
   const latestTransformControlsActiveRef = useRef(transformControlsActive);
   const latestSelectedLayerKeyRef = useRef(selectedLayerKey);
@@ -3878,28 +3682,13 @@ const ThreeScene = memo(function ThreeScene({
   }, [sceneMode]);
 
   useEffect(() => {
-    latestPlacementModeRef.current = placementMode;
-    const controls = transformControlsRef.current;
-    if (controls) {
-      controls.getHelper().visible = shouldShowTransformControlHelper(
-        latestTransformControlsActiveRef.current,
-        latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        placementMode
-      );
-    }
-    notifySceneRefreshRef.current();
-  }, [placementMode]);
-
-  useEffect(() => {
     latestSelectedLayerKeyRef.current = selectedLayerKey;
     const controls = transformControlsRef.current;
     if (controls) {
       controls.getHelper().visible = shouldShowTransformControlHelper(
         latestTransformControlsActiveRef.current,
         selectedLayerKey,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
     }
     notifySceneRefreshRef.current();
@@ -3912,8 +3701,7 @@ const ThreeScene = memo(function ThreeScene({
       controls.getHelper().visible = shouldShowTransformControlHelper(
         transformControlsActive,
         latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
     }
     notifySceneRefreshRef.current();
@@ -3952,8 +3740,7 @@ const ThreeScene = memo(function ThreeScene({
       transformControlsRef.current.getHelper().visible = shouldShowTransformControlHelper(
         latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
     }
     applyingTransformRef.current = false;
@@ -3981,8 +3768,7 @@ const ThreeScene = memo(function ThreeScene({
       controls.getHelper().visible = shouldShowTransformControlHelper(
         latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
     }
     notifySceneRefreshRef.current();
@@ -3998,8 +3784,7 @@ const ThreeScene = memo(function ThreeScene({
       controls.getHelper().visible = shouldShowTransformControlHelper(
         latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
     }
     notifySceneRefreshRef.current();
@@ -4339,9 +4124,6 @@ const ThreeScene = memo(function ThreeScene({
         pointer.y = -((clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1;
         raycaster.setFromCamera(pointer, camera);
       };
-      const setRaycasterFromEvent = (event: MouseEvent | PointerEvent) => {
-        setRaycasterFromClientPoint(event.clientX, event.clientY);
-      };
       const getModelHitFromClientPoint = (clientX: number, clientY: number) => {
         const modelRoot = modelRootRef.current;
         if (!modelRoot) {
@@ -4656,8 +4438,7 @@ const ThreeScene = memo(function ThreeScene({
       transformControlsHelper.visible = shouldShowTransformControlHelper(
         latestTransformControlsActiveRef.current,
         latestSelectedLayerKeyRef.current,
-        objectsByLayerKeyRef.current,
-        latestPlacementModeRef.current
+        objectsByLayerKeyRef.current
       );
       scene.add(transformControlsHelper);
 
@@ -4673,7 +4454,6 @@ const ThreeScene = memo(function ThreeScene({
             loadedObjects.push(contextTiles);
             sceneContentRoot.add(contextTiles.object);
             syncEarthSurfaceVisibility();
-            placementSurfaceRootRef.current = contextTiles.object;
             if (contextTiles.tiles) {
               registerTilesRenderer(contextTiles.tiles, camera, renderer, container);
               tilesRef.current.push(contextTiles.tiles);
@@ -4757,8 +4537,7 @@ const ThreeScene = memo(function ThreeScene({
           transformControls.getHelper().visible = shouldShowTransformControlHelper(
             latestTransformControlsActiveRef.current,
             latestSelectedLayerKeyRef.current,
-            objectsByLayerKeyRef.current,
-            latestPlacementModeRef.current
+            objectsByLayerKeyRef.current
           );
           const shouldAutoFocusLoadedModel = Boolean(loaded.tiles || contextTilesUrl);
           if (shouldAutoFocusLoadedModel) {
@@ -4859,7 +4638,6 @@ const ThreeScene = memo(function ThreeScene({
             disposed ||
             !renderer ||
             transformControls.dragging ||
-            latestPlacementModeRef.current ||
             modelRootRef.current !== request.modelRoot
           ) {
             return;
@@ -4886,7 +4664,6 @@ const ThreeScene = memo(function ThreeScene({
           !modelRootRef.current ||
           event.buttons ||
           transformControls.dragging ||
-          latestPlacementModeRef.current ||
           isNativeGlobeRotateModifier(event) ||
           performance.now() < lowFpsRecoveryUntil
         ) {
@@ -4915,7 +4692,6 @@ const ThreeScene = memo(function ThreeScene({
             !renderer ||
             !modelRootRef.current ||
             transformControls.dragging ||
-            latestPlacementModeRef.current ||
             isNativeGlobeRotateModifier(request) ||
             performance.now() < lowFpsRecoveryUntil
           ) {
@@ -4986,38 +4762,12 @@ const ThreeScene = memo(function ThreeScene({
         }
         canvasPointerIntent = null;
 
-        if (latestPlacementModeRef.current) {
-          setRaycasterFromEvent(event);
-          const placement = getSurfacePlacement(
-            raycaster,
-            latestSceneModeRef.current,
-            ellipsoidContextRef.current,
-            placementSurfaceRootRef.current,
-            modelRootRef.current
-          );
-          if (placement) {
-            onTransformChange({
-              ...latestTransformRef.current,
-              position: placement.point.toArray() as [number, number, number],
-              rotation: shouldUseGeoPlacement(type, latestSceneModeRef.current)
-                ? [0, 0, 0]
-                : latestTransformRef.current.rotation,
-              geo: scenePositionToGeo(placement.point.toArray(), latestSceneModeRef.current, ellipsoidContextRef.current)
-            });
-            onPlacementDone();
-          } else {
-            onPlacementMiss("未命中地球表面，请点击可见地表区域");
-          }
-          return;
-        }
-
         scheduleCanvasPick(event.clientX, event.clientY);
       };
       const handleCanvasDoubleClick = (event: MouseEvent) => {
         if (
           !renderer ||
           transformControls.dragging ||
-          latestPlacementModeRef.current ||
           event.button !== 0 ||
           isNativeGlobeRotateModifier(event) ||
           isTransformControlPointerHit(event, transformControlsRef.current, camera, rendererElement)
@@ -5131,8 +4881,7 @@ const ThreeScene = memo(function ThreeScene({
           transformControls.getHelper().visible = shouldShowTransformControlHelper(
             latestTransformControlsActiveRef.current,
             latestSelectedLayerKeyRef.current,
-            objectsByLayerKeyRef.current,
-            latestPlacementModeRef.current
+            objectsByLayerKeyRef.current
           );
         }
 
@@ -5594,7 +5343,6 @@ const ThreeScene = memo(function ThreeScene({
       cameraRef.current = null;
       modelRootRef.current = null;
       transformHandleRef.current = null;
-      placementSurfaceRootRef.current = null;
       tilesRef.current = [];
       transformControlsRef.current = null;
       globeControlsRef.current = null;
@@ -5609,19 +5357,17 @@ const ThreeScene = memo(function ThreeScene({
         container.removeChild(renderer.domElement);
       }
     };
-  }, [applyHiddenLayerVisibility, contextTilesUrl, onInteractionHintChange, onLayerTreeChange, onMaterialListChange, onPlacementDone, onPlacementMiss, onSceneInfoChange, onSelectLayer, onTransformChange, type, url]);
+  }, [applyHiddenLayerVisibility, contextTilesUrl, onInteractionHintChange, onLayerTreeChange, onMaterialListChange, onSceneInfoChange, onSelectLayer, onTransformChange, type, url]);
 
-  const canvasInteractionDescription = placementMode
-    ? "地表落位模式：单击地球表面放置模型，按 Esc 退出"
-    : sceneMode === "sphere"
-      ? "三维操作：左键拖动平移地球，右键或 Shift 加左键旋转，滚轮缩放，双击模型聚焦"
-      : "三维操作：左键旋转，Shift、Ctrl 或 ⌘ 加左键平移，滚轮缩放，右键上下拖动缩放，中键俯仰观察，双击模型聚焦";
+  const canvasInteractionDescription = sceneMode === "sphere"
+    ? "三维操作：左键拖动平移地球，右键或 Shift 加左键旋转，滚轮缩放，双击模型聚焦"
+    : "三维操作：左键旋转，Shift、Ctrl 或 ⌘ 加左键平移，滚轮缩放，右键上下拖动缩放，中键俯仰观察，双击模型聚焦";
 
   return (
     <div
       ref={containerRef}
       aria-label={canvasInteractionDescription}
-      className={`preview-three-canvas${placementMode ? " is-placement-mode" : ""}`}
+      className="preview-three-canvas"
     />
   );
 }, areThreeScenePropsEqual);
@@ -6055,10 +5801,9 @@ function isTransformControlPointerHit(
 function shouldShowTransformControlHelper(
   transformControlsActive: boolean,
   selectedLayerKey: string | null,
-  objectsByLayerKey: Map<string, THREE.Object3D>,
-  placementMode: boolean
+  objectsByLayerKey: Map<string, THREE.Object3D>
 ): boolean {
-  if (!transformControlsActive || placementMode || !selectedLayerKey) {
+  if (!transformControlsActive || !selectedLayerKey) {
     return false;
   }
   const selected = objectsByLayerKey.get(selectedLayerKey);
@@ -6488,58 +6233,8 @@ function readObjectTransform(
   };
 }
 
-function getSurfacePlacement(
-  raycaster: THREE.Raycaster,
-  sceneMode: PreviewSceneMode,
-  ellipsoidContext: EllipsoidContext,
-  surfaceRoot: THREE.Object3D | null,
-  modelRoot: THREE.Object3D | null
-): SurfacePlacement | null {
-  if (surfaceRoot) {
-    const surfaceHit = raycaster
-      .intersectObject(surfaceRoot, true)
-      .find((item) => isPickableObject(item.object) && !isDescendantOf(item.object, modelRoot));
-    if (surfaceHit) {
-      return getSurfacePlacementFromHit(surfaceHit);
-    }
-  }
-
-  return getFallbackSurfacePlacement(raycaster.ray, sceneMode, ellipsoidContext);
-}
-
-function getSurfacePlacementFromHit(hit: THREE.Intersection): SurfacePlacement {
-  return {
-    point: hit.point.clone()
-  };
-}
-
 function hasPointerMoved(intent: CanvasPointerIntent, event: PointerEvent): boolean {
   return Math.hypot(event.clientX - intent.x, event.clientY - intent.y) > 4;
-}
-
-function getFallbackSurfacePlacement(
-  ray: THREE.Ray,
-  sceneMode: PreviewSceneMode,
-  ellipsoidContext: EllipsoidContext
-): SurfacePlacement | null {
-  const target = new THREE.Vector3();
-  if (sceneMode === "sphere") {
-    const localRay = ray.clone().applyMatrix4(getEllipsoidFrameInverse(ellipsoidContext));
-    const hit = ellipsoidContext.geospatialEllipsoid.getIntersection(localRay, target);
-    if (hit) {
-      target.applyMatrix4(ellipsoidContext.group.matrixWorld);
-      return {
-        point: target
-      };
-    }
-  }
-  const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-  const hit = ray.intersectPlane(plane, target);
-  return hit
-    ? {
-      point: target
-    }
-    : null;
 }
 
 function buildLayerTree(
